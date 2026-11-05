@@ -1,0 +1,35 @@
+{
+    "name": "@typecrate/harness",
+    "version": "1.0.2",
+    "description": "Rust-native harness control plane: the canonical /v1/harness REST + stream server, ported from @underload/harness and discovered by @typecrate/services through *-route.rs files.",
+    "private": true,
+    "type": "module",
+    "#identity": "npm identity for the Rust crate at packages/typecrate/harness. Crate name == npm name with @ dropped and / replaced by - (rust/README.md name mapping); the crate version and this version line are pinned together and src/lib.rs asserts the crate constant matches. private: true because the artifact is a cargo build inside this repo, not a published package yet.",
+    "#layout": "Rust-first and native-only: Cargo.toml is a standalone Cargo workspace (explicit [workspace] boundary so the root rust workspace stays untouched, the same shape packages/typecrate/services uses) with one lib plus the typecrate-harness-server bin. There is no wasm target here - the harness is a server with filesystem persistence. Artifacts land in the repo-root .rust/target because ../../../.cargo/config.toml sets target-dir; cargo picks that config up by walking up from this directory.",
+    "#rust": "check / test / lint / build / start are plain cargo. `lint` denies warnings because nothing else in this repo runs a non-strict clippy for this crate yet; `verify` is the full gate (fmt:check + lint + test + release build of the server). `start` ends in a bare `--` so npm's own `--` separator forwards flags to the executable; the bin is a placeholder until the HTTP stage lands and prints a not-wired-yet note with exit 0.",
+    "#parity": "Behavioural spec is packages/underload/harness/src (shared/harness-api.ts, shared/harness-stream.ts, shared/origin.ts, server/config.ts, server/api-paging.ts, server/api-events.ts, server/environment.ts, server/package-root.ts, server/protocol.ts, types/index.ts). Port decisions and every deliberate deviation are recorded in knowledge.md.",
+    "scripts": {
+        "check": "cargo check --all-targets",
+        "test": "cargo test",
+        "lint": "cargo clippy --all-targets -- -D warnings",
+        "fmt": "cargo fmt",
+        "fmt:check": "cargo fmt -- --check",
+        "build": "cargo build --release --bin typecrate-harness-server",
+        "start": "cargo run --bin typecrate-harness-server --",
+        "verify": "npm run fmt:check && npm run lint && npm run test && npm run build"
+    },
+    "keywords": [
+        "typecrate",
+        "harness",
+        "rust",
+        "http",
+        "server",
+        "axum",
+        "agents"
+    ],
+    "engines": {
+        "node": ">=18"
+    },
+    "author": "NQQT",
+    "license": "MIT"
+}

@@ -1,0 +1,128 @@
+# =============================================================================
+# typecrate-harness - the Rust core behind the `@typecrate/harness` npm package.
+#
+# WHY an explicit `[workspace]` table HERE (and not a crate under root `rust/crates`):
+# the package was requested at packages/typecrate/harness, and the root workspace
+# (../../../Cargo.toml) only globs `members = ["rust/crates/*"]`. Without a
+# `[workspace]` boundary cargo walks up, finds the root workspace, and fails with
+# "current package believes it's in a workspace when it's not". Declaring the
+# boundary here keeps the requested npm location and leaves the root workspace
+# untouched - the same shape packages/typecrate/services already uses (see that
+# file's header comment for the full reasoning).
+#
+# What is still inherited from the repo root (cargo config discovery walks up from
+# the cwd, independently of workspace membership - see ../../../.cargo/config.toml):
+#   target-dir = ".rust/target"          -> artifacts stay inside the repo
+#   [env] TMP/TEMP/TMPDIR = Temp/rust    -> child processes never touch OS temp
+#   rust-toolchain.toml channel 1.99.1   -> pinned toolchain
+#
+# Native-only on purpose: this crate is a server (axum + tokio + filesystem
+# persistence), so there is no wasm32 boundary and no target gating - the whole
+# dependency list is the native runtime. `packages/typecrate/services` is the one
+# that also publishes a wasm artifact.
+# =============================================================================
+
+[workspace]
+# 3 = the edition-2024 default (matches the root workspace and
+# packages/typecrate/services): per-target feature resolution.
+resolver = "3"
+
+[package]
+name = "typecrate-harness"
+# Crate name == npm name with `@` dropped and `/` replaced by `-`
+# (naming rule in ../../../rust/README.md "Name mapping rule").
+version = "1.0.2"                       # mirrors the npm line in package.json
+edition = "2024"
+rust-version = "1.99"                   # same floor as the root workspace
+license = "MIT"
+publish = false                         # crates.io: consumed by path, not published
+description = "Rust-native harness control plane for @typecrate/harness: the canonical /v1/harness REST + stream server ported from packages/underload/harness."
+
+[lib]
+name = "typecrate_harness"              # in Rust code: `use typecrate_harness::...`
+path = "src/lib.rs"
+
+# The native HTTP executable. Declared explicitly so the artifact/bin name is
+# stable and greppable (`cargo run --bin typecrate-harness-server`) instead of
+# cargo's autodiscovered `server`.
+# T1 ships a placeholder only: the router, the store and the endpoint wiring land
+# in the later stages of this port, and a `[[bin]]` table needs a file that
+# compiles today.
+[[bin]]
+name = "typecrate-harness-server"
+path = "src/bin/server.rs"
+
+[dependencies]
+# The canonical `/v1/harness` mount: JSON bodies, query strings (limit/cursor/filters)
+# and the WebSocket upgrade at `/v1/harness/stream` (the TS package speaks SSE on the
+# gateway mount and WS on the standalone one; the contract's stream is WS, so `ws`).
+axum = { version = "0.8", features = ["json", "query", "ws"] }
+# Multi-thread runtime + macros for `#[tokio::main]`/`#[tokio::test]`, the listener,
+# timeouts (retry backoff, turn budgets), ctrl_c/SIGTERM for graceful shutdown,
+# `fs` for the snapshot/journal documents, `io-util` for the stream transport.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "sync",
+    "signal",
+    "fs",
+    "io-util",
+] }
+# Derives for the wire contract in src/contract.rs (snake_case REST resources,
+# camelCase display subtree - same split as src/shared/harness-api.ts).
+serde = { version = "1", features = ["derive"] }
+# `preserve_order` keeps a JSON document's own key order, which is what lets a TS-written
+# `state.json` round-trip through this server byte-for-byte instead of alphabetically
+# (T1 left it off; the persistence layer needs it - see knowledge.md "T2").
+serde_json = { version = "1", features = ["preserve_order"] }
+# base64url paging cursors (`api-paging.ts`), and the canonical base64 attachment
+# bytes on HarnessAttachment.data.
+base64 = "0.22"
+# Opaque instance ids (sessions, turns, requests, attachments) - uuid v4, the same
+# "opaque unique id" role the TS host ids play.
+uuid = { version = "1", features = ["v4"] }
+# Package-root `.env` loading with dotenv's `override: false` precedence
+# (packages/underload/harness/src/server/environment.ts).
+dotenvy = "0.15"
+# Body reading for the submit/attachment bounds (MAX_BODY_BYTES / MAX_SUBMIT_BODY_BYTES).
+http-body-util = "0.1"
+# The provider client (GET {baseURL}/models, POST {baseURL}/chat/completions).
+# rustls rather than native-tls: no OpenSSL dependency on any host.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+] }
+# Stream pumping + the agent run loops.
+futures-util = "0.3"
+# Runtime knob validation (`HARNESS_WORKER_IDLE_MS` is digits-only, api config.ts
+# `integerWithin`) and the tool source/label grammars.
+regex = "1"
+# The one error type every layer maps into an ApiError (src/error.rs).
+thiserror = "2"
+# Cancellation/watch channels for the turn lanes and the worker bridges.
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+# tests/ drive the hub and (later) the listener on a real runtime; `full` keeps the
+# integration tests from needing per-test feature plumbing.
+tokio = { version = "1", features = ["full"] }
+
+# Lint policy copied from the root workspace ([workspace.lints]) because a
+# standalone workspace does not inherit another workspace's lint table.
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Release profile mirrors packages/typecrate/services (and the root workspace):
+# this workspace is separate, so the settings have to be restated.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
