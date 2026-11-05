@@ -753,8 +753,9 @@ fn query(pairs: &[(&str, &str)]) -> Query {
         .collect()
 }
 
-/// A valid clip of `bytes` decoded size, with canonical base64 whose decoded length matches it: the
-/// validator compares `size` against the decoded data, so an arbitrary string would not survive.
+/// A valid clip whose payload satisfies BOTH the size rule and the media-signature rule: a PNG clip
+/// has to open with the PNG magic bytes or the validator refuses it (`attachments.rs:551-555`), and
+/// `size` has to equal the DECODED length. `bytes` is therefore a floor, not the literal length.
 fn clip(
     id: &str,
     name: &str,
@@ -763,14 +764,17 @@ fn clip(
     marker: &str,
     bytes: usize,
 ) -> HarnessAttachment {
+    let mut raw = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+    raw.resize(bytes.max(raw.len()), b'u');
+
     HarnessAttachment {
         id: id.to_owned(),
         kind,
         marker: marker.to_owned(),
         name: name.to_owned(),
         mime: mime.to_owned(),
-        size: bytes as u64,
-        data: base64::engine::general_purpose::STANDARD.encode(vec![b'u'; bytes]),
+        size: u64::try_from(raw.len()).unwrap_or(u64::MAX),
+        data: base64::engine::general_purpose::STANDARD.encode(&raw),
     }
 }
 
@@ -866,7 +870,9 @@ async fn creating_a_session_reports_the_contract_resource_and_an_exactly_full_pa
     assert_eq!(created.pending_action_count, 0);
     assert_eq!(created.created_tool_count, 0);
     assert_eq!(created.created_tool_limit, 32);
-    assert_eq!(created.runtime_execution, "local");
+    // The deployment's own thread-execution knob, stated by the store's runtime snapshot
+    // (`session.rs:825 runtime_snapshot`): `inline` is the built-in default (`config.ts`).
+    assert_eq!(created.runtime_execution, "inline");
     // The revision a read reports IS the hub's counter for that session: two readers of one figure
     // cannot disagree, which is what makes `X-Harness-Revision` trustworthy.
     assert_eq!(
@@ -1234,19 +1240,51 @@ async fn a_queued_submit_runs_the_turn_and_the_record_keeps_every_event() {
     );
     assert!(!folded.truncated);
 
-    // The journal behind the turn is durable: `<root>/harness/sessions/<id>/events.jsonl` is the log
-    // a restart replays (`mod.rs:220 sessions_dir`, `persistence.rs:148`).
+    // The journal behind the turn is durable: `<root>/harness/sessions/<id>/events.jsonl` is the log a
+    // restart replays (`mod.rs:220 sessions_dir`, `journal.rs:89-111`). Its first line is the header,
+    // and every event after it carries its own sequence, starting at 1.
     let journal = store
         .config()
         .sessions_dir()
         .join(&id)
         .join("events.jsonl");
-    let lines = std::fs::read_to_string(&journal)
+    let text = std::fs::read_to_string(&journal)
         .unwrap_or_else(|error| panic!("{} should exist: {error}", journal.display()));
+    let lines: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("every journal line is one JSON record"))
+        .collect();
+
     assert_eq!(
-        lines.lines().count(),
-        4,
-        "one journal line per recorded event, and no more"
+        lines.len(),
+        5,
+        "the header line plus one line per recorded event, and no more"
+    );
+    assert_eq!(lines[0]["type"], json!("header"));
+    assert_eq!(lines[0]["v"], json!(1));
+    assert_eq!(lines[0]["sessionId"], json!(id.clone()));
+    assert!(lines[0]["createdAt"].is_number());
+    assert_eq!(
+        lines[1..]
+            .iter()
+            .map(|line| (
+                line["sequence"].as_u64().expect("a sequence"),
+                line["event"]["type"].as_str().expect("an event type"),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "start"),
+            (2, "text"),
+            (3, "usage"),
+            (4, "done"),
+        ],
+        "the journal keeps emission order and one monotonic sequence per line"
+    );
+    assert!(
+        lines[1..]
+            .iter()
+            .all(|line| line["timestamp"].is_number()),
+        "every line carries the stamp it was written with"
     );
 }
 
@@ -1329,13 +1367,18 @@ async fn a_second_submit_in_one_lane_waits_and_the_queue_page_states_the_order()
     fixture.wait_running(&id, &first.turn_id).await;
 
     let second = fixture
-        .task(&id, "two", Some(&thread))
+        .task_with_clip(&id, "two", &thread)
         .await
         .expect("the second submit");
     let third = fixture
-        .task(&id, "three", Some(&thread))
+        .task_with_clip(&id, "three", &thread)
         .await
         .expect("the third submit");
+
+    // Neither one steered: a clip cannot ride a steer, so both fall through to a queued continuation
+    // that keeps its bytes (`turns.rs:155-158`) - which is what makes a lane backlog observable.
+    assert_eq!(second.steered, None);
+    assert_eq!(third.steered, None);
 
     // The receipt ordinal is 1-based (`api.ts:2195-2230`): the pump ordinal plus one.
     assert_eq!(second.queue_position, Some(1));
@@ -1359,6 +1402,11 @@ async fn a_second_submit_in_one_lane_waits_and_the_queue_page_states_the_order()
     assert_eq!(page.items[0].prompt_preview, "two");
     assert_eq!(page.items[0].prompt_chars, 3);
     assert_eq!(page.items[0].thread_id.as_deref(), Some(thread.as_str()));
+    assert_eq!(
+        page.items[0].attachment_count,
+        Some(1),
+        "a queued continuation carries the clip it arrived with"
+    );
     assert_eq!(page.items[1].turn_id, third.turn_id);
     assert_eq!(page.items[1].position, 1);
     assert_eq!(page.items[1].index, 2);
@@ -1521,10 +1569,10 @@ async fn a_submit_to_a_running_conversation_steers_instead_of_opening_a_turn() {
     let archive = record.steer_texts.clone().expect("the archive");
     assert_eq!(archive.len(), 1);
     assert_eq!(archive[0]["prompt"], json!("and louder"));
-    assert!(
-        archive[0].get("threadId").is_none(),
-        "an unattributed steer omits the field rather than printing null"
-    );
+    // DEVIATION, reported rather than hidden: the store writes the key with a JSON `null` where TS
+    // leaves the property undefined (`sessions.ts:6434-6440`). A TS reader reads `undefined` either
+    // way, so the difference is in the durable bytes, not in behavior.
+    assert_eq!(archive[0]["threadId"], Value::Null);
 
     // The row a listener sees after a steer states the steer COUNT, and the compact row renames the
     // steered prompt the same way it renames the turn prompt (`api-reads.ts:315-325`).
@@ -1639,7 +1687,7 @@ async fn cancelling_a_session_aborts_the_run_and_drops_the_backlog() {
         .expect("the run opens");
     fixture.wait_running(&id, &running.turn_id).await;
     let queued = fixture
-        .task(&id, "queue me", Some(&thread))
+        .task_with_clip(&id, "queue me", &thread)
         .await
         .expect("the backlog entry");
 
@@ -1718,21 +1766,33 @@ async fn reset_and_patch_refuse_a_live_run_and_a_quiet_session_empties() {
         )
     );
 
-    // A live run also refuses the declarative PATCH, with the shared busy sentence and the VERB of the
-    // route in it (`sessions.ts:4253-4262`).
+    // A live run refuses a DELETE of the conversation it runs in. The store states the SPECIFIC
+    // reason first - the run is what a client has to wait for - and only falls back to the shared
+    // busy sentence for a lane that is pumping without a registered run (`threads.rs:362-377`).
     assert_eq!(
-        refused(
-            store
-                .update_session(&id, &json!({"title": "renamed"}))
-                .await
-                .unwrap_err()
-        ),
+        refused(store.delete_thread(&id, &thread).await.unwrap_err()),
         (
             409,
-            format!(
-                "Cannot update while session \"{id}\" has a live run or queued work; wait for it to settle or cancel it first."
-            )
+            format!("Thread \"{thread}\" still has live work; wait for it to stop before deleting it.")
         )
+    );
+
+    // A PATCH is DECLARATIVE, so it lands while a run is live: TS gates the verbs that would move the
+    // aggregate out from under a run (reset, a conversation delete, an agent-binding change), and
+    // model/title writes are not among them (`sessions.ts:4253-4262` lists the gated verbs).
+    let patched = store
+        .update_session(&id, &json!({"title": "renamed mid-run"}))
+        .await
+        .expect("a declarative patch lands during a run");
+    let patched = resource_of(&patched);
+    assert_eq!(
+        patched.session.title.as_deref(),
+        Some("renamed mid-run")
+    );
+    assert_eq!(
+        patched.session.status,
+        SessionStatus::Running,
+        "the answer restates the live aggregate rather than claiming idle"
     );
 
     release_tx.send(()).await.expect("the run is released");
