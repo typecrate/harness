@@ -29,6 +29,7 @@ use typecrate_harness::contract::{
     AttachmentKind, HarnessAttachment, HarnessMessage, HarnessToolCall, HarnessUsage,
     ProviderConfig, ToolCall, ToolDecl,
 };
+use typecrate_harness::store::read;
 use typecrate_harness::transport::{
     self, MALFORMED_FRAME_ECHO_CHARS, StreamEvent, StreamResult, TransportError,
 };
@@ -142,12 +143,16 @@ async fn provider(script: Script) -> (String, Arc<Provider>) {
 }
 
 /// A provider config pointed at `base`, with one credential and one custom header.
+///
+/// `sampling` stays `None` so every existing body assertion still sees the plain
+/// `{model, stream, messages, tools?}` document; the sampling tests set it explicitly.
 fn config(base: &str) -> ProviderConfig {
     ProviderConfig {
         base_url: base.to_owned(),
         api_key: Some("secret-key".to_owned()),
         model: "model-of-the-hour".to_owned(),
         headers: BTreeMap::new(),
+        sampling: None,
     }
 }
 
@@ -1201,6 +1206,83 @@ fn a_five_file_block_is_grouped_into_numbered_parts() {
             .filter(|part| part["type"] == json!("image_url"))
             .count(),
         1
+    );
+}
+
+/// `samplingBody` (`transport/openai.ts:618-627`) spread into the request body
+/// (`openai.ts:745`: `...samplingBody(sampling)`).
+///
+/// Three rules are pinned at once: a number that IS one of `HarnessSampling`'s five fields reaches the
+/// body verbatim, a NON-number is dropped (`typeof value === 'number'`), and a name outside the type is
+/// dropped rather than smuggled to the provider. The server's own default is
+/// `{temperature: 0.3}` (`server/harnesses/toolbox.ts:245`), so the second half of the test drives that
+/// exact value the way a session turn does.
+#[tokio::test]
+async fn sampling_fields_merge_into_the_request_body() {
+    let signal = CancellationToken::new();
+    let script = Script::streaming(stream(&[final_chunk(
+        "Four.",
+        "stop",
+        json!({ "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }),
+    )]));
+
+    let (base, state) = provider(script).await;
+    let client = transport::OpenAiClient::new(ProviderConfig {
+        sampling: Some(json!({
+            "temperature": 0.3,
+            "top_p": "not-a-number",
+            "seed": 7,
+        })),
+        ..config(&base)
+    });
+    let mut events: Vec<StreamEvent> = Vec::new();
+
+    client
+        .stream_chat(&transcript(), &[], &signal, &mut |event| events.push(event))
+        .await
+        .expect("the stream completes");
+
+    let captured = state
+        .captured
+        .lock()
+        .expect("the capture lock is uncontended")
+        .clone()
+        .expect("the provider saw a request");
+
+    assert_eq!(
+        captured.body,
+        json!({
+            "model": "model-of-the-hour",
+            "stream": true,
+            "messages": [
+                { "role": "system", "content": "Answer briefly." },
+                { "role": "user", "content": "What is 2 + 2?" },
+            ],
+            "temperature": 0.3,
+        }),
+        "only the numeric `HarnessSampling` field is forwarded"
+    );
+
+    // The server default a session turn runs with (`toolbox.ts:245`).
+    assert_eq!(
+        transport::sampling_body(Some(&read::default_sampling())),
+        vec![("temperature".to_owned(), json!(0.3))],
+        "the deployment default is exactly one temperature field at 0.3"
+    );
+    assert_eq!(
+        transport::sampling_body(Some(
+            &json!({ "presence_penalty": -0.5, "max_tokens": 900 })
+        )),
+        vec![
+            ("presence_penalty".to_owned(), json!(-0.5)),
+            ("max_tokens".to_owned(), json!(900)),
+        ],
+        "the other accepted names are forwarded too, in the order the document states them"
+    );
+    assert_eq!(
+        transport::sampling_body(None),
+        Vec::<(String, Value)>::new(),
+        "a provider with no sampling contributes nothing"
     );
 }
 

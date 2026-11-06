@@ -45,11 +45,23 @@
 //! |                | two adapters, one transport here                               |
 //! | `server`       | `src/server/{handler,service,start}.ts` (the router, the       |
 //! |                | graceful shutdown, the final durable document on the way out)  |
+//! | `stream`       | `src/server/stream/**`: `protocol.ts` (vocabulary, cursor      |
+//! |                | codec, frame validator) -> `stream/protocol`, `broker.ts`      |
+//! |                | (subscriptions, sequences, replay windows) -> `stream/broker`, |
+//! |                | `connection.ts` (the per-socket conversation) ->               |
+//! |                | `stream/connection`, and `transport.ts`/`mount.ts` (the        |
+//! |                | handshake gates and the origin gate) -> `stream/mod`. The RFC  |
+//! |                | 6455 codec TS hand-rolls is axum's `ws` + tokio-tungstenite    |
+//! |                | here, so there is no `stream/transport.rs`.                    |
 //!
-//! STILL TO PORT: the WebSocket upgrade BODY (`src/server/stream/**`; this crate answers the mount
-//! with TypeScript's own 400 sentence), the session-domain route BODIES (`api.ts:1958-2820`, whose
-//! handlers are reachable stubs that consume the documented body and then refuse), and the
-//! `*-route.rs` discovery wiring. The public signatures below are contractual, not incidental,
+//! STILL TO PORT: the session-created tool's module host - an installed module is durable, but this
+//! build has no runtime compiler to execute it - and the runtime-compiler tools the catalogue lists but
+//! this build cannot execute (see `knowledge.md` "T4" and "T5c"). The `*-route.rs` discovery wiring is
+//! NOT in that list any more: T6 shipped it, so `endpoint/harness/harness-route.rs` is the route file
+//! `packages/typecrate/services` discovers at build time and the gateway serves the exact dispatcher
+//! this crate's standalone bin binds. The other gap is lane isolation: this build provides `inline`
+//! only, and REFUSES a `worker` deployment (`runtime::validate_supported_execution`, `knowledge.md`
+//! "T9") instead of pretending otherwise. The public signatures below are contractual, not incidental,
 //! because every one of those stages reads them.
 
 /// Crate name, for banners and diagnostics (matches `[package] name` with `-` -> `_`).
@@ -87,6 +99,7 @@ pub mod registry;
 pub mod runtime;
 pub mod server;
 pub mod store;
+pub mod stream;
 pub mod tools;
 pub mod transport;
 pub mod turn;

@@ -188,11 +188,21 @@ fn the_catalogue_lists_every_group_in_the_published_order() {
 
     assert_eq!(
         rows.len(),
-        35,
-        "every runtime, preset, harness and web row is listed"
+        31,
+        "every LISTED runtime, preset, harness and web row: the 35 generated rows minus the four \
+         the manifest marks `listed: false` (`tool-manifest.ts:1002, 1046, 1692, 1811`)"
     );
+    assert_eq!(names.len(), 31);
     assert_eq!(rows[0].name, "toolRegistry");
     assert_eq!(names[0], "toolRegistry");
+
+    // T7b: the four unlisted runtime rows are absent from the listing.
+    for withheld in ["toolCancel", "threadSend", "threadRead", "threadList"] {
+        assert!(
+            !names.contains(&withheld),
+            "`{withheld}` is `listed: false` in the manifest, so the server does not advertise it"
+        );
+    }
 
     // Group boundaries: core rows, then presets, then app tools, then the web pair.
     let group_of = |name: &str| {
@@ -202,7 +212,7 @@ fn the_catalogue_lists_every_group_in_the_published_order() {
             .unwrap_or_default()
     };
 
-    assert_eq!(group_of("threadList"), "Core tools");
+    assert_eq!(group_of("threadFork"), "Core tools");
     assert_eq!(group_of("syntax"), "Package presets");
     assert_eq!(group_of("timeNow"), "Harness tools");
     assert_eq!(group_of("search"), "Web search");
@@ -394,9 +404,16 @@ fn declarations_are_catalogue_ordered_and_follow_the_policy() {
 
     assert!(names.contains(&"shell"), "enabled");
     assert!(names.contains(&"read"), "declared");
-    assert!(names.contains(&"delegate"), "subagents present");
     assert!(names.contains(&"toolRequest"), "always declared");
     assert!(names.contains(&"task"), "always declared");
+    // T7b: `delegate` is catalogued-only in this build (no nested-run runtime), so a subagent
+    // roster no longer buys the model a tool whose call can only fail. The same rule covers every
+    // name in `MISSING_CAPABILITY` - including one the model ENABLED, which is the case that used
+    // to reach a declaration through `policy.enabled`.
+    assert!(
+        !names.contains(&"delegate"),
+        "a catalogued-only name is never declared"
+    );
     assert!(
         !names.contains(&"customTool"),
         "a created tool is appended by the store"
@@ -404,6 +421,23 @@ fn declarations_are_catalogue_ordered_and_follow_the_policy() {
     assert!(
         !names.contains(&"fileList"),
         "searchable waits for toolRequest"
+    );
+
+    let enabled_but_unexecutable = ToolPolicy {
+        enabled: vec!["profileManage".to_owned(), "threadRead".to_owned()],
+        ..ToolPolicy::default()
+    };
+    let offered = runtime.declarations(&enabled_but_unexecutable);
+
+    assert!(
+        !offered
+            .iter()
+            .any(|decl| decl.name == "profileManage" || decl.name == "threadRead"),
+        "an enabled tool this build cannot execute is offered to neither the model nor toolRequest"
+    );
+    assert!(
+        offered.iter().any(|decl| decl.name == "toolRequest"),
+        "the executable core pair is still offered, so the filter is per-row"
     );
 
     // Catalogue order, never policy order, so the same set sends the same bytes.
@@ -1779,22 +1813,33 @@ async fn every_catalogued_row_has_a_detail_and_a_known_kind() {
     let fixture = Fixture::new("every-row");
 
     for entry in catalogue::ENTRIES.iter() {
-        let detail = runtime
-            .detail(entry.name)
-            .unwrap_or_else(|| panic!("{} details", entry.name));
+        let detail = runtime.detail(entry.name);
 
-        assert!(!detail.summary.description.is_empty());
-        assert_eq!(
-            detail.parameters.as_ref().expect("a schema")["type"],
-            json!("object"),
-            "{}'s schema is an object schema",
-            entry.name
-        );
-        assert!(matches!(
-            detail.summary.availability.as_ref().map(|a| a.state),
-            None | Some(ToolAvailabilityState::Available)
-                | Some(ToolAvailabilityState::Unconfigured)
-        ));
+        if catalogue::is_listed(entry.name) {
+            let detail = detail.unwrap_or_else(|| panic!("{} details", entry.name));
+
+            assert!(!detail.summary.description.is_empty());
+            assert_eq!(
+                detail.parameters.as_ref().expect("a schema")["type"],
+                json!("object"),
+                "{}'s schema is an object schema",
+                entry.name
+            );
+            assert!(matches!(
+                detail.summary.availability.as_ref().map(|a| a.state),
+                None | Some(ToolAvailabilityState::Available)
+                    | Some(ToolAvailabilityState::Unconfigured)
+            ));
+        } else {
+            // T7b: a `listed: false` row resolves on the session toolbox and the dispatch path, but
+            // NOT on the global identified read (`api.ts:1847` looks it up in `coreEntries`, which
+            // `tools/descriptors.ts:290-328` already filtered).
+            assert!(
+                detail.is_none(),
+                "{} is unlisted, so GET /tools/{{name}} must not resolve it",
+                entry.name
+            );
+        }
 
         let outcome = call(&runtime, entry.name, json!({}), &fixture.directory).await;
 

@@ -29,7 +29,7 @@
 
 use serde_json::Value;
 
-use crate::api::{self, ApiResult, ApiResponse, Ctx};
+use crate::api::{self, ApiResponse, ApiResult, Ctx};
 use crate::contract;
 use crate::error::ApiError;
 use crate::store;
@@ -142,7 +142,11 @@ pub(crate) fn page_revision(body: &Value) -> u64 {
 pub(crate) fn number_of(body: &Value, key: &str) -> u64 {
     body.get(key)
         .and_then(Value::as_u64)
-        .or_else(|| body.get(key).and_then(Value::as_f64).map(|value| value as u64))
+        .or_else(|| {
+            body.get(key)
+                .and_then(Value::as_f64)
+                .map(|value| value as u64)
+        })
         .unwrap_or(0)
 }
 
@@ -162,7 +166,7 @@ pub(crate) fn stamped(status: u16, body: Value, revision: u64) -> ApiResponse {
 /// empty page rather than a refusal) - both are the store's `list_sessions` order, which is this
 /// port's copy of the same recipe.
 pub async fn get_sessions(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let body = ctx.runtime.store.list_sessions(&ctx.query).await?;
     let revision = page_revision(&body);
@@ -232,7 +236,7 @@ pub async fn post_session(ctx: &mut Ctx) -> ApiResult {
 
 /// `GET {root}/sessions/{session_id}` (`api.ts:2044-2048`).
 pub async fn get_session(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
     let body = ctx.runtime.store.get_session(&session_id).await?;
@@ -285,7 +289,7 @@ pub async fn delete_session(ctx: &mut Ctx) -> ApiResult {
 
 /// `GET {root}/sessions/{session_id}/definition` (`api.ts:2137-2151`).
 pub async fn get_session_definition(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
     let body = ctx.runtime.store.session_definition(&session_id).await?;
@@ -296,7 +300,7 @@ pub async fn get_session_definition(ctx: &mut Ctx) -> ApiResult {
 
 /// `GET {root}/sessions/{session_id}/commands` (`api.ts:2164-2178`).
 pub async fn get_session_commands(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
     let body = ctx
@@ -355,7 +359,7 @@ pub async fn post_session_reset(ctx: &mut Ctx) -> ApiResult {
     let session_id = session_of(ctx);
 
     require_session(ctx, &session_id)?;
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let body = ctx.runtime.store.reset_session(&session_id).await?;
 
@@ -413,7 +417,9 @@ pub(crate) fn store_of(ctx: &Ctx) -> &store::Store {
 
 /// `json(200, response)` with no revision at all, for the reads TS stamps nothing on
 /// (`api.ts:1232-1233`): the roster list, the instruction text, the session tool reads.
-#[must_use]
+///
+/// No `#[must_use]`: `ApiResult` already carries it, and an attribute with no message on a type that
+/// is already must-use is what `clippy::must_use_unit` refuses.
 pub(crate) fn plain(body: Value) -> ApiResult {
     Ok(api::json(200, body))
 }

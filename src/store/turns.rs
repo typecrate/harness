@@ -717,6 +717,10 @@ impl SessionStore {
                     cancelled: token.is_cancelled(),
                     messages: Vec::new(),
                     stop_reason: None,
+                    // A panic unwinds the executor with it, so nothing can be recovered: the drained
+                    // guidance of a run that died inside the executor is reported as none rather than
+                    // guessed at.
+                    unused_steering: Vec::new(),
                 },
             };
 
@@ -749,6 +753,10 @@ impl SessionStore {
         if inner.shutting_down {
             return None;
         }
+
+        // The CURRENT catalogue, cloned out of the guard BEFORE the session is borrowed mutably: the
+        // instruction ladder reads the live global overlay, and `inner` cannot be borrowed twice.
+        let catalogue = Arc::clone(&inner.host_agents);
 
         let state = inner.sessions.get_mut(session_id)?;
 
@@ -845,6 +853,27 @@ impl SessionStore {
             .as_deref()
             .and_then(|id| state.steer_tx.get(id).cloned());
 
+        // The conversation's accepted-but-undelivered guidance goes to the run that can use it
+        // (`sessions.ts:6461-6495`, and `harness.ts:6831-6836`'s hand-back for a run that drained
+        // steering and then failed). The mailbox is the durable half of that promise: a steer accepted
+        // with no live channel, and the guidance a failed run restored, both wait here and must reach
+        // the NEXT run in the order they were accepted - never overtaken by a fresh submit.
+        if let Some(conversation) = thread_id.as_deref() {
+            let pending = state.steer_mailbox.remove(conversation);
+
+            if let Some(records) = pending {
+                let count = u64::try_from(records.len()).unwrap_or(u64::MAX);
+
+                if let Some(sender) = state.steer_tx.get(conversation).cloned() {
+                    for record in records {
+                        let _ = sender.send(record.prompt.clone());
+                    }
+                }
+
+                state.steer_active = state.steer_active.saturating_sub(count);
+            }
+        }
+
         state.active.push(ActiveRun {
             turn_id: turn_id.clone(),
             index,
@@ -894,7 +923,7 @@ impl SessionStore {
         // `persistence.ts:778`). The layer order is `session > harness > global > catalogue`
         // (`read::instruction_for`).
         let (system_instruction, _instruction_source, _guidelines) =
-            state.instruction_for(&agent, self.agents());
+            state.instruction_for(&agent, &catalogue);
 
         if let Some(turn) = state.turns.get_mut(&turn_id) {
             turn.instruction_sources = vec![json!({
@@ -1197,7 +1226,44 @@ impl SessionStore {
 
         // N4: an unanswered question cannot outlive its run (`sessions.ts:7377-7382`), scoped to THIS
         // conversation so a sibling lane's question stays answerable.
-        state.expire_actions(ACTION_RUN_ENDED_MESSAGE, thread_id);
+        let closed_actions = state.expire_actions(ACTION_RUN_ENDED_MESSAGE, thread_id);
+
+        // R5 preservation (`harness.ts:6826-6837`): steering this run drained but never showed the
+        // model is rolled back WITH the transcript, so it goes back to the conversation instead of
+        // vanishing. Two arms of that rule are load-bearing:
+        //   * a STOP discards it - `cancelled` here is the same fact as `run.aborted`, and a cancel-all
+        //     or a thread stop has already said this conversation should not continue;
+        //   * a thread whose record is `stopped` discards it, because `stopThread` cleared its queue.
+        // Ordering note: this runs AFTER `expire_actions`, which subtracts the conversation's mailbox
+        // from `steer_active` - re-queueing first would have the expiry eat the guidance just restored.
+        if !outcome.unused_steering.is_empty()
+            && !cancelled
+            && let Some(conversation) = thread_id
+        {
+            let stopped = state.thread(conversation).is_some_and(|thread| {
+                thread.status == store::lifecycle_str(contract::ThreadLifecycle::Stopped)
+            });
+
+            if !stopped {
+                let requeued = u64::try_from(outcome.unused_steering.len()).unwrap_or(u64::MAX);
+
+                for text in &outcome.unused_steering {
+                    state
+                        .steer_mailbox
+                        .entry(conversation.to_owned())
+                        .or_default()
+                        .push(store::steer_record(
+                            ids::new_id(),
+                            at,
+                            text.clone(),
+                            None,
+                            None,
+                        ));
+                }
+
+                state.steer_active = state.steer_active.saturating_add(requeued);
+            }
+        }
 
         state.record.updated_at = at;
         state.touch_idle(at, self.config.idle_ms);
@@ -1287,6 +1353,15 @@ impl SessionStore {
             Some(turn_id),
             patch,
             Vec::new(),
+        );
+
+        // T16: the run ending settled every unanswered question of this conversation, so each one
+        // announces `action.closed` with reason `ended` (`sessions.ts:2325-2335` publishes from the ONE
+        // settlement point, and `api.ts:1126-1138` moves `actions` once per settlement).
+        self.publish_actions_closed(
+            session_id,
+            &closed_actions,
+            store::actions::action_closed_reason(ACTION_RUN_ENDED_MESSAGE),
         );
 
         // A cancelled session (removed or disposed mid-run) stops the pump entirely; a cancelled TURN
@@ -1487,7 +1562,7 @@ impl SessionStore {
             // `api-reads.ts:740-752`), which is the figure the roster row advertises, so a run never uses
             // a model its own row denies.
             provider: {
-                let mut provider = self.provider_of(state);
+                let mut provider = self.provider_of(inner, state);
                 provider.model = state.agent_model(agent);
 
                 provider

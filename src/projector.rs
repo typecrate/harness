@@ -28,11 +28,19 @@
 //!      `prompt: ""` and omits the rest; the row read model replaces them from the
 //!      `SessionTurn` it already has (`store::read::TurnState::row` renames `prompt` into
 //!      `promptPreview`/`promptChars`).
-//!   3. **The context bar.** `context:add`/`context:set`/`context:remove` and
-//!      `TurnSection.context` are not produced, so `blocks` is `[]` and a section carries no
-//!      `context` field. The lazy BLOCK-detail route has nothing to answer from until that half
-//!      lands; the STEP detail route is unaffected, because a step's answer is the two recorded
-//!      events, which the store owns.
+//!   3. **The context bar's record-only half.** The `user` and `system` blocks TypeScript mints
+//!      on its prompt section (`turn-projector.ts:98-113`) have no input here: the projector seam
+//!      is `ProjectorFactory::create(&self)` (`ports.rs:239-241`), which carries no prompt, and
+//!      the protocol's event enum has no user or instruction event. The fold DOES mint the blocks
+//!      its events describe - a `tool` block per call, rewritten by its result, and an
+//!      `assistant` block per final answer - while `blocks` stays `[]`, because the list
+//!      TypeScript publishes there is the prompt section's.
+//!
+//!      THE ID OFFSET THAT FOLLOWS FROM IT: TypeScript numbers a block with
+//!      `${section.sections.length}-${kind}-${key}`, and its `sections` array already holds the
+//!      prompt section at index 0. This fold has none, so the same block on the same flow is ONE
+//!      LOWER (`1-tool-c…` where TypeScript says `2-tool-c…`), stable across live and replay like
+//!      every other id here.
 //!
 //! The pending-tool line (`pending:set` / `PENDING_NODE_ID`) is absent too: this crate's turn
 //! engine runs a tool round to completion before the next request, so from the projector's
@@ -352,6 +360,11 @@ pub struct Section {
     cached_reported: bool,
     answer_node_id: Option<String>,
     tail: Option<Value>,
+    /// The CONTEXT BAR entries of this flow (`TurnSection.context`, `turn-display.ts:953`), in
+    /// mint order: a `tool` block follows every call and is rewritten when its result lands, and
+    /// the root flow’s final answer becomes an `assistant` block (`pushBlock`,
+    /// `turn-projector.ts:1029-1054`). Empty for a flow whose events describe no bar entry.
+    context: Vec<Value>,
     nodes: Vec<Node>,
     /// The prose node this request is still streaming into; detached at every boundary.
     text_writer: Option<usize>,
@@ -376,6 +389,10 @@ pub struct TurnProjector {
     last_applied_at: Option<u64>,
     /// An owner question's step, so its answer can settle the same row by request id.
     action_steps: BTreeMap<String, String>,
+    /// The context-bar segment the NEXT tool result settles, as (section index, block id)
+    /// (`pendingToolBlocks`, `turn-projector.ts:3378`). The pairing is by call, in order, exactly
+    /// as the step pairing is, so an out-of-order result settles the right segment or none.
+    pending_block: Option<(usize, String)>,
 }
 
 impl TurnProjector {
@@ -721,6 +738,74 @@ impl TurnProjector {
         }));
     }
 
+    /// `addBlock` (`turn-projector.ts:1029-1054`, id from `blockIdOf:1005-1007`): append one
+    /// context-bar entry to a flow and publish it as `context:add`. The caller builds the shape.
+    ///
+    /// A `ContextBlock` is METADATA ONLY (`turn-display.ts:434-559`): no text and no preview, so
+    /// the bar stays bounded however long the conversation runs. The bytes of the recorded range
+    /// `[eventFrom..=eventTo]` are fetched per block on a click, which is why the lazy block route
+    /// answers from the durable record (`api::turns::find_block` + `build_turn_block_detail`).
+    ///
+    /// The id is `{section count}-{kind}-{key}`, the count being TypeScript's
+    /// `section.sections.length`. This fold has no prompt section at index 0, so the same segment
+    /// sits ONE ORDINAL LOWER than TypeScript's (`1-tool-7` where TypeScript says `2-tool-7`);
+    /// it is still minted once and never renumbered, so an id captured before a restart resolves
+    /// after it (invariant 4).
+    fn add_block(&mut self, section: usize, block: Value, ops: &mut Vec<Value>) {
+        self.sections[section].context.push(block);
+
+        ops.push(json!({
+            "op": "context:add",
+            "turnId": "",
+            "sectionId": self.sections[section].id,
+            // The op carries the row AS STORED, so a client that applies the op reaches exactly
+            // the document a cold replay compiles.
+            "block": self.sections[section].context.last().cloned().unwrap_or(Value::Null),
+        }));
+    }
+
+    /// `patchBlock` (`:1061-1082`): merge a patch into one segment and publish it as
+    /// `context:set`. Identity members (`id`, `kind`, `turnId`, `sectionId`, `eventFrom`) are
+    /// immutable (`turn-display.ts:561-566`), so a patch that would change one of those must be a
+    /// `context:remove` + `context:add` pair instead - none of the patches here does.
+    ///
+    /// A patch for a block this fold has never minted is dropped: TypeScript's `updateToolBlock`
+    /// returns at `:1065` for the same reason, and inventing a late segment would put a row in the
+    /// bar that no event ordered.
+    fn patch_block(
+        &mut self,
+        section: usize,
+        block_id: &str,
+        patch: Map<String, Value>,
+        ops: &mut Vec<Value>,
+    ) {
+        let Some(position) = self.sections[section]
+            .context
+            .iter()
+            .position(|block| block.get("id").and_then(Value::as_str) == Some(block_id))
+        else {
+            return;
+        };
+
+        let block = &mut self.sections[section].context[position];
+
+        let Some(entries) = block.as_object_mut() else {
+            return;
+        };
+
+        for (key, value) in &patch {
+            entries.insert(key.clone(), value.clone());
+        }
+
+        ops.push(json!({
+            "op": "context:set",
+            "turnId": "",
+            "sectionId": self.sections[section].id,
+            "blockId": block_id,
+            "patch": Value::Object(patch),
+        }));
+    }
+
     /// Adds one step node and reports it (`pushStep`, `:1215-1239`).
     ///
     /// `attempt_owned` decides whether a later `retry` may remove this step: a tool call IS
@@ -1020,6 +1105,38 @@ impl Projector for TurnProjector {
                 });
 
                 self.push_step(section, step, true, &mut ops);
+
+                // The bar’s segment for this call (`turn-projector.ts:2043`): the key is the call's
+                // OWN event index, so the step row and the bar agree by construction
+                // (`turn-display.ts:446-448`). No text travels with the segment - it is metadata,
+                // and the payload route reads `[eventFrom..=eventTo]` out of the record on a click.
+                let args_chars = display_chars(&call.arguments);
+                let section_id = self.sections[section].id.clone();
+                let block_id = format!("{}-tool-{index}", self.sections.len().max(1));
+
+                self.add_block(
+                    section,
+                    json!({
+                        "kind": "tool",
+                        "id": block_id,
+                        "turnId": "",
+                        "sectionId": section_id,
+                        "name": call.name,
+                        "at": at,
+                        // `chars` is the WHOLE recorded length (invariant 5), and while the call is
+                        // open that is exactly the argument bytes, because no result exists yet.
+                        "chars": args_chars,
+                        "argsChars": args_chars,
+                        // The arguments travelled with the committed message that asked for the
+                        // call, so an open call already counts as prompt text (`:529-541`).
+                        "inPrompt": true,
+                        "eventFrom": index,
+                        "eventTo": index,
+                    }),
+                    &mut ops,
+                );
+
+                self.pending_block = Some((section, block_id));
             }
 
             HarnessEvent::ToolResult {
@@ -1074,6 +1191,59 @@ impl Projector for TurnProjector {
                     );
 
                     self.patch_step(&step_id, patch, &mut ops);
+
+                    // The SAME segment, settled: the result's length joins `chars`, and `state`,
+                    // `endedAt` and the measured span come straight from the record - never a
+                    // re-derivation (`turn-display.ts:489-545`). One block per call, so a result
+                    // patches the row its call opened instead of adding a second one.
+                    let settling = self
+                        .pending_block
+                        .take()
+                        .filter(|(block_section, _)| *block_section == section);
+
+                    // The pending entry is CONSUMED either way: a segment opened in another flow
+                    // is not this result's to settle, and it must not linger to settle the wrong
+                    // one later. The shadow is deliberate - the filter proved the two are one.
+                    if let Some((section, block_id)) = settling {
+                        let prior = self.sections[section].context.iter().find(|block| {
+                            block.get("id").and_then(Value::as_str) == Some(block_id.as_str())
+                        });
+
+                        let args_chars = prior
+                            .and_then(|block| block.get("argsChars").and_then(Value::as_u64))
+                            .unwrap_or(0);
+
+                        let restamped = prior
+                            .and_then(|block| block.get("name").and_then(Value::as_str))
+                            .is_some_and(|recorded| recorded != name.as_str());
+
+                        let result_chars = display_chars(content);
+
+                        let mut block_patch = Map::new();
+
+                        block_patch.insert(
+                            "chars".to_owned(),
+                            json!(args_chars + u64::try_from(result_chars).unwrap_or(u64::MAX)),
+                        );
+                        block_patch.insert("resultChars".to_owned(), json!(result_chars));
+                        block_patch.insert("state".to_owned(), json!(state));
+                        block_patch.insert("endedAt".to_owned(), json!(at));
+                        block_patch.insert("eventTo".to_owned(), json!(index));
+
+                        // A measured span only when the runtime recorded one: an immediate
+                        // validation failure executed nothing (`contract.rs:784-787`).
+                        if let Some(duration) = duration_ms {
+                            block_patch.insert("durationMs".to_owned(), json!(duration));
+                        }
+
+                        // `name` is re-stamped ONLY when the recorded name changed
+                        // (`turn-display.ts:478-480`), which an out-of-order pair can do.
+                        if restamped {
+                            block_patch.insert("name".to_owned(), json!(name));
+                        }
+
+                        self.patch_block(section, &block_id, block_patch, &mut ops);
+                    }
                 } else {
                     // A genuine result-only frame (a missed `tool_call`): show it rather than
                     // dropping information (`:2145-2202`). This frame is not attempt-owned:
@@ -1168,6 +1338,51 @@ impl Projector for TurnProjector {
                 // the turn settles, and a response still waiting on background work has not
                 // finished at all (`:2307-2321`).
                 self.commit_attempt(section, &mut ops);
+
+                // The bar's answer segment. TypeScript mints an `assistant` block per WINDOW of
+                // streamed `text` deltas and falls back to the `done` message ONLY when that
+                // window holds no deltas - the two carry the same bytes, and counting both would
+                // double the answer (`turn-display.ts:373-376`). This fold does not open a bar
+                // segment per prose window (the deltas are folded into nodes; a segment per window
+                // would need a window-scoped id and a patch on every delta), so the fallback IS
+                // the answer segment here, keyed by the `done` event's own index exactly as
+                // TypeScript keys that same case.
+                //
+                // Only the ROOT flow gets one: a nested flow's answer is already a row in its
+                // parent's transcript (`:2380`). A pending set is never consulted, because this
+                // engine runs a tool round to completion before the next request - the module
+                // header says why.
+                let streamed = self.sections[section]
+                    .nodes
+                    .iter()
+                    .any(|node| node.kind == "text");
+
+                if self.sections[section].key == ROOT_KEY
+                    && !streamed
+                    && !message.content.is_empty()
+                {
+                    let answer_chars = display_chars(&message.content);
+                    let section_id = self.sections[section].id.clone();
+
+                    self.add_block(
+                        section,
+                        json!({
+                            "kind": "assistant",
+                            "id": format!("{}-assistant-{index}", self.sections.len().max(1)),
+                            "turnId": "",
+                            "sectionId": section_id,
+                            "name": "answer",
+                            "at": at,
+                            "chars": answer_chars,
+                            // A committed answer IS prompt text for the requests that follow
+                            // (`turn-display.ts:529-541`).
+                            "inPrompt": true,
+                            "eventFrom": index,
+                            "eventTo": index,
+                        }),
+                        &mut ops,
+                    );
+                }
 
                 let mut patch = Map::new();
 
@@ -1926,6 +2141,11 @@ fn wire_section(section: &Section) -> Value {
         .map(|position| wire_node(section, position))
         .collect();
 
+    // The bar rides the row whether or not it has entries, because TypeScript’s
+    // `createBaseSection` always sets `context: []` (`:700-712`); a client may map over it
+    // without a presence check.
+    entry.insert("context".to_owned(), Value::Array(section.context.clone()));
+
     entry.insert("nodes".to_owned(), Value::Array(nodes));
 
     Value::Object(entry)
@@ -2045,4 +2265,95 @@ impl ProjectorFactory for TurnProjectorFactory {
     fn create(&self) -> Box<dyn Projector> {
         Box::new(TurnProjector::new())
     }
+}
+
+// ---------------------------------------------------------------------------
+// The wire identity the seam cannot mint (`knowledge.md` "The projector seam's limits")
+//
+// `TurnProjector` has NO turn record (`ProjectorFactory::create()` takes none), so its own section
+// keys are `s{ordinal}` and every op says `turnId: ""`. The wire identity is `${turnId}:${ordinal}`
+// (`turn-projector.ts:698`), and the ordinal is exactly the position `mint_section` allocated — the
+// same fact `display()`'s section array states by its order.
+//
+// BOTH readers therefore run through the functions below: the LIVE `display.ops` frames the store
+// publishes (`store::TurnState::record_event`) and the REST display document
+// (`store::read::TurnState::display`). Before this existed, only the REST path re-stamped, so a
+// listener that applied the ops it streamed and then read the snapshot saw two different sets of
+// section ids and had to rebuild the tree to reconcile them.
+// ---------------------------------------------------------------------------
+
+/// The wire id of one projector section (`turn-projector.ts:698`).
+///
+/// An id this fold did not mint (`"turn"`, a `{ordinal}-{kind}-{key}` block id, a `{turnId}:{n}` that
+/// is already stamped, a node id `n{index}`) is returned unchanged, which makes the rewrite idempotent.
+#[must_use]
+pub fn section_wire_id(turn_id: &str, id: &str) -> String {
+    let Some(ordinal) = id.strip_prefix('s') else {
+        return id.to_owned();
+    };
+
+    if ordinal.is_empty() || !ordinal.bytes().all(|byte| byte.is_ascii_digit()) {
+        return id.to_owned();
+    }
+
+    format!("{turn_id}:{ordinal}")
+}
+
+/// Rewrites one value in place: every `turnId` string field gets the turn id, and every string that IS
+/// a projector section key becomes its wire id — at any depth, because an op embeds the section payload
+/// (`section:open`), a section patch, a step copy and a tail descriptor, and each of those names the
+/// section under its own key (`sectionId`, `parentSectionId`, `id`, ...).
+///
+/// The "value is a section key" test is the shape, not the key name: only `s{digits}` matches, so a
+/// prose string that happens to read "s1" is the only content that could ever be rewritten, and the
+/// fold never puts prose in an id position.
+pub fn stamp_turn_identity(turn_id: &str, value: &mut Value) {
+    match value {
+        Value::Object(entries) => {
+            for (key, entry) in entries.iter_mut() {
+                if let Some(text) = entry.as_str() {
+                    if key == "turnId" {
+                        *entry = Value::String(turn_id.to_owned());
+                    } else {
+                        let stamped = section_wire_id(turn_id, text);
+
+                        if stamped != text {
+                            *entry = Value::String(stamped);
+                        }
+                    }
+
+                    continue;
+                }
+
+                stamp_turn_identity(turn_id, entry);
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                stamp_turn_identity(turn_id, item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Stamps every op of one turn with the identity the wire carries (`sectionWireId` + `turnId`,
+/// `turn-projector.ts:698`/`:1982-1990`).
+///
+/// The store mints ops in exactly one place — `TurnState::record_event` — so stamping here is what
+/// makes a streamed `display.ops` section id EQUAL the id `GET /sessions/:id/turns/:turn/display`
+/// reports for the same section, which is the point of the compact board channel.
+#[must_use]
+pub fn stamp_display_ops(turn_id: &str, ops: Vec<Value>) -> Vec<Value> {
+    if turn_id.is_empty() {
+        return ops;
+    }
+
+    let mut stamped = ops;
+
+    for op in &mut stamped {
+        stamp_turn_identity(turn_id, op);
+    }
+
+    stamped
 }

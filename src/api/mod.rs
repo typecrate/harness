@@ -44,6 +44,7 @@ use crate::origin;
 use crate::paging;
 use crate::ports::Query;
 use crate::runtime::{self, HarnessRuntime};
+use crate::stream;
 
 pub mod actions;
 pub mod agents;
@@ -143,10 +144,26 @@ impl Ctx {
     /// A route documented as body-less (`readEmptyBody`, `api.ts:520-531`): the body IS still read,
     /// because a malformed one must be refused rather than ignored; anything other than an absent
     /// body, `null`, or `{}` is then a 400.
+    ///
+    /// NOT used by any route today: the TypeScript server never calls `readEmptyBody` (it is defined
+    /// and left uncalled), and its GET/DELETE handlers never touch `ctx.body()` - so a body on those
+    /// verbs is ignored rather than refused. See [`Ctx::ignore_body`] and `knowledge.md` "T7b".
     pub async fn require_empty_body(&mut self) -> Result<(), ApiError> {
         let value = self.body.read().await?;
 
         contract::require_empty_body(&value)
+    }
+
+    /// The GET/DELETE/reset rule: TypeScript never reads the body on these verbs, so a body is
+    /// IGNORED - not parsed (a malformed one stays a success) and not refused.
+    ///
+    /// The stream is still drained, which is the adapter's own requirement rather than the
+    /// contract's: the answer is flushed the moment the handler returns, and a client still writing
+    /// its upload would read a connection reset instead of the JSON document
+    /// (`drain_unread_body`'s note). Awaiting here also keeps every handler's signature uniform, so
+    /// the dispatcher's table stays data.
+    pub async fn ignore_body(&mut self) {
+        self.body.drain_pending().await;
     }
 
     /// One raw query value, untrimmed (`ctx.query.get(name)`, which the paging routes hand straight
@@ -231,6 +248,22 @@ impl BodyReader {
 }
 
 impl BodyReader {
+    /// Throws away an unread body WITHOUT parsing it: no cap check, no media-type check, no JSON
+    /// decode. This is what a body-less verb does with a body the contract never documents
+    /// ([`Ctx::ignore_body`]), and it is also the dispatcher's sweep after a handler that refused
+    /// before looking at the stream.
+    ///
+    /// The state becomes `Ready({})` so a later sweep does not read the same (now empty) stream
+    /// twice; the parsed value is deliberately never produced, because the whole point is that these
+    /// bytes are not interpreted.
+    pub async fn drain_pending(&mut self) {
+        if matches!(self, Self::Pending { .. }) {
+            drain(pending_stream(self), BODY_DRAIN_GRACE_BYTES).await;
+
+            *self = Self::Ready(Value::Object(serde_json::Map::new()));
+        }
+    }
+
     /// Reads, caps, type-checks and parses the stream (`readJson` + `readBoundedBody`).
     pub async fn read(&mut self) -> Result<Value, ApiError> {
         let outcome = match self {
@@ -1320,70 +1353,22 @@ fn pending_stream(reader: &mut BodyReader) -> Body {
 /// 2 MB body. The bytes are therefore read and thrown away, bounded by the same grace the 405 arm
 /// uses, so a compliant client always receives its 400/404/405/415.
 async fn drain_unread_body(reader: &mut BodyReader) {
-    if matches!(reader, BodyReader::Pending { .. }) {
-        drain(pending_stream(reader), BODY_DRAIN_GRACE_BYTES).await;
-    }
+    reader.drain_pending().await;
 }
 
 fn ctx_epoch(ctx: &Ctx) -> String {
     ctx.runtime.epoch()
 }
 
-/// The stream mount (`api.ts:3906-3912` + `handler.ts:245-250`).
+/// The stream mount (`api.ts:3906-3912` + `handler.ts:245-250` + `stream/{transport,mount}.ts`).
 ///
-/// T5c replaces the body of this function with the WebSocket upgrade; today the contract's honest
-/// non-upgrade answer is the 400 the JSON dispatcher itself raises, which is what
-/// `queue.test.ts:1090` and `view.test.ts:779` pin.
+/// T5c owns the whole upgrade now, so the body is one delegation: the gates, the subprotocol echo, the
+/// `X-Harness-Epoch` header on the 101 and the frame conversation all live in [`crate::stream`]. The
+/// honest non-upgrade answer is still TypeScript's own 400 sentence, which `crate::stream::upgrade`
+/// prints for a GET that never sent the upgrade tokens - the one `queue.test.ts:1090` and
+/// `view.test.ts:779` pin.
 pub async fn handle_stream(root: PathBuf, request: Request) -> Response {
-    let (parts, body) = request.into_parts();
-    let headers = parts.headers;
-    let pathname = parts.uri.path().to_owned();
-    let query = parse_query(parts.uri.query());
-    let method = parts.method.as_str().to_ascii_uppercase();
-
-    // The stream gate applies the SAME rule as REST, including `https://*.github.io`
-    // (`stream/mount.ts:41-60`); only the refusal sentence differs.
-    if let Err(error) = origin::check_stream_origin(
-        header_text(&headers, "origin").as_deref(),
-        header_text(&headers, "host").as_deref(),
-    ) {
-        return write_error(&error, events::process_epoch());
-    }
-
-    let runtime = match runtime::runtime_for(&root) {
-        Ok(runtime) => runtime,
-        Err(error) => return write_error(&error, events::process_epoch()),
-    };
-
-    let epoch = runtime.epoch();
-    let mount = requested_mount(&pathname);
-
-    if mount != contract::HARNESS_API_ROOT {
-        return write_error(
-            &ApiError::not_found(format!(
-                "This server serves {}; \"{mount}\" is not mounted.",
-                contract::HARNESS_API_ROOT
-            )),
-            &epoch,
-        );
-    }
-
-    let reader = BodyReader::pending(body, contract::MAX_BODY_BYTES, &headers);
-
-    let mut ctx = Ctx {
-        runtime,
-        method,
-        pathname,
-        query,
-        params: BTreeMap::new(),
-        headers,
-        body: reader,
-    };
-
-    root::stream_route(&mut ctx)
-        .await
-        .map(|response| write_response(&response, &ctx_epoch(&ctx)))
-        .unwrap_or_else(|error| write_error(&error, &ctx_epoch(&ctx)))
+    stream::upgrade(root, request).await
 }
 
 /// Routes one matched operation to its handler. This is the only place a handler is named, so the

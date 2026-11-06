@@ -82,6 +82,13 @@ where
 /// Serves an already-bound listener, which is what lets the executable print the address it REALLY
 /// got (`--port 0` asks for any free port, so the requested address is not the answer) and what
 /// lets a test hold a socket on `127.0.0.1:0`.
+///
+/// The shutdown arm runs the stream half of the host's close step BEFORE the listener finishes
+/// draining (`start.ts:319-340` closes the mount, then disposes the store): every live connection
+/// gets its `error` frame plus close `1001` while the socket is still open, and the store stops
+/// claiming queued work so a turn that has not started cannot start behind the drain. An upgraded
+/// WebSocket is an in-flight request to hyper, so a stream that is never told to leave would hold
+/// graceful shutdown open until the client's own timeout.
 pub async fn serve_on<F>(
     listener: TcpListener,
     database_root: PathBuf,
@@ -90,10 +97,45 @@ pub async fn serve_on<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    let closing = database_root.clone();
+
     axum::serve(listener, router(database_root))
-        .with_graceful_shutdown(shutdown)
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+
+            begin_shutdown(&closing);
+        })
         .await
 }
+
+/// Stops claiming queued work and closes every live stream of `database_root` with `1001`
+/// (`start.ts:319-327`'s mount close, and `sessions.ts:8638 dispose`'s `shuttingDown` flag).
+///
+/// A root with no runtime yet served no request and holds no socket, so this answers quietly. The
+/// durable checkpoint stays a separate step ([`flush`]), because that is the part that can fail and
+/// the part an embedder may want to order differently — the `typecrate-services` gateway owns its own
+/// listener, so it calls this from its own process-exit path rather than from `serve_on`.
+pub fn begin_shutdown(database_root: &Path) {
+    let Some(active) = runtime::cached_runtime(database_root) else {
+        return;
+    };
+
+    active.store.begin_shutdown();
+    active.close_streams(STREAM_SHUTDOWN_CODE);
+}
+
+/// [`begin_shutdown`] for EVERY root this process cached, for a host that serves several roots and
+/// owns the listener (`typecrate-services`' executable).
+pub fn begin_shutdown_all() {
+    for active in runtime::cached_runtimes() {
+        active.store.begin_shutdown();
+        active.close_streams(STREAM_SHUTDOWN_CODE);
+    }
+}
+
+/// The close code a graceful host shutdown sends (`stream/protocol.ts`'s `GOING_AWAY` arm: 1001,
+/// which the connection turns into an `error` frame with that `close_code` and then the close).
+pub const STREAM_SHUTDOWN_CODE: u16 = 1001;
 
 /// Writes the final durable document for `database_root` on the way out: the live sessions, the
 /// registry rows, the tombstones and the saved provider pair.
@@ -111,5 +153,8 @@ pub fn flush(database_root: &Path) -> Result<(), ApiError> {
         return Ok(());
     };
 
-    active.save()
+    // `begin_shutdown` already ran in `serve_on`'s arm for a standalone listener; repeating it is
+    // what makes this callable on its own (an embedder that never went through `serve_on`), and both
+    // steps are idempotent.
+    active.shutdown()
 }

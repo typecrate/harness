@@ -282,8 +282,21 @@ impl ToolRegistry {
     }
 
     /// The one rule, stated per row, for whether a model is offered this tool.
+    ///
+    /// A row this build CANNOT execute is never offered, whatever the policy enabled
+    /// (`knowledge.md` "Catalogued-only tools"): TS's `declared()` comes from the live registry, and
+    /// every name in [`MISSING_CAPABILITY`] is absent from this port's registry, so offering it
+    /// would send the model a tool whose call can only fail. The same filter is what keeps
+    /// `toolRequest`/`toolList` from surfacing them - both answer from this list.
     #[must_use]
     pub fn is_declared(&self, entry: &Entry, policy: &ToolPolicy) -> bool {
+        if MISSING_CAPABILITY
+            .iter()
+            .any(|(name, _)| *name == entry.name)
+        {
+            return false;
+        }
+
         // The bootstrap pair and the session plan ride EVERY request
         // (`toolbox.ts:188-190` `CORE_TOOL_NAMES`), as do the core file tools
         // (`toolbox.ts:197-201` `CORE_PRESET_TOOL_NAMES`).
@@ -335,14 +348,34 @@ impl ToolRuntime for ToolRegistry {
             .collect()
     }
 
-    /// Every catalogue row, in the order `GET /tools` emits them.
+    /// Every row the SERVER lists, in the order `GET /tools` emits them. The four
+    /// `listed: false` runtime rows are withheld exactly as `tools/descriptors.ts:290-328`
+    /// withholds them from `RUNTIME_DESCRIPTORS`; they stay resolvable through
+    /// [`catalogue::find`] for the session toolbox and the execution dispatch.
     fn summaries(&self) -> Vec<ToolSummary> {
+        catalogue::listed_entries()
+            .map(|entry| self.summary_of(entry))
+            .collect()
+    }
+
+    /// Every row of the generated table, which is what a SESSION toolbox walks: TS's
+    /// `sessionToolRowsOf` reads the live harness registry (`api-reads.ts:831-836`), and that
+    /// registry holds the four `listed: false` capability rows.
+    fn catalogue_summaries(&self) -> Vec<ToolSummary> {
         ENTRIES.iter().map(|entry| self.summary_of(entry)).collect()
     }
 
     /// One row plus the two fields only the identified read carries: the argument schema
     /// and the execution gate (`harness-api.ts:654-665`).
+    ///
+    /// An unlisted row is `None` here, exactly like TS's `getToolOne`, which looks the name up in
+    /// `coreEntries` (the listed runtime set) `?? catalogue.find(name)` and therefore 404s
+    /// `threadRead` (`api.ts:1847`).
     fn detail(&self, name: &str) -> Option<ToolDetail> {
+        if !catalogue::is_listed(name) {
+            return None;
+        }
+
         let entry = catalogue::find(name)?;
 
         Some(ToolDetail {
@@ -592,7 +625,7 @@ fn validated_action_request(arguments: &Value) -> Result<Value, ToolFailure> {
             "actionRequest received arguments that do not match its schema: missing required property \"question\".".to_owned(),
         ))?;
 
-    if question.trim().is_empty() || question.chars().count() > 4_000 {
+    if question.trim().is_empty() || question.encode_utf16().count() > 4_000 {
         return Err(ToolFailure::Rejected(
             "actionRequest question must be a non-blank string of at most 4000 characters."
                 .to_owned(),
@@ -845,7 +878,9 @@ mod tests {
         });
         let summaries = registry.summaries();
 
-        assert_eq!(summaries.len(), ENTRIES.len());
+        // The LISTED set is the TS page: 35 rows minus the four the manifest marks
+        // `listed: false` (`tool-manifest.ts:1002, 1046, 1692, 1811`).
+        assert_eq!(summaries.len(), ENTRIES.len() - UNLISTED_EXPECTED.len());
         assert_eq!(ENTRIES.len(), 35);
         assert_eq!(summaries[0].name, "toolRegistry");
         assert_eq!(summaries[0].group, "Core tools");
@@ -866,8 +901,9 @@ mod tests {
         let index = |name: &str| rows.iter().position(|(row, _)| row == name).expect("a row");
 
         // The group boundaries the TypeScript route states (`api.test.ts:1134-1150`,
-        // `server.test.ts:219`, `websearch.test.ts:112`).
-        assert!(index("threadList") < index("syntax"));
+        // `server.test.ts:219`, `websearch.test.ts:112`). `threadFork` is the last LISTED runtime
+        // row; `threadList` is no longer in this page at all (asserted below).
+        assert!(index("threadFork") < index("syntax"));
         assert!(index("download") < index("timeNow"));
         assert!(index("textSummarize") < index("search"));
         assert_eq!(rows[index("search")].1.as_str(), "Web search");
@@ -879,12 +915,38 @@ mod tests {
         let mut names: Vec<&str> = summaries.iter().map(|row| row.name.as_str()).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), ENTRIES.len());
+        assert_eq!(names.len(), summaries.len());
 
         for name in crate::registry::presets::SHARED_TOOL_NAMES {
             assert!(names.contains(&name), "{name} must stay catalogued");
         }
+
+        // T7b: the four unlisted runtime rows are absent from the GLOBAL listing and its identified
+        // read, while the session toolbox and the execution dispatch still resolve them.
+        for name in UNLISTED_EXPECTED {
+            assert!(
+                !names.contains(&name),
+                "{name} is `listed: false` in the manifest and must not appear in GET /tools"
+            );
+            assert!(
+                registry.detail(name).is_none(),
+                "{name} must not resolve on GET /tools/{{name}} either"
+            );
+            assert!(
+                registry
+                    .catalogue_summaries()
+                    .iter()
+                    .any(|row| row.name == *name),
+                "{name} stays in the session toolbox, which reads the live registry"
+            );
+        }
+
+        assert_eq!(registry.catalogue_summaries().len(), ENTRIES.len());
     }
+
+    /// The manifest's `listed: false` runtime rows, restated here so the test names the same set
+    /// `catalogue::UNLISTED` does (a drift between the two is a catalogue bug worth failing on).
+    const UNLISTED_EXPECTED: [&str; 4] = ["toolCancel", "threadSend", "threadRead", "threadList"];
 
     #[test]
     fn search_states_its_environment_and_fetch_omits_nothing() {
@@ -997,9 +1059,37 @@ mod tests {
 
         assert!(names.contains(&"shell".to_owned()));
         assert!(names.contains(&"read".to_owned()));
-        assert!(names.contains(&"delegate".to_owned()));
         assert!(names.contains(&"toolRequest".to_owned()));
         assert!(names.contains(&"task".to_owned()));
+
+        // T7b: `delegate` is catalogued-only in this build (no nested-run runtime), so it is NOT
+        // offered even when the harness has subagents. The same rule covers every name in
+        // `MISSING_CAPABILITY`; an explicitly enabled one is the case that used to leak through
+        // `policy.enabled`, and it is what `toolRequest` used to be able to surface.
+        assert!(
+            !names.iter().any(|name| name == "delegate"),
+            "a catalogued-only name is never declared"
+        );
+
+        let enabled_only = ToolPolicy {
+            enabled: vec!["profileManage".to_owned(), "threadRead".to_owned()],
+            ..ToolPolicy::default()
+        };
+        let offered: Vec<String> = registry
+            .declarations(&enabled_only)
+            .iter()
+            .map(|decl| decl.name.clone())
+            .collect();
+
+        assert!(
+            !offered
+                .iter()
+                .any(|name| name == "profileManage" || name == "threadRead"),
+            "an enabled-but-unexecutable tool is offered to neither the model nor toolRequest: {offered:?}"
+        );
+        // The genuinely executable core pair is still offered, so the filter removed the two
+        // names and not the whole list.
+        assert!(offered.iter().any(|name| name == "toolRequest"));
 
         // Catalogue order, not policy order.
         let position = |name: &str| names.iter().position(|row| row == name).expect("declared");

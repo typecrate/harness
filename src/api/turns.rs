@@ -47,7 +47,7 @@ const TURN_ORDERS: [&str; 2] = ["asc", "desc"];
 /// apply, then the cursor slices what survives - so the page and `next_cursor` describe the filtered
 /// collection and no turn record is copied on this path.
 pub async fn get_session_turns(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
 
@@ -88,7 +88,7 @@ pub async fn get_session_turns(ctx: &mut Ctx) -> ApiResult {
 
 /// `GET {root}/sessions/{session_id}/turns/{turn_id}` (`api.ts:3791-3798`).
 pub async fn get_session_turn(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
     let turn_id = ctx.param("turn_id").to_owned();
@@ -125,7 +125,7 @@ pub async fn get_session_turn(ctx: &mut Ctx) -> ApiResult {
 /// The tree is the projector's document with the turn's identity stamped in (see the module header);
 /// the route adds `revision`, which is the owning turn's figure by definition (`:3820-3822`).
 pub async fn get_session_turn_display(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
     let turn_id = ctx.param("turn_id").to_owned();
@@ -163,7 +163,7 @@ pub async fn get_session_turn_display(ctx: &mut Ctx) -> ApiResult {
 /// `next` therefore names the ordinal AFTER the last event served, and `total_events` is the count of
 /// matching events while `partial` is true for as long as the turn is queued or running.
 pub async fn get_session_turn_events(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
     let turn_id = ctx.param("turn_id").to_owned();
@@ -192,7 +192,9 @@ pub async fn get_session_turn_events(ctx: &mut Ctx) -> ApiResult {
 
     // The next cursor exists only for an exactly-full page that has not reached the end of the log
     // (`api.ts:3838-3842`).
-    let next = last.filter(|last| served == limit && last + 1 < recorded).map(|last| last + 1);
+    let next = last
+        .filter(|last| served == limit && last + 1 < recorded)
+        .map(|last| last + 1);
 
     let revision = ctx.revision("turn", Some(&turn_key(&session_id, &turn_id)));
 
@@ -219,7 +221,7 @@ pub async fn get_session_turn_events(ctx: &mut Ctx) -> ApiResult {
 /// result index come from the compiled display state, because the projection is what made them
 /// addressable; the two EVENTS come from the raw record, verbatim.
 pub async fn get_session_turn_step(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
     let turn_id = ctx.param("turn_id").to_owned();
@@ -238,7 +240,8 @@ pub async fn get_session_turn_step(ctx: &mut Ctx) -> ApiResult {
             ApiError::bad_request("A step id must be the recorded event index of the step.")
         })?;
 
-    let unknown = || ApiError::not_found(format!("Unknown step \"{step_id}\" in turn \"{turn_id}\"."));
+    let unknown =
+        || ApiError::not_found(format!("Unknown step \"{step_id}\" in turn \"{turn_id}\"."));
 
     let store = ctx.runtime.store.as_ref();
     let mut inner = store.lock();
@@ -295,12 +298,14 @@ pub async fn get_session_turn_step(ctx: &mut Ctx) -> ApiResult {
 /// `sessions.ts:3976-4018`).
 ///
 /// The METADATA comes from the compiled bar itself, so an answer can never disagree with the segment
-/// that was clicked; the PAYLOAD comes from the durable record. THIS BUILD mints no context segments
-/// at all - the projector seam has no `context:*` ops (`knowledge.md` "T4"), so `TurnSummary.blocks`
-/// is `[]` and every lookup here is the honest 404, never a synthesized body. The lookup and the
-/// payload builder are ported so the route becomes real the moment the projector folds a bar.
+/// that was clicked; the PAYLOAD comes from the durable record. The bar EXISTS for the kinds the
+/// events describe - the fold mints a `tool` block per call and an `assistant` block per final
+/// answer (`projector::TurnProjector::push_block`) - and the record-only kinds (`user`/`system`)
+/// stay unminted, because the projector seam is created without the prompt (`ports.rs:239-241`);
+/// a lookup for one of those is the honest 404, never a synthesized body. The lookup and the
+/// payload builder are ported whole, so a block the bar does have answers in full.
 pub async fn get_session_turn_block(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
     let turn_id = ctx.param("turn_id").to_owned();
@@ -356,11 +361,13 @@ pub async fn get_session_turn_block(ctx: &mut Ctx) -> ApiResult {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let name = block
-        .get("name")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let range = |key: &str| block.get(key).and_then(Value::as_u64).map(|value| value as usize);
+    let name = block.get("name").and_then(Value::as_str).map(str::to_owned);
+    let range = |key: &str| {
+        block
+            .get(key)
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+    };
     let from = range("eventFrom");
     let to = range("eventTo");
 
@@ -390,11 +397,14 @@ pub async fn get_session_turn_block(ctx: &mut Ctx) -> ApiResult {
                 .iter()
                 .chain(steers.iter())
                 .find(|submit| {
-                    submit.get("prompt").and_then(Value::as_str).is_some_and(|_| {
-                        let id = submit.get("id").and_then(Value::as_str).unwrap_or_default();
+                    submit
+                        .get("prompt")
+                        .and_then(Value::as_str)
+                        .is_some_and(|_| {
+                            let id = submit.get("id").and_then(Value::as_str).unwrap_or_default();
 
-                        !id.is_empty() && suffix == format!("i{id}")
-                    })
+                            !id.is_empty() && suffix == format!("i{id}")
+                        })
                 })
                 .and_then(|submit| submit.get("prompt").and_then(Value::as_str));
 
@@ -461,7 +471,7 @@ pub async fn get_session_turn_block(ctx: &mut Ctx) -> ApiResult {
 /// THE one route that carries `data`: the descriptor rows every other read prints exist precisely so
 /// the bytes stay here until a client asks for them (`:3893-3895`).
 pub async fn get_session_turn_attachment(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
     let turn_id = ctx.param("turn_id").to_owned();
@@ -536,7 +546,10 @@ fn find_step(display: &Value, step_id: &str) -> Option<FoundStep> {
                     .and_then(|detail| detail.get("resultStepId"))
                     .and_then(Value::as_str)
                     .map(str::to_owned),
-                call_id: node.get("callId").and_then(Value::as_str).map(str::to_owned),
+                call_id: node
+                    .get("callId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
             });
         }
     }
@@ -594,8 +607,10 @@ fn recorded_stream_text(
     let mut text = String::new();
     let mut matched = false;
 
-    for index in from..=to {
-        let delta = match (&events[index], kind) {
+    // The slice is the range, and the loop is over its events in order (`sessions.ts:1227-1240` walks
+    // the same half-open range forward).
+    for event in &events[from..=to] {
+        let delta = match (event, kind) {
             (contract::HarnessEvent::Text { delta, .. }, "assistant") => Some(delta.clone()),
             (contract::HarnessEvent::Reasoning { delta, .. }, "reasoning") => Some(delta.clone()),
             _ => None,
@@ -626,8 +641,13 @@ fn tool_pair(
     let mut args = None;
     let mut result = None;
 
-    for index in from..=to.min(events.len().saturating_sub(1)) {
-        match &events[index] {
+    // The segment's own event range, clamped to what the record holds. TS walks `from..=to` over the
+    // same slice and reads no further than the last event it has (`sessions.ts:1227-1252`), and `get`
+    // is how that bound is honoured without panicking on a range the record never reached.
+    let last = to.min(events.len().saturating_sub(1));
+
+    for event in events.get(from..=last).unwrap_or(&[]) {
+        match event {
             contract::HarnessEvent::ToolCall { call, .. } => {
                 args.get_or_insert(call.arguments.clone());
             }

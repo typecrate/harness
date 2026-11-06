@@ -17,15 +17,14 @@
 //! A TOOL FAILURE IS DATA: manual execution answers `200 {ok: false}` for a call that executed and
 //! failed, and reserves 404/409 for "this name is not callable here" (`api.ts:3338-3345`).
 //!
-//! THE ONE DEVIATION FROM `api.ts` IN THIS FILE, stated in `knowledge.md`
-//! ---------------------------------------------------------------------
-//! `postSessionTool` refuses `"replace": true` with a 403 capability denial (`api.ts:3163-3168`)
-//! because the TypeScript runtime's `createTool` has no replace flag. This port's registration kernel
-//! DOES have one (`store::tools::create_session_tool`, previous-revision report included), so refusing
-//! it would contradict a capability the same build implements, and the pair of TypeScript's refusals
-//! (409 without the flag, 403 with it) would leave no way to replace a created name at all. Here a
-//! re-registration answers `201 {created: false, replaced: true, previous_revision}` and a plain
-//! duplicate create answers the store's 409 naming the flag.
+//! THE TWO PLACES THIS FILE STILL DIFFERS FROM `api.ts`, stated in `knowledge.md`
+//! ------------------------------------------------------------------------------
+//! Registration is DECLARATION-ONLY here: T3 records the declaration (name, description, tags,
+//! schema, source text) and never compiles a body, so `checks` is omitted (TS emits the kernel's
+//! compile results, `api.ts:3122`) and a POST create over a CATALOGUE or harness-owned name stays a
+//! refusal, because this port's toolbox ledger has no override row for an inherited binding. A
+//! repeated CREATED name follows TypeScript exactly: `201 {created: false, replaced: true,
+//! previous_revision}` and no creation slot spent.
 
 use serde_json::{Map, Value, json};
 
@@ -76,7 +75,7 @@ const ORIGINS: [&str; 3] = ["catalogue", "discovered", "created"];
 /// refused before a row is built. The page carries the creation `budget` beside the paging meta, which
 /// is why this route assembles its own body rather than reusing a store page.
 pub async fn get_session_tools(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
 
@@ -150,6 +149,22 @@ pub async fn post_session_tool(ctx: &mut Ctx) -> ApiResult {
 
     api::require_body_fields(&body, &CREATE_FIELDS)?;
 
+    // `api.ts:3163-3168`: this deployment registers with the kernel's own replace rule (a repeated
+    // name IS the replace, `api.ts:3064-3095`), so an explicit replace-on-create flag is refused as
+    // a capability rather than silently ignored - and the refusal runs BEFORE the body is decoded,
+    // exactly where the TypeScript handler places it.
+    if body.get("replace").and_then(Value::as_bool) == Some(true) {
+        return Err(api::capability_denied(
+            &format!(
+                "POST {root}/sessions/{session_id}/tools with \"replace\"",
+                root = contract::HARNESS_API_ROOT
+            ),
+            "an atomic replace-on-create registration",
+        ));
+    }
+
+    require_create_tool_fields(&body)?;
+
     let request: contract::CreateSessionToolRequest = contract::decode_body(Value::Object(body))?;
 
     let registration = mutate_tool(ctx, &session_id, move |state, host| {
@@ -172,7 +187,7 @@ pub async fn post_session_tool(ctx: &mut Ctx) -> ApiResult {
 /// though it created nothing), and the detail adds the argument schema plus the `{scope, manual}`
 /// gate. `json(200, response)` - TS stamps no header here (`:2885`).
 pub async fn get_session_tool(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
     let name = ctx.param("tool_id").to_owned();
@@ -197,7 +212,7 @@ pub async fn get_session_tool(ctx: &mut Ctx) -> ApiResult {
 /// The store's 404 is already the contract's sentence - `Tool "x" has no installed source revision in
 /// session "y".` (`api.ts:2893-2896`) - and the response is the source object itself, not an envelope.
 pub async fn get_session_tool_source(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
     let name = ctx.param("tool_id").to_owned();
@@ -238,11 +253,21 @@ pub async fn patch_session_tool(ctx: &mut Ctx) -> ApiResult {
         return Err(empty_patch());
     }
 
+    // `api.ts:3191-3193`: the test is `typeof body.enabled !== 'boolean'`, so a stated `null` is
+    // the SAME refusal as a string - it is not "absent".
     if let Some(enabled) = body.get("enabled")
-        && !enabled.is_null()
         && !enabled.is_boolean()
     {
         return Err(ApiError::bad_request("\"enabled\" must be a boolean."));
+    }
+
+    // `api.ts:3009-3012` guards the update path with the same sentence: `body.tags !== undefined`
+    // makes a stated `null` a refusal too, and a non-string member is refused before the candidate
+    // reaches the registration kernel.
+    if body.get("tags").is_some_and(|tags| !is_string_array(tags)) {
+        return Err(ApiError::bad_request(
+            "\"tags\" must be an array of strings.",
+        ));
     }
 
     // `api.ts:3199-3203`: a patch whose only key is the gate is a runtime write, not a registration.
@@ -291,8 +316,8 @@ pub async fn delete_session_tool(ctx: &mut Ctx) -> ApiResult {
 
     require_session(ctx, &session_id)?;
 
-    let row = tool_row(ctx, &session_id, &name)
-        .ok_or_else(|| missing_in("tool", &name, &session_id))?;
+    let row =
+        tool_row(ctx, &session_id, &name).ok_or_else(|| missing_in("tool", &name, &session_id))?;
 
     if row.r#protected {
         return Err(ApiError::forbidden(format!(
@@ -508,8 +533,8 @@ where
 /// `Send` only), so an async helper holding `&Ctx` across an await would make the dispatcher's future
 /// non-`Send` - the exact bound axum's `Handler` impl requires. Nothing here awaits.
 fn set_session_tool_enabled(ctx: &Ctx, session_id: &str, name: &str, enabled: bool) -> ApiResult {
-    let row = tool_row(ctx, session_id, name)
-        .ok_or_else(|| missing_in("tool", name, session_id))?;
+    let row =
+        tool_row(ctx, session_id, name).ok_or_else(|| missing_in("tool", name, session_id))?;
 
     // A `protected` entry is the control plane the session runs on: the switch is not a user-level
     // edit, and the runtime would refuse it anyway (`api.ts:2936-2944`).
@@ -549,11 +574,7 @@ fn set_session_tool_enabled(ctx: &Ctx, session_id: &str, name: &str, enabled: bo
 
 /// `assertIdleForToolMutation` (`api.ts:2909-2920`), sentence for sentence: the route names itself, and
 /// the reason distinguishes "lanes are running" from "a run is in progress".
-fn assert_idle_for_tool_mutation(
-    ctx: &Ctx,
-    session_id: &str,
-    route: &str,
-) -> Result<(), ApiError> {
+fn assert_idle_for_tool_mutation(ctx: &Ctx, session_id: &str, route: &str) -> Result<(), ApiError> {
     let store = store_of(ctx);
     let inner = store.lock();
     let state = inner
@@ -607,4 +628,53 @@ fn origin_of(raw: &str) -> SessionToolOrigin {
 #[must_use]
 fn body_enabled(body: &Map<String, Value>) -> Option<bool> {
     body.get("enabled").and_then(Value::as_bool)
+}
+
+/// Whether a value is a JSON array whose every member is a string (`api.ts:3010`'s
+/// `Array.isArray(tags) && tags.some(tag => typeof tag !== 'string')`, inverted).
+#[must_use]
+fn is_string_array(value: &Value) -> bool {
+    value.is_array()
+        && value
+            .as_array()
+            .is_some_and(|list| list.iter().all(Value::is_string))
+}
+
+/// The three create-mode presences `registerSessionTool` states BEFORE the candidate reaches the
+/// kernel (`api.ts:3000-3018`), in that order, with the handler's own sentences: a missing field
+/// must print `A created tool requires ...`, never serde's `missing field ...`.
+///
+/// `name` keeps TS's laxness (`String(body.name ?? '')`): absent, `null` and an empty string are
+/// the refusals, while a non-string travels to the typed decode (TS coerces it and the kernel then
+/// refuses the name grammar - the same 400 with a different sentence, and this port has no JS
+/// `String()` semantics to copy). `description` is stricter, because that is what the handler
+/// tests: `typeof body.description === 'string'`.
+fn require_create_tool_fields(body: &Map<String, Value>) -> Result<(), ApiError> {
+    // `String(body.name ?? '')` is the TypeScript test (`api.ts:3000-3002`): absent, `null` and an
+    // EMPTY string are all the same refusal, while a non-string is coerced (this port lets the
+    // typed decode answer for it, which is the same 400 with a different sentence).
+    let name_absent = match body.get("name") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(text)) => text.is_empty(),
+        Some(_) => false,
+    };
+
+    if name_absent {
+        return Err(ApiError::bad_request("A created tool requires a \"name\"."));
+    }
+
+    if !matches!(body.get("description"), Some(Value::String(_))) {
+        return Err(ApiError::bad_request(
+            "A created tool requires a \"description\".",
+        ));
+    }
+
+    // Tags are REQUIRED on create: an untagged tool could never be discovered (`api.ts:3014-3017`).
+    match body.get("tags") {
+        None => Err(ApiError::bad_request("A created tool requires \"tags\".")),
+        Some(tags) if is_string_array(tags) => Ok(()),
+        Some(_) => Err(ApiError::bad_request(
+            "\"tags\" must be an array of strings.",
+        )),
+    }
 }

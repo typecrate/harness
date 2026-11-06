@@ -205,9 +205,9 @@ pub(crate) async fn fetch(
         .contains("html")
         .then(|| extract_title(&raw))
         .flatten();
-    let truncated = converted.chars().count() > MAX_CONTENT_CHARS;
+    let truncated = converted.encode_utf16().count() > MAX_CONTENT_CHARS;
     let content: String = converted.chars().take(MAX_CONTENT_CHARS).collect();
-    let characters = content.chars().count();
+    let characters = content.encode_utf16().count();
 
     let mut result = json!({
         "provider": "native",

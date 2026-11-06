@@ -592,12 +592,20 @@ impl SessionStore {
         // A run whose conversation is stopped but that has not settled yet keeps the session `running`
         // until its abort lands; the terminal settle frame then fixes the aggregate
         // (`sessions.ts:7715-7717`).
+        // The questions this stop settled, in settlement order; the announce loop below turns each one
+        // into an `action.closed`.
+        let mut closed_actions: Vec<String> = Vec::new();
+
         for target in &stopped {
             state.set_thread_status(target, ThreadLifecycle::Stopped);
-            state.expire_actions(
+
+            // T16: the stop settled that conversation's unanswered questions, so each one announces
+            // itself (`sessions.ts:2325-2335`); a sibling lane's questions stay open because the expiry
+            // is scoped to THIS thread.
+            closed_actions.extend(state.expire_actions(
                 crate::store::session::ACTION_CANCELLED_MESSAGE,
                 Some(target),
-            );
+            ));
         }
 
         state.record.updated_at = at;
@@ -624,6 +632,25 @@ impl SessionStore {
             thread_id,
             &json!({ "thread_id": thread_id, "status": "stopped" }),
         ));
+
+        // T16: one `action.closed` per question this stop settled, each moving the `actions` counter
+        // once (`api.ts:1126-1138`).
+        for request_id in &closed_actions {
+            outcome = outcome.event(
+                "action.closed",
+                &[("actions", Some(id))],
+                Some(thread_id),
+                None,
+                json!({
+                    "action_closed": {
+                        "request_id": request_id,
+                        "reason": store::actions::action_closed_reason(
+                            crate::store::session::ACTION_CANCELLED_MESSAGE,
+                        ),
+                    }
+                }),
+            );
+        }
 
         // The abort ALREADY happened, exactly as in TS, where `harness.stopThread` runs before
         // `persistOrThrow` (`sessions.ts:7652/7722`): a failed write means the stop is not durable, and

@@ -38,14 +38,14 @@ const THREAD_STATUSES: [&str; 3] = ["idle", "running", "stopped"];
 /// The fields `POST .../threads` accepts (`api.ts:3419`).
 ///
 /// `origin` is deliberately absent: the contract's REST body has no origin field, and the route
-/// creates a HOST conversation (`api.ts:3435` calls `harness.createThread`, whose rows are host rows
-/// - the roster read filters `origin === 'host'`, `api.ts:3351`). The handler therefore injects
-/// `"origin": "host"` into the store call rather than accepting it from the wire.
+/// creates a HOST conversation (`api.ts:3435` calls `harness.createThread`, whose rows are host rows;
+/// the roster read filters `origin === 'host'`, `api.ts:3351`). The handler therefore injects an
+/// `origin` member carrying `host` into the store call rather than accepting it from the wire.
 const CREATE_THREAD_FIELDS: [&str; 3] = ["agent", "label", "owner_thread_id"];
 
 /// `GET {root}/sessions/{session_id}/threads` (`api.ts:3371-3391`).
 pub async fn get_session_threads(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
 
@@ -79,12 +79,7 @@ pub async fn get_session_threads(ctx: &mut Ctx) -> ApiResult {
     let slice = paging::slice_page(rows, cursor, limit, Some(total));
 
     let revision = ctx.revision("threads", Some(&session_id));
-    let body = paging::page_slice_body(
-        ctx.runtime.hub.epoch(),
-        slice,
-        revision,
-        now_millis(),
-    );
+    let body = paging::page_slice_body(ctx.runtime.hub.epoch(), slice, revision, now_millis());
 
     Ok(api::with_revision(200, body, revision))
 }
@@ -160,7 +155,7 @@ pub async fn post_session_thread(ctx: &mut Ctx) -> ApiResult {
 
 /// `GET {root}/sessions/{session_id}/threads/{thread_id}` (`api.ts:3393-3413`).
 pub async fn get_session_thread(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
     let thread_id = ctx.param("thread_id").to_owned();
@@ -210,10 +205,9 @@ pub async fn delete_session_thread(ctx: &mut Ctx) -> ApiResult {
             .into_iter()
             .filter(|candidate| candidate != &thread_id)
             .filter(|candidate| {
-                state
-                    .thread(candidate)
-                    .is_some_and(|thread| thread.origin == crate::store::origin_str(contract::ThreadOrigin::Host))
-                    && is_descendant(state, candidate, &thread_id)
+                state.thread(candidate).is_some_and(|thread| {
+                    thread.origin == crate::store::origin_str(contract::ThreadOrigin::Host)
+                }) && is_descendant(state, candidate, &thread_id)
             })
             .count();
 
@@ -221,9 +215,9 @@ pub async fn delete_session_thread(ctx: &mut Ctx) -> ApiResult {
             .turn_ids()
             .into_iter()
             .filter(|turn_id| {
-                state
-                    .turn(turn_id)
-                    .is_some_and(|turn| turn.record.thread_id.as_deref() == Some(thread_id.as_str()))
+                state.turn(turn_id).is_some_and(|turn| {
+                    turn.record.thread_id.as_deref() == Some(thread_id.as_str())
+                })
             })
             .count();
 
@@ -302,17 +296,15 @@ pub async fn post_thread_cancel(ctx: &mut Ctx) -> ApiResult {
 ///
 /// The walk is bounded at 64 hops, exactly as TS bounds it, because a document written by hand could
 /// name an owner cycle and this read runs inside the store guard.
-fn is_descendant(
-    state: &crate::store::SessionState,
-    candidate: &str,
-    ancestor: &str,
-) -> bool {
+fn is_descendant(state: &crate::store::SessionState, candidate: &str, ancestor: &str) -> bool {
     let mut current = state
         .thread(candidate)
         .and_then(|thread| thread.owner_thread_id.clone());
     let mut depth = 0;
 
-    while let Some(owner) = current && depth < 64 {
+    while let Some(owner) = current
+        && depth < 64
+    {
         if owner == ancestor {
             return true;
         }

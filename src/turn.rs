@@ -101,6 +101,14 @@ struct Run<'a> {
     max_attempts: u64,
     /// Text streamed in a later turn is appended after the prompt, never merged with it.
     iteration: u64,
+    /// EVERY steer text this run drained from its channel, in arrival order, whether or not the
+    /// model has seen it yet.
+    ///
+    /// TS keeps the same list as `run.steering` (`harness.ts:6831-6836`): a failure rolls the
+    /// transcript back to `commitIndex`, so guidance that was appended into it is unwound WITH it and
+    /// must be handed to the next run rather than silently consumed. A successful run's list is
+    /// dropped with the run.
+    delivered: Vec<String>,
 }
 
 impl Run<'_> {
@@ -170,6 +178,7 @@ async fn run_turn(mut input: TurnInput) -> TurnOutcome {
         last_attempt: 1,
         max_attempts: MAX_RETRIES + 1,
         iteration: 0,
+        delivered: Vec::new(),
     };
 
     // `start` FIRST: the store's contract is that the first turn's start predates a watcher
@@ -213,6 +222,10 @@ async fn run_turn(mut input: TurnInput) -> TurnOutcome {
                     cancelled: true,
                     messages: run.original.clone(),
                     stop_reason: None,
+                    // A STOP discards the guidance by contract (`harness.ts:6831-6835`: the thread is
+                    // stopped and its queue cleared), but it is still REPORTED here so the store can
+                    // decide — it decides not to re-queue.
+                    unused_steering: std::mem::take(&mut run.delivered),
                 }
             } else {
                 run.emit(HarnessEvent::Error {
@@ -229,6 +242,10 @@ async fn run_turn(mut input: TurnInput) -> TurnOutcome {
                     cancelled: false,
                     messages: run.original.clone(),
                     stop_reason: None,
+                    // R5 preservation: every steer this run drained is rolled back with the
+                    // transcript, so it goes back to the store in arrival order
+                    // (`harness.ts:6826-6837`).
+                    unused_steering: std::mem::take(&mut run.delivered),
                 }
             }
         }
@@ -353,6 +370,8 @@ impl Run<'_> {
                     cancelled: false,
                     messages: std::mem::take(&mut self.history),
                     stop_reason: response.stop_reason.clone(),
+                    // The run answered: every steer it drained reached the model, so nothing is owed.
+                    unused_steering: Vec::new(),
                 });
             }
 
@@ -385,6 +404,10 @@ impl Run<'_> {
 
     /// Takes every queued steer, without waiting (`ports.rs:74-82`: an unbounded channel the
     /// executor must drain to empty when it settles).
+    ///
+    /// Whatever is taken is also remembered in [`Run::delivered`], because a later failure rolls the
+    /// transcript back past it and the store has to be able to hand the same text to the next run
+    /// (`harness.ts:6826-6837`).
     fn drain_steering(&mut self) -> Vec<String> {
         let Some(receiver) = self.input.steering.as_mut() else {
             return Vec::new();
@@ -394,6 +417,7 @@ impl Run<'_> {
 
         while let Ok(text) = receiver.try_recv() {
             if !text.trim().is_empty() {
+                self.delivered.push(text.clone());
                 guidance.push(text);
             }
         }

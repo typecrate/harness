@@ -69,20 +69,23 @@ impl SessionStore {
             return Err(ApiError::bad_request("A session requires a harness name."));
         }
 
-        // The registry lookup happens OUTSIDE the store guard, and `HarnessRegistry` owns its own
-        // interior lock: the order (registry -> store) is the one every path in this crate uses, so two
-        // writes can never invert (`sessions.ts:1827-1831`).
-        let definition = self
+        let now = now_millis();
+        let session_id = ids::new_session_id();
+
+        // ONE lock for the whole decision: the harness resolves from the CURRENT registry, the
+        // defaults are the CURRENT global settings, and the record lands in the same guarded region
+        // (`sessions.ts:1827` + `api.ts:1974-1989` both read live store state, never a boot copy). A
+        // `POST /harnesses` that committed before this call is therefore visible here without a
+        // restart, and a `PATCH /config` is visible to the very next create.
+        let mut inner = self.lock();
+
+        let definition = inner
             .registry()
             .find(harness)
             .cloned()
             .ok_or_else(|| ApiError::not_found(format!("Unknown harness \"{harness}\".")))?;
 
-        // The CURRENT global defaults, so a `/config` patch is visible to the next session without a
-        // restart (`api.ts:1974-1989`). The store holds the deployment pair, which is exactly what TS
-        // reads here.
-        let defaults = self.settings().clone();
-
+        let defaults = inner.settings();
         let input = request.settings.clone().unwrap_or_default();
         let settings = crate::config::merge_settings(&defaults, &input)?;
 
@@ -92,8 +95,6 @@ impl SessionStore {
             )));
         }
 
-        let now = now_millis();
-        let session_id = ids::new_session_id();
         // The canonical name the snapshot reports, which an alias resolves away
         // (`sessions.ts:1832` + `:1882`).
         let name = definition.name.clone();
@@ -142,19 +143,15 @@ impl SessionStore {
 
         // Order is the recipe: insert, COMMIT, then move the counters and publish, so the 201 can
         // never report a session the next restart has forgotten (`sessions.ts:1934-1942`).
-        let payload = {
-            let mut inner = self.lock();
+        inner.insert(state);
 
-            inner.insert(state);
+        if let Err(error) = self.save(&inner) {
+            inner.remove(&session_id);
 
-            if let Err(error) = self.save(&inner) {
-                inner.remove(&session_id);
+            return Err(error);
+        }
 
-                return Err(error);
-            }
-
-            self.built_session_payload(&inner, &session_id)
-        };
+        let payload = self.built_session_payload(&inner, &session_id);
 
         Ok(json!({ "session": payload }))
     }
@@ -209,21 +206,24 @@ impl SessionStore {
     pub async fn get_session(&self, id: &str) -> Result<Value, ApiError> {
         let inner = self.lock();
         let state = require_session(&inner, id)?;
-        let payload = self.session_resource(state);
+        let payload = self.session_resource(&inner, state);
 
         Ok(json!({ "session": payload }))
     }
 
     /// The identified read of the frozen definition (`api.ts:2113-2127`).
     ///
-    /// The registry and the catalogue are consulted WITHOUT the store guard: they are shared `Arc`s with
-    /// their own interior locking, and `session_definition_of` only ever reads a name out of the frozen
-    /// copy to compare it with the live one.
+    /// The live registry and the live catalogue are read from the SAME guard that holds the session,
+    /// because they are part of the store's host view (`StoreInner::registry` /
+    /// [`StoreInner::agents`]); `session_definition_of` only ever reads a name out of the frozen copy
+    /// to compare it with the live one.
     pub async fn session_definition(&self, id: &str) -> Result<Value, ApiError> {
         let inner = self.lock();
         let state = require_session(&inner, id)?;
+        // The registry and the catalogue come from the guard, not from a `Store` accessor: those
+        // accessors take the lock again, and the lock is not reentrant.
         let definition =
-            store::read::session_definition_of(state, &self.hub, self.registry(), self.agents());
+            store::read::session_definition_of(state, &self.hub, inner.registry(), inner.agents());
 
         Ok(json!({ "definition": definition }))
     }
@@ -363,6 +363,7 @@ impl SessionStore {
             }
 
             self.session_resource(
+                &inner,
                 inner
                     .sessions
                     .get(id)
@@ -406,7 +407,17 @@ impl SessionStore {
                     run.cancel.cancel();
                 }
 
-                state.expire_actions(ACTION_SESSION_GONE_MESSAGE, None);
+                let closed = state.expire_actions(ACTION_SESSION_GONE_MESSAGE, None);
+
+                // T16: the delete settled every question the session still had, so every question card
+                // a client is holding gets its `action.closed` (`sessions.ts:2325-2335` publishes from
+                // the settlement itself, not from a later read). The session id still names the frame:
+                // the resource it addressed is gone, which is exactly what the frame says.
+                self.publish_actions_closed(
+                    id,
+                    &closed,
+                    store::actions::action_closed_reason(ACTION_SESSION_GONE_MESSAGE),
+                );
             }
         }
 
@@ -627,11 +638,21 @@ impl SessionStore {
             let inner = self.lock();
             let state = require_session(&inner, id)?;
 
+            // `api.ts:2334-2335`: the running turn first, and the LAST recorded turn when the session is
+            // busy with a run whose row is not `running` any more. A cancel-all that only stops threads
+            // therefore still names the turn it interrupted rather than answering `null`.
             let active = state
                 .turns_in_index_order(false)
                 .into_iter()
                 .find(|turn| turn.record.status == "running")
-                .map(|turn| turn.record.id.clone());
+                .map(|turn| turn.record.id.clone())
+                .or_else(|| {
+                    // `record.busy` is TS's "a run is executing" flag (`sessions.ts:3337`, `:7201`),
+                    // and the fallback names the newest recorded turn.
+                    (state.active_run_count() > 0)
+                        .then(|| state.turn_order.last().cloned())
+                        .flatten()
+                });
 
             let dropped = if all {
                 u64::try_from(state.pending_count()).unwrap_or(u64::MAX)
@@ -674,18 +695,29 @@ impl SessionStore {
                 }
             }
 
-            state.expire_actions(ACTION_CANCELLED_MESSAGE, None);
+            let closed_actions = state.expire_actions(ACTION_CANCELLED_MESSAGE, None);
 
             if all {
                 // Stop-ALL marks every HOST conversation stopped and drops every backlog. The
                 // default `agent:<name>` conversations are internal plumbing, so they stay usable
                 // (`sessions.ts:7540-7556`).
+                //
+                // A conversation that ACTUALLY transitioned counts as a cancellation on its own
+                // (`sessions.ts:7765-7788`: `if (stopped > 0) cancelled = true`), which is the case TS
+                // answers `cancelled: true` for on a session with host threads, no live run and no
+                // backlog. One already stopped is a no-op, exactly as TS's `stopThread` returning
+                // `false` is.
                 for thread_id in state.thread_ids() {
                     if let Some(thread) = state.thread_mut(&thread_id)
                         && thread.origin == store::origin_str(contract::ThreadOrigin::Host)
                     {
+                        let stopped_now = thread.status
+                            != store::lifecycle_str(contract::ThreadLifecycle::Stopped);
+
                         thread.status =
                             store::lifecycle_str(contract::ThreadLifecycle::Stopped).to_owned();
+
+                        cancelled |= stopped_now;
                     }
                 }
 
@@ -710,7 +742,16 @@ impl SessionStore {
 
             if !cancelled {
                 // A cancel that found nothing changes no state, so it persists and publishes
-                // nothing (`api.ts:2341`: `cancelled: false` is still a 200).
+                // nothing (`api.ts:2341`: `cancelled: false` is still a 200). A question that DID
+                // settle above still gets its announcement, because its promise is already resolved.
+                if !closed_actions.is_empty() {
+                    self.publish_actions_closed(
+                        id,
+                        &closed_actions,
+                        store::actions::action_closed_reason(ACTION_CANCELLED_MESSAGE),
+                    );
+                }
+
                 return Ok(serde_json::to_value(contract::CancelSessionResult {
                     cancelled: false,
                     session_id: id.to_string(),
@@ -758,6 +799,27 @@ impl SessionStore {
                 payload,
                 Vec::new(),
             );
+
+            // T16: the cancel settled every question it found, so each one announces itself on the
+            // `actions` resource (`api.ts:1126-1138` moves that counter once per settlement). The
+            // frames ride the same write, so a failed document never publishes a settlement that was
+            // rolled back.
+            for request_id in &closed_actions {
+                outcome = outcome.event(
+                    "action.closed",
+                    &[("actions", Some(id))],
+                    None,
+                    active_turn_id.as_deref(),
+                    json!({
+                        "action_closed": {
+                            "request_id": request_id,
+                            "reason": store::actions::action_closed_reason(
+                                ACTION_CANCELLED_MESSAGE,
+                            ),
+                        }
+                    }),
+                );
+            }
 
             if let Err(error) = self.commit(&inner, id, &mut outcome) {
                 self.rollback_state(&mut inner, id, &before);
@@ -813,44 +875,24 @@ impl SessionStore {
     // Shared helpers
     // -----------------------------------------------------------------------
 
-    /// The deployment runtime a session resource reports (`api-reads.ts:226`'s `runtime_execution`).
-    ///
-    /// WHY NOT A STORE FIELD: [`StoreConfig`] owns the SESSION deployment (root, caps, TTLs); the process
-    /// runtime lives in [`crate::config::ServerConfig`], which the transport loads from the environment
-    /// (`config::load_server_config`). The store therefore states the BUILT-IN runtime with its own
-    /// provider trio substituted: no environment read happens inside a request, so two reads of one
-    /// session cannot disagree, and the answer is the deployment's whenever `HARNESS_THREAD_EXECUTION` is
-    /// at its default. See knowledge.md "T3".
-    #[must_use]
-    pub(crate) fn runtime_snapshot(&self) -> crate::config::ServerConfig {
-        let settings = self.settings();
-
-        crate::config::ServerConfig {
-            base_url: settings.base_url.clone(),
-            api_key: settings.api_key.clone(),
-            model: settings.model.clone(),
-            max_retries: crate::config::DEFAULT_MAX_RETRIES,
-            retry_delay_ms: crate::config::DEFAULT_RETRY_DELAY_MS,
-            request_timeout_ms: crate::config::DEFAULT_REQUEST_TIMEOUT_MS,
-            thread_execution: crate::config::DEFAULT_THREAD_EXECUTION.to_owned(),
-            io_execution: crate::config::DEFAULT_IO_EXECUTION.to_owned(),
-            worker_idle_ms: crate::config::DEFAULT_WORKER_IDLE_MS,
-            max_lane_workers: crate::config::DEFAULT_MAX_LANE_WORKERS,
-            worker_handshake_ms: crate::config::DEFAULT_WORKER_HANDSHAKE_MS,
-            worker_entry: None,
-            io_worker_entry: None,
-        }
-    }
-
     /// The current session resource, for a caller that already holds the guard.
-    pub(crate) fn session_resource(&self, state: &SessionState) -> Value {
-        let runtime = self.runtime_snapshot();
-
+    ///
+    /// Both live figures come out of the SAME guard: `endpoint` from the session's own settings and
+    /// credential (`api-reads.ts:225 providerDefaultsOf(record.settings)`), `runtime_execution` from
+    /// the store's host view of the deployment (`api-reads.ts:226 context.runtime.threadExecution`).
+    /// [`StoreConfig`] owns only the SESSION deployment (root, caps, TTLs); the process runtime lives
+    /// in [`crate::config::ServerConfig`], which the host loads once and pushes in through
+    /// [`Store::set_host_view`] — so no environment read happens inside a request, and two reads of
+    /// one session cannot disagree.
+    pub(crate) fn session_resource(
+        &self,
+        inner: &store::StoreInner,
+        state: &SessionState,
+    ) -> Value {
         serde_json::to_value(store::read::session_resource_of(
             state,
             &self.hub,
-            self.settings(),
-            &runtime,
+            inner.runtime_config(),
         ))
         .unwrap_or(Value::Null)
     }
@@ -943,7 +985,7 @@ impl SessionStore {
             let _ = self.hub.bump(resource, key);
         }
 
-        let resource = self.session_resource(state);
+        let resource = self.session_resource(inner, state);
         let patch = json!({ "session": store::read::session_state_patch_of(state, &self.hub) });
 
         let _ = self.hub.publish(
@@ -1121,7 +1163,8 @@ pub(crate) fn parse_agent_models(
             )));
         }
 
-        if model.chars().count() > crate::registry::presets::MAX_MODEL_ID_LENGTH {
+        // The bound is TS's `.length`, i.e. UTF-16 code units (`registry.ts:432`).
+        if model.encode_utf16().count() > crate::registry::presets::MAX_MODEL_ID_LENGTH {
             return Err(ApiError::bad_request(format!(
                 "`agentModels.{agent}` cannot exceed {} characters.",
                 crate::registry::presets::MAX_MODEL_ID_LENGTH
@@ -1171,7 +1214,8 @@ pub(crate) fn validate_input(raw: &str, attachment_count: usize) -> Result<Strin
         return Err(ApiError::bad_request(EMPTY_TASK_MESSAGE));
     }
 
-    if input.chars().count() > MAX_INPUT_CHARS {
+    // `validateInput` bounds with `.length`, i.e. UTF-16 code units (`sessions.ts:1278-1290`).
+    if input.encode_utf16().count() > MAX_INPUT_CHARS {
         return Err(ApiError::payload_too_large(format!(
             "A task cannot exceed {MAX_INPUT_CHARS} characters."
         )));

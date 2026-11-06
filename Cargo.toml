@@ -45,9 +45,9 @@ path = "src/lib.rs"
 # The native HTTP executable. Declared explicitly so the artifact/bin name is
 # stable and greppable (`cargo run --bin typecrate-harness-server`) instead of
 # cargo's autodiscovered `server`.
-# T1 ships a placeholder only: the router, the store and the endpoint wiring land
-# in the later stages of this port, and a `[[bin]]` table needs a file that
-# compiles today.
+# T5a shipped the real listener: flags, the runtime-support gate that refuses an execution mode this
+# build does not provide, the bind, the banner, the shutdown signal, and the final durable
+# checkpoint.
 [[bin]]
 name = "typecrate-harness-server"
 path = "src/bin/server.rs"
@@ -112,6 +112,10 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # tests/ drive the hub and (later) the listener on a real runtime; `full` keeps the
 # integration tests from needing per-test feature plumbing.
 tokio = { version = "1", features = ["full"] }
+# T5c's stream suite talks RFC 6455 over a real socket. The same version axum's `ws` feature
+# already resolves (see Cargo.lock), so this adds a dev-dependency without adding a dependency:
+# the shipped crate still carries only the list above.
+tokio-tungstenite = "0.29"
 
 # Lint policy copied from the root workspace ([workspace.lints]) because a
 # standalone workspace does not inherit another workspace's lint table.

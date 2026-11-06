@@ -17,7 +17,10 @@
 //!   1. `.env` load, before the configuration and before the tool catalogue - a search key that
 //!      lives in the file has to be visible when the catalogue resolves availability
 //!      (`knowledge.md` T4: "a host that loads `.env` later must build the registry afterwards");
-//!   2. the configuration (`load_server_config`), which validates every `HARNESS_*` value;
+//!   2. the configuration (`load_server_config`), which validates every `HARNESS_*` value, immediately
+//!      followed by the RUNTIME-SUPPORT gate (`validate_supported_execution`): an execution mode this
+//!      build cannot provide is refused there, before the document is read, because the TS server
+//!      aborts rather than degrading a `worker` deployment to an inline run;
 //!   3. `state.json` + `agents.json`, read BEFORE any session is constructed, so the registry is
 //!      rebuilt first and a session's harness resolves from its own frozen copy afterwards;
 //!   4. the registry replay (tombstones first, then saved rows) and the agent overlay;
@@ -37,12 +40,13 @@ use crate::error::ApiError;
 use crate::events::EventHub;
 use crate::package_root;
 use crate::persistence::{self, HarnessGlobalSettingsRecord};
-use crate::ports::{ProjectorFactory, ToolRuntime, TurnExecutor};
+use crate::ports::{ProjectorFactory, StreamExists, ToolRuntime, TurnExecutor};
 use crate::projector::TurnProjectorFactory;
 use crate::registry::HarnessRegistry;
 use crate::store::Store;
 use crate::store::StoreConfig;
 use crate::store::actions::StoreTaskHost;
+use crate::stream;
 use crate::tools::ToolRegistry;
 use crate::turn::AgentExecutor;
 
@@ -90,6 +94,16 @@ pub struct HarnessRuntime {
     /// The session store - the single source of truth for sessions, turns, threads and
     /// transcripts. Host routes never touch a session aggregate directly.
     pub store: Arc<Store>,
+    /// The live update stream's broker (`stream/mount.ts`'s `createHarnessStreamMount` broker, held by
+    /// the runtime rather than by the listener because its lifetime is the RUNTIME: one epoch, one set
+    /// of subscription tables, and one replay-window set per database root).
+    ///
+    /// It is wired to the SAME hub the REST surface publishes through, so a mutation a route commits
+    /// fans out to every live stream in this process without a route importing the stream module, and a
+    /// `subscription_state` revision can never disagree with the `X-Harness-Revision` a page carried
+    /// (`knowledge.md` "Event hub"). It also answers `unknown_resource` through
+    /// [`crate::ports::StreamExists`] on the store above.
+    pub stream_broker: Arc<stream::StreamBroker>,
     /// The credential channels `api.ts:795-833` keeps separate (`globalSettings.apiKey`,
     /// `globalSettings.hasKey`, `credentialBaseURL`) plus the boot document they reset to.
     pub credentials: Mutex<CredentialState>,
@@ -260,16 +274,58 @@ fn cache_key(root: &Path) -> PathBuf {
 ///
 /// A failed build is NOT cached (`runtime.ts:296-308`: "A corrupt database throws on creation and
 /// is NOT replaced by an empty one: every later request for that root fails clearly until the file
-/// is fixed"), so a retry after fixing the file succeeds without a restart.
+/// is fixed"), so a retry after fixing the file succeeds without a restart. The unsupported
+/// execution mode is one of those failures ([`validate_supported_execution`]), which is how the
+/// gateway's FIRST request answers 400 instead of silently serving an inline turn.
 ///
 /// # Errors
 ///
-/// [`ApiError::bad_request`] (400) when a provider or runtime setting is unusable - the
-/// `SettingsError`/`ServerRuntimeError` case, which TS's dispatcher also answers 400 for - and
-/// [`ApiError::internal`] (500) for anything else: an unreadable or malformed document, or a saved
-/// registry this build cannot replay, both of which TS wraps in `HarnessPersistenceError` and
-/// `service.ts:517-528` surfaces as a 500 with the real message.
+/// [`ApiError::bad_request`] (400) when a provider or runtime setting is unusable or a runtime knob
+/// names a mode this build cannot provide - the `SettingsError`/`ServerRuntimeError` case, which
+/// TS's dispatcher also answers 400 for - and [`ApiError::internal`] (500) for anything else: an
+/// unreadable or malformed document, or a saved registry this build cannot replay, both of which TS
+/// wraps in `HarnessPersistenceError` and `service.ts:517-528` surfaces as a 500 with the real
+/// message.
 pub fn runtime_for(root: &Path) -> Result<Arc<HarnessRuntime>, ApiError> {
+    cached_or_build(root, || {
+        // 1. `.env` first, and never an override (`environment.rs`, `dotenvy::from_path`).
+        let environment = environment::load_harness_environment();
+
+        // 2. Configuration + runtime knobs. A bad value is a 400 that names the variable.
+        let config = config::load_server_config(&environment::harness_runtime_env())?;
+
+        build_runtime(root, environment, config)
+    })
+}
+
+/// The same runtime lookup with the caller's OWN loaded [`ServerConfig`], for an embedder that owns
+/// its configuration channel and for the tests that must not write the process environment (writing
+/// it is `unsafe` in edition 2024 and this crate forbids unsafe).
+///
+/// Only the SETTINGS are injected: the `.env` STATUS the runtime reports stays what this process
+/// read, because that status is a fact about the boot, not a setting. A root that already has a
+/// runtime returns it unchanged - the injected config applies when the runtime is BUILT, exactly
+/// like the environment does through [`runtime_for`]. The support gate runs either way.
+///
+/// # Errors
+///
+/// Exactly the refusals of [`runtime_for`], including the 400 for an execution mode this build
+/// cannot provide.
+pub fn runtime_for_with(
+    root: &Path,
+    config: ServerConfig,
+) -> Result<Arc<HarnessRuntime>, ApiError> {
+    cached_or_build(root, || {
+        build_runtime(root, environment::load_harness_environment(), config)
+    })
+}
+
+/// The cache read-then-build-then-insert unit the two entry points above share, so the "one build
+/// per root, a failed build is not cached" rule has exactly one implementation.
+fn cached_or_build<F>(root: &Path, build: F) -> Result<Arc<HarnessRuntime>, ApiError>
+where
+    F: FnOnce() -> Result<HarnessRuntime, ApiError>,
+{
     let key = cache_key(root);
 
     let mut guard = cache()
@@ -280,10 +336,78 @@ pub fn runtime_for(root: &Path) -> Result<Arc<HarnessRuntime>, ApiError> {
         return Ok(Arc::clone(existing));
     }
 
-    let runtime = Arc::new(build_runtime(root)?);
+    let runtime = Arc::new(build()?);
     guard.insert(key, Arc::clone(&runtime));
 
     Ok(runtime)
+}
+
+// ---------------------------------------------------------------------------
+// Runtime-support gate
+// ---------------------------------------------------------------------------
+
+/// The only execution mode this Rust build can actually provide.
+///
+/// `config.rs` accepts `inline` | `worker` because it ports the TS loader verbatim, and the loader
+/// is also what a settings review uses - so acceptance is the parser's business and SUPPORT is a
+/// separate fact owned here. The TS server treats `worker` as a promise it never breaks: a lane
+/// that cannot be isolated aborts the start (`workers/capability.ts`, `workers/io-client.ts:282`,
+/// `sessions.ts:1513-1516`) rather than running inline. This build has no worker backend at all, so
+/// the honest equivalent of that promise is a refusal at the same moment, never a silent fallback.
+pub const SUPPORTED_EXECUTION_MODE: &str = "inline";
+
+/// The one sentence an unsupported knob produces, naming the field, the value, the variable that
+/// set it, and the fact that no silent fallback follows.
+fn unsupported_execution_issue(field: &str, variable: &str, value: &str) -> String {
+    format!(
+        "{field} \"{value}\" is not supported in this Rust build; only \
+         \"{SUPPORTED_EXECUTION_MODE}\" is available. Unset {variable} or set it to \
+         \"{SUPPORTED_EXECUTION_MODE}\" - this build never runs a \"{value}\" deployment inline \
+         silently."
+    )
+}
+
+/// Refuses a deployment this build cannot honour, BEFORE anything is constructed.
+///
+/// Deliberately NOT part of [`config::load_server_config`]: that loader is also what reports the
+/// configuration back to an operator (`GET /config` prints `thread_execution`), and refusing there
+/// would make a worker deployment unreportable. This gate is a separate, named support check, so a
+/// host can still read what the deployment ASKED for while the runtime refuses to START on it.
+///
+/// Both knobs are checked in one pass and reported in one message (the same aggregation rule
+/// `load_server_config` uses), so an operator who set both fixes them in one edit.
+///
+/// # Errors
+///
+/// [`ApiError::bad_request`] (400) prefixed `Invalid runtime settings: ` and naming the offending
+/// environment variable, when `thread_execution` is anything but `inline` or `io_execution` is
+/// anything but `inline`.
+pub fn validate_supported_execution(config: &ServerConfig) -> Result<(), ApiError> {
+    let mut issues: Vec<String> = Vec::new();
+
+    if config.thread_execution != SUPPORTED_EXECUTION_MODE {
+        issues.push(unsupported_execution_issue(
+            "thread_execution",
+            "HARNESS_THREAD_EXECUTION",
+            &config.thread_execution,
+        ));
+    }
+
+    if config.io_execution != SUPPORTED_EXECUTION_MODE {
+        issues.push(unsupported_execution_issue(
+            "io_execution",
+            "HARNESS_IO_EXECUTION",
+            &config.io_execution,
+        ));
+    }
+
+    if issues.is_empty() {
+        return Ok(());
+    }
+
+    Err(ApiError::bad_request(config::format_server_runtime_issues(
+        &issues,
+    )))
 }
 
 /// Drops every cached runtime. Tests use this to force a cold restart of one root (the same
@@ -326,15 +450,36 @@ pub fn cached_runtime(root: &Path) -> Option<Arc<HarnessRuntime>> {
     guard.get(&cache_key(root)).map(Arc::clone)
 }
 
-/// Builds one runtime (`createHarnessRuntime`). The error mapping is the brief's: 400 for bad
-/// provider settings (already the status `load_server_config` raises), 500 for the disk and the
-/// replay.
-fn build_runtime(root: &Path) -> Result<HarnessRuntime, ApiError> {
-    // 1. `.env` first, and never an override (`environment.rs`, `dotenvy::from_path`).
-    let environment = environment::load_harness_environment();
+/// Every cached runtime, for a shutdown that owns no root list.
+///
+/// `server::serve_on`'s shutdown arm and the standalone executable both need "close the streams of
+/// whatever this process actually served", and a runtime is created lazily per database root
+/// (`runtime.ts:299-308`), so the set of roots is only knowable from the cache. A root that never
+/// served a request is absent, and therefore needs nothing.
+#[must_use]
+pub fn cached_runtimes() -> Vec<Arc<HarnessRuntime>> {
+    let guard = cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    // 2. Configuration + runtime knobs. A bad value is a 400 that names the variable.
-    let config = config::load_server_config(&environment::harness_runtime_env())?;
+    guard.values().map(Arc::clone).collect()
+}
+
+/// Builds one runtime (`createHarnessRuntime`). The error mapping is the brief's: 400 for bad
+/// provider settings (already the status `load_server_config` raises) or an execution mode this
+/// build cannot provide ([`validate_supported_execution`]), 500 for the disk and the replay.
+///
+/// The configuration is a PARAMETER rather than a read inside, so the two entry points above differ
+/// only in where the settings came from, and the gate below fires for both.
+fn build_runtime(
+    root: &Path,
+    environment: environment::HarnessEnvironment,
+    config: ServerConfig,
+) -> Result<HarnessRuntime, ApiError> {
+    // The RUNTIME-SUPPORT gate, immediately after the settings are known and before the first
+    // filesystem read: a deployment that asked for a lane worker gets the refusal without this
+    // process touching `state.json`, which is the Rust shape of TS's startup abort.
+    validate_supported_execution(&config)?;
 
     // The BOOT document, kept aside because it is the reset target `PATCH /config` nulls point at
     // (`api.ts:789-793 shipped` + `:1384-1385`, which resets to `defaults`, i.e. the environment's
@@ -380,6 +525,9 @@ fn build_runtime(root: &Path) -> Result<HarnessRuntime, ApiError> {
     effective.model = merged.model.clone();
     effective.api_key = merged.api_key.clone();
     let runtime_settings = effective.settings();
+    // Kept aside because `effective` moves into the runtime's own lock, and the store needs its own
+    // copy of the same loaded configuration (`Store::set_host_view`).
+    let loaded_config = effective.clone();
     let settings = Arc::new(RwLock::new(effective));
 
     // 4c. The registry: shipped presets minus the tombstones, with the saved rows replayed onto
@@ -409,18 +557,16 @@ fn build_runtime(root: &Path) -> Result<HarnessRuntime, ApiError> {
     let task_host = Arc::new(StoreTaskHost::new());
     let hub = Arc::new(EventHub::new());
 
-    // The store keeps its own `Arc<HarnessRegistry>`/`Arc<AgentCatalogue>` snapshots (its fields
-    // are immutable and it is not this stage's file): the session paths that resolve a harness or
-    // an agent profile read the BOOT state. See `knowledge.md` "T5a" for the consequence and the
-    // one-line store change that removes it.
+    // The store's host view is the live registry, not a boot copy: `sessions.ts:1827` resolves the
+    // harness for a create from the store's CURRENT registry, so a `POST /harnesses` that committed
+    // seconds ago has to be visible to the next `POST /sessions`.
     let store_registry = Arc::new(registry.clone());
 
     let store = Arc::new(Store::open(
         StoreConfig::at(root),
         runtime_settings.clone(),
-        // The store keeps an immutable catalogue, so it gets a snapshot of the decisions this
-        // runtime now owns: the same consequence (and the same one-line store fix) as the
-        // registry snapshot above.
+        // The same rule for the catalogue: `api.ts:1707` reads the live `agentState`, so a
+        // `PATCH /agents` lands in the next session's instruction ladder.
         Arc::new(agents.clone()),
         Arc::clone(&tools) as Arc<dyn ToolRuntime>,
         Arc::clone(&executor) as Arc<dyn TurnExecutor>,
@@ -429,6 +575,27 @@ fn build_runtime(root: &Path) -> Result<HarnessRuntime, ApiError> {
         Arc::clone(&hub),
         Some(task_host),
     ));
+
+    // `Store::open` can only derive the runtime knobs from the trio it is handed, so the loaded
+    // `ServerConfig` goes in now: `runtime_execution` on a session resource is
+    // `api-reads.ts:226 context.runtime.threadExecution`, i.e. `HARNESS_THREAD_EXECUTION`, and every
+    // later host write re-pushes the view through `save` / `save_agents` (`sync_store`).
+    store.set_host_view(
+        Arc::new(registry.clone()),
+        Arc::new(agents.clone()),
+        loaded_config,
+    );
+
+    // 6. The stream broker, LAST because it reaches the store for the `unknown_resource` answer and
+    // the hub for the epoch and the counters. Registering it on the hub is what makes every REST
+    // mutation fan out to the live streams of this process: `stream/mount.ts:244-320`'s
+    // `createStreamSources` bridge is the same seam, spelled as a listener because this crate's hub
+    // already carries the published event.
+    // The store answers `unknown_resource` through the trait object; the coercion is spelled with an
+    // intermediate binding because `Arc::clone` would otherwise be inferred at the trait-object type.
+    let store_ref: Arc<Store> = Arc::clone(&store);
+    let exists: Arc<dyn StreamExists> = store_ref;
+    let stream_broker = stream::StreamBroker::with_hub_listener(Arc::clone(&hub), exists);
 
     Ok(HarnessRuntime {
         root: package_root::normalize_lexically(root),
@@ -441,6 +608,7 @@ fn build_runtime(root: &Path) -> Result<HarnessRuntime, ApiError> {
         executor,
         projector,
         store,
+        stream_broker,
         // The boot document, not the merged one: see the `boot_config` note above.
         credentials: Mutex::new(CredentialState::boot(&boot_config)),
     })
@@ -489,6 +657,9 @@ impl HarnessRuntime {
     /// after rolling back whatever it mutated in memory.
     pub fn save(&self) -> Result<(), ApiError> {
         if !self.store.config().persist {
+            // An in-memory root still has to see the host's live view; only the document is skipped.
+            self.sync_store();
+
             return Ok(());
         }
 
@@ -528,7 +699,76 @@ impl HarnessRuntime {
         // The credential is never in this document; the pair is the whole saved state.
         database.global_settings = Some(global_settings);
 
-        persistence::write_harness_database(&self.root, &database, &Store::write_owner())
+        persistence::write_harness_database(&self.root, &database, &Store::write_owner())?;
+
+        // The document holds the state the runtime just committed, so the store's host view moves to
+        // the SAME values: the next `POST /sessions` resolves the harness, the settings and the agent
+        // decisions this write made durable (`sessions.ts:1827` / `api.ts:1974` read live store
+        // state). A failed write never gets here, and the caller's rollback re-syncs instead.
+        self.sync_store();
+
+        Ok(())
+    }
+
+    /// Copies the runtime's live host view into the store, in the order the lock rules require.
+    ///
+    /// Each value is CLONED out of its own lock and every lock is released BEFORE `set_host_view`
+    /// takes the store mutex: the documented order is host lock -> store lock, and taking a host
+    /// lock while holding the store lock is the inversion that deadlocks (`store/mod.rs` "THE LOCK").
+    pub fn sync_store(&self) {
+        let registry = {
+            let guard = self
+                .registry
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            Arc::new(guard.clone())
+        };
+
+        let agents = {
+            let guard = self
+                .agents
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            Arc::new(guard.clone())
+        };
+
+        let config = {
+            let guard = self
+                .settings
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            guard.clone()
+        };
+
+        self.store.set_host_view(registry, agents, config);
+    }
+
+    /// Publishes the live stream frames as a host shutdown sees them: one `error` frame carrying
+    /// `close_code` per connection, then the close (`stream/mount.ts`'s `broker.close(1001)`, and
+    /// `close_all(1012)` for an epoch change).
+    ///
+    /// `stream::StreamBroker::close_all` is otherwise reachable only from tests: TS's start step calls
+    /// it on the way out, and a stream that simply drops its socket instead gives a client no reason
+    /// and no replay window to resume from.
+    pub fn close_streams(&self, code: u16) {
+        self.stream_broker.close_all(code);
+    }
+
+    /// The store-side shutdown step: stop claiming queued work, close the live streams, and write the
+    /// final durable document.
+    ///
+    /// This is the honest shape of `start.ts:319-340` (`broker.close` -> `store.dispose()` ->
+    /// `store.drainIo()`): the flag goes first so no pump starts new work behind the checkpoint, the
+    /// sockets close second so no frame races it, and the document is written last because it is the
+    /// step that can fail. `server::flush` keeps calling this on the standalone path.
+    pub fn shutdown(&self) -> Result<(), ApiError> {
+        self.store.begin_shutdown();
+        self.close_streams(1001);
+
+        self.save()
     }
 
     /// Commits the agent overlay to `<root>/harness/agents.json`
@@ -546,7 +786,13 @@ impl HarnessRuntime {
             agents.records()
         };
 
-        persistence::write_harness_agent_records(&self.root, &records)
+        persistence::write_harness_agent_records(&self.root, &records)?;
+
+        // The overlay is durable, so the store reads the same decision list the next session and the
+        // next turn resolve their instruction ladder from.
+        self.sync_store();
+
+        Ok(())
     }
 
     /// Replaces the agent catalogue with one rebuilt from `records` (the rollback half of
@@ -565,6 +811,12 @@ impl HarnessRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         *guard = next;
+
+        drop(guard);
+
+        // The rollback has to reach the store too, or a failed overlay write leaves the session paths
+        // resolving the decision the runtime just put back.
+        self.sync_store();
     }
 
     /// Replaces the harness registry with a snapshot (the same rollback shape, for a definition
@@ -576,6 +828,10 @@ impl HarnessRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         *guard = registry;
+
+        drop(guard);
+
+        self.sync_store();
     }
 
     /// A snapshot of the registry, for a route that needs an undo point before mutating.
@@ -594,6 +850,16 @@ impl HarnessRuntime {
     #[must_use]
     pub fn epoch(&self) -> String {
         self.hub.epoch().to_owned()
+    }
+
+    /// The live stream broker this runtime owns (`stream/mount.ts`'s `mount.broker`).
+    ///
+    /// The stream upgrade takes it so a connection and a REST write share one subscription table, one
+    /// set of sequences, and one set of parked replay windows; an embedder (T6's service route) reaches
+    /// the same object through this accessor rather than building a second broker.
+    #[must_use]
+    pub fn stream_broker(&self) -> Arc<stream::StreamBroker> {
+        Arc::clone(&self.stream_broker)
     }
 
     /// Advances one counter and publishes the change (`api.ts:1215-1221 publish` over

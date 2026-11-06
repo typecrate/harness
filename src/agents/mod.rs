@@ -554,7 +554,8 @@ fn normalize_agent_text(value: &str, field: &str, max: usize) -> Result<String, 
         )));
     }
 
-    if text.chars().count() > max {
+    // The bound is TypeScript's `.length`, i.e. UTF-16 code units, not scalar characters.
+    if text.encode_utf16().count() > max {
         return Err(ApiError::bad_request(format!(
             "`agent.{field}` cannot exceed {max} characters."
         )));

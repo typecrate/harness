@@ -40,7 +40,7 @@ const PUT_FIELDS: [&str; 2] = ["messages", "if_revision"];
 
 /// `GET {root}/sessions/{session_id}/threads/{thread_id}/transcript` (`api.ts:3556-3568`).
 pub async fn get_transcript_metadata(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
     let thread_id = ctx.param("thread_id").to_owned();
@@ -55,7 +55,7 @@ pub async fn get_transcript_metadata(ctx: &mut Ctx) -> ApiResult {
         .ok_or_else(|| store.unknown_session(&session_id))?;
 
     let response = contract::TranscriptMetadataResponse {
-        transcript: store.transcript_metadata(&state, &thread_id, &agent_of(state, &thread_id)),
+        transcript: store.transcript_metadata(state, &thread_id, &agent_of(state, &thread_id)),
     };
 
     drop(inner);
@@ -101,9 +101,12 @@ pub async fn put_transcript(ctx: &mut Ctx) -> ApiResult {
     let if_revision = match body.get("if_revision") {
         None => None,
         Some(value) => {
-            let stated = value
-                .as_i64()
-                .or_else(|| value.as_f64().filter(|number| number.fract() == 0.0).map(|n| n as i64));
+            let stated = value.as_i64().or_else(|| {
+                value
+                    .as_f64()
+                    .filter(|number| number.fract() == 0.0)
+                    .map(|n| n as i64)
+            });
 
             let Some(expected) = stated else {
                 return Err(ApiError::bad_request("\"if_revision\" must be an integer."));
@@ -136,6 +139,25 @@ pub async fn put_transcript(ctx: &mut Ctx) -> ApiResult {
 
     drop(inner);
 
+    // DEVIATION, reported: the store builds these links in the pre-R5 shape (`store/transcript.rs:397`,
+    // `{root}/sessions/{id}/transcript/{thread}`), which is NOT a path this router mounts. TS's route
+    // builds them itself, from the mount it is served under (`api.ts:3705-3715`), and the handler is
+    // the only layer this stage may change - so the three URLs are rewritten to the mounted shape here
+    // rather than left as links a client cannot follow.
+    let mut receipt = receipt;
+    let root = crate::contract::HARNESS_API_ROOT;
+    let base = format!("{root}/sessions/{session_id}/threads/{thread_id}");
+
+    if receipt.links.is_some() {
+        // All three members are `Option` in the generated type because the contract marks them
+        // optional; TS's route always fills all three, so this does too.
+        receipt.links = Some(contract::TranscriptWriteLinks {
+            transcript: Some(format!("{base}/transcript")),
+            messages: Some(format!("{base}/transcript/messages?limit=25")),
+            document: Some(format!("{base}/transcript/document")),
+        });
+    }
+
     let revision = receipt.revision;
 
     Ok(api::with_revision(
@@ -152,7 +174,7 @@ pub async fn put_transcript(ctx: &mut Ctx) -> ApiResult {
 /// `total` stays the whole transcript's entry count, which the store's page builder already does
 /// together with the "an exactly-full page only" cursor rule (`api.ts:3605`).
 pub async fn get_transcript_messages(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
     let thread_id = ctx.param("thread_id").to_owned();
@@ -174,7 +196,7 @@ pub async fn get_transcript_messages(ctx: &mut Ctx) -> ApiResult {
         .ok_or_else(|| store.unknown_session(&session_id))?;
 
     let page = store.transcript_page(
-        &state,
+        state,
         &thread_id,
         &agent_of(state, &thread_id),
         &ctx.query,
@@ -196,7 +218,7 @@ pub async fn get_transcript_messages(ctx: &mut Ctx) -> ApiResult {
 /// An UNREADABLE conversation answers with its RAW value - the text the user is fixing - and
 /// `content_type` is `application/json` on both paths.
 pub async fn get_transcript_document(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
     let thread_id = ctx.param("thread_id").to_owned();
@@ -211,7 +233,7 @@ pub async fn get_transcript_document(ctx: &mut Ctx) -> ApiResult {
         .ok_or_else(|| store.unknown_session(&session_id))?;
 
     let mut body = serde_json::to_value(store.transcript_document(
-        &state,
+        state,
         &thread_id,
         &agent_of(state, &thread_id),
     ))

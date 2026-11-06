@@ -85,7 +85,7 @@ impl Store {
             .session(id)
             .ok_or_else(|| store::session_not_found(id))?;
 
-        let agents = read::session_agent_rows_of(state, self.hub(), self.agents());
+        let agents = read::session_agent_rows_of(state, self.hub(), inner.agents());
         let total = u64::try_from(agents.len()).unwrap_or(u64::MAX);
 
         let response = SessionAgentListResponse {
@@ -114,7 +114,7 @@ impl Store {
             return Err(unknown_agent(id, agent_id));
         }
 
-        let (instruction, source, guidelines) = state.instruction_for(agent_id, self.agents());
+        let (instruction, source, guidelines) = state.instruction_for(agent_id, inner.agents());
 
         let response = SessionInstructionTextResponse {
             session_id: id.to_owned(),
@@ -151,8 +151,11 @@ impl Store {
         }
 
         // The profile must be a REAL catalogue profile: a session can point an agent at a trusted
-        // definition, never at a made-up one.
-        if self.agents().effective(&request.profile).is_none() {
+        // definition, never at a made-up one. The CURRENT catalogue (`api.ts:1707` reads the live
+        // `agentState`), fetched before the guard so the borrow below stays single.
+        let catalogue = self.agents();
+
+        if catalogue.effective(&request.profile).is_none() {
             return Err(ApiError::bad_request(format!(
                 "Unknown agent profile \"{}\".",
                 request.profile
@@ -232,7 +235,7 @@ impl Store {
         definition.agents.push(name.to_owned());
         state.record.definition = store::descriptor_record_of(&definition);
 
-        let agents = read::session_agent_rows_of(state, self.hub(), self.agents());
+        let agents = read::session_agent_rows_of(state, self.hub(), &catalogue);
         let agent = agents
             .into_iter()
             .find(|row| row.agent_id == name)
@@ -281,6 +284,10 @@ impl Store {
             ));
         }
 
+        // The roster rows are projected through the CURRENT catalogue, taken before the guard so the
+        // mutable session borrow below stays the only one out of `inner`.
+        let catalogue = self.agents();
+
         let mut inner = self.lock();
         let state = inner
             .session_mut(id)
@@ -325,7 +332,7 @@ impl Store {
             state.set_agent_model(agent_id, &model);
         }
 
-        let agents = read::session_agent_rows_of(state, self.hub(), self.agents());
+        let agents = read::session_agent_rows_of(state, self.hub(), &catalogue);
         let agent = agents
             .into_iter()
             .find(|row| row.agent_id == agent_id)
@@ -494,7 +501,9 @@ pub fn binding_of(
             .cloned()
             .unwrap_or_else(|| state.record.settings.model.clone()),
         instruction_source: source,
-        instruction_chars: u64::try_from(text.chars().count()).unwrap_or(u64::MAX),
+        // `chars` is `instruction.length` (`api-reads.ts`'s roster row), i.e. UTF-16 code units.
+        instruction_chars: u64::try_from(crate::projector::display_chars(&text))
+            .unwrap_or(u64::MAX),
         has_instruction_override: matches!(
             source,
             SessionInstructionSource::Harness | SessionInstructionSource::Session

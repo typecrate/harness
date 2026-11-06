@@ -82,18 +82,115 @@ pub fn decode_cursor(epoch: &str, cursor: Option<&str>) -> Result<u64, ApiError>
     let (token_epoch, ordinal_text) = text.split_at(separator);
     let ordinal_text = &ordinal_text[1..];
 
-    // Digits only: TS accepts anything `Number()` can coerce, but a token this server issued
-    // is always digits, so a non-digit ordinal is by definition foreign. (A `+5`/`1e3` token
-    // therefore lands on the stale/foreign answer here instead of being coerced.)
-    let is_plain_ordinal =
-        !ordinal_text.is_empty() && ordinal_text.bytes().all(|byte| byte.is_ascii_digit());
-
-    let ordinal = match (token_epoch == epoch, is_plain_ordinal) {
-        (true, true) => ordinal_text.parse::<u64>().map_err(|_| stale_cursor())?,
+    // The ordinal is whatever `Number()` can coerce (`api-paging.ts:74`): this server issues digits,
+    // but a client that re-encoded its own cursor (`+5`, `1e3`, `0x10`) is still describing an
+    // ordinal, and TS accepts it. A token whose ordinal half cannot be coerced, or that is not a safe
+    // non-negative integer, is by definition not one this server issued.
+    let ordinal = match number_value(ordinal_text) {
+        Some(value) if is_safe_integer(value) && value >= 0.0 => value as u64,
         _ => return Err(stale_cursor()),
     };
 
+    // The epoch half is a strict string compare (`:79`), so a coerced ordinal from a FOREIGN epoch is
+    // still the stale/foreign refusal.
+    if token_epoch != epoch {
+        return Err(stale_cursor());
+    }
+
     Ok(ordinal)
+}
+
+/// The ECMAScript `Number(text)` coercion (`api-paging.ts:74`, `:101`) for exactly the shapes a query
+/// string can carry: trim, then an optional sign, then a radix literal (`0x`/`0o`/`0b`), a decimal
+/// with an optional fraction, or a decimal with an optional exponent.
+///
+/// `None` is every value TS would reject through `Number.isSafeInteger` anyway: `NaN` (any spelling
+/// JS does not recognise, including `1.5.2` and `1_000` - numeric separators are a SOURCE form, not a
+/// string coercion) and `Infinity`/`-Infinity` (which includes `1e400`). An empty or whitespace-only
+/// text is `0`, because `Number("")` and `Number("  ")` are both `0` - that is why `?limit=` is a
+/// bounds refusal (`0 < min`) while an ABSENT `limit` is the default.
+fn number_value(text: &str) -> Option<f64> {
+    let text = text.trim();
+
+    if text.is_empty() {
+        return Some(0.0);
+    }
+
+    let (negative, rest) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+
+    let magnitude = |value: f64| if negative { -value } else { value };
+
+    // The radix literals: digits only after the prefix, no sign, no fraction and no exponent
+    // (`Number("0x+5")` and `Number("0x")` are both `NaN`).
+    for (prefix, radix) in [("0x", 16u32), ("0o", 8), ("0b", 2)] {
+        if rest.len() > prefix.len()
+            && rest.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        {
+            let parsed = i64::from_str_radix(&rest[prefix.len()..], radix).ok()?;
+
+            return Some(magnitude(parsed as f64));
+        }
+    }
+
+    // The decimal form, scanned rather than trusted: Rust's `f64::from_str` also accepts `inf`,
+    // `infinity`, `NaN` and a bare `.5`/`5.` tail, and JS's grammar for those is different.
+    let is_digit = |glyph: char| glyph.is_ascii_digit();
+    let bytes = rest.as_bytes();
+    let mut index = 0;
+    let mut seen_digits = false;
+
+    while index < bytes.len() && is_digit(bytes[index] as char) {
+        index += 1;
+        seen_digits = true;
+    }
+
+    if index < bytes.len() && bytes[index] == b'.' {
+        index += 1;
+
+        while index < bytes.len() && is_digit(bytes[index] as char) {
+            index += 1;
+            seen_digits = true;
+        }
+    }
+
+    if !seen_digits {
+        return None;
+    }
+
+    if index < bytes.len() && (bytes[index] | 0x20) == b'e' {
+        index += 1;
+
+        if index < bytes.len() && (bytes[index] == b'+' || bytes[index] == b'-') {
+            index += 1;
+        }
+
+        let exponent_start = index;
+
+        while index < bytes.len() && is_digit(bytes[index] as char) {
+            index += 1;
+        }
+
+        // An `e` with no digits after it is `NaN` in JS.
+        if exponent_start == index {
+            return None;
+        }
+    }
+
+    if index != bytes.len() {
+        return None;
+    }
+
+    rest.parse::<f64>().ok().map(magnitude)
+}
+
+/// `Number.isSafeInteger` (`:80`, `:103`): a finite, integral value inside the exact `f64` integer
+/// range.
+#[must_use]
+fn is_safe_integer(value: f64) -> bool {
+    value.is_finite() && value.fract() == 0.0 && value.abs() <= (1i64 << 53) as f64 - 1.0
 }
 
 /// The refusal every unusable cursor gets (`api-paging.ts:83`).
@@ -128,32 +225,29 @@ fn decode_token(token: &str) -> Option<String> {
 pub fn resolve_limit(limit: Option<&str>) -> Result<u64, ApiError> {
     const LIMIT_MESSAGE: &str = "Query parameter \"limit\" must be an integer between 1 and 100.";
 
-    // An ABSENT limit is the default, and `?limit=` is absent: the extractor is TS `paramOf`
-    // (`api.ts:482-488`), which trims and maps an empty value to `undefined` before it reaches
-    // `resolveLimit`, where `undefined` is the default (`api-paging.ts:95`). A route that hands
-    // the raw query value here therefore gets the same answer as TS only if empty is treated as
-    // absent, not as `Number('') === 0`.
-    let Some(raw) = limit.map(str::trim).filter(|value| !value.is_empty()) else {
+    // An ABSENT `limit` is the default. `?limit=` is NOT absent: the TS route passes the RAW
+    // `URLSearchParams.get` value to `resolveLimit` (`api.ts:1489`), and `Number("")` is `0`, which
+    // the bounds check then refuses. (An earlier revision of this port treated empty as absent
+    // because the OTHER filters do; T7b follows the paging helper itself.)
+    let Some(raw) = limit else {
         return Ok(PAGE_LIMIT_DEFAULT);
     };
 
-    // TS accepts `typeof limit === 'number'` too (`:97`); a query string is always text, so
-    // the trimmed digits-only check below is the same test.
-    if !raw.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(ApiError::bad_request(LIMIT_MESSAGE));
-    }
-
-    let Ok(value) = raw.parse::<u64>() else {
+    // `const value = Number(limit)` + `Number.isSafeInteger` (`api-paging.ts:101-103`), so `+25`,
+    // `25.0`, `1e2` and `0x19` all resolve, while `1.5`, `abc`, `1e400` and an over-2^53 digit run
+    // do not.
+    let Some(value) = number_value(raw).filter(|value| is_safe_integer(*value)) else {
         return Err(ApiError::bad_request(LIMIT_MESSAGE));
     };
 
-    // `Number.isSafeInteger` is the TS guard against a 19-digit overflow; a `u64` that parsed
-    // but falls outside the contract bounds is the same refusal.
-    if !(PAGE_LIMIT_MIN..=PAGE_LIMIT_MAX).contains(&value) {
+    // `value < HARNESS_PAGE_LIMIT.min || value > HARNESS_PAGE_LIMIT.max` (`:103`). The comparison is
+    // on the coerced number because that is what TS bounds, and a negative zero is inside the range
+    // exactly as it is there.
+    if value < PAGE_LIMIT_MIN as f64 || value > PAGE_LIMIT_MAX as f64 {
         return Err(ApiError::bad_request(LIMIT_MESSAGE));
     }
 
-    Ok(value)
+    Ok(value as u64)
 }
 
 /// A bounded slice: the entries for this page plus whether a next page exists

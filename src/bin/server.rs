@@ -3,20 +3,23 @@
 //! The native form of `startHarnessServer` (`packages/underload/harness/src/server/start.ts:102-103`
 //! for the bind defaults, `:133-340` for the construction and the close sequence). The library owns
 //! the router and the per-root runtime (`src/server.rs`, `src/runtime.rs`); this file is the
-//! thinnest possible process wrapper: flags, one bind, the banner, the shutdown signal, and the
-//! final durable checkpoint.
+//! thinnest possible process wrapper: flags, the runtime-support gate that refuses an execution mode
+//! this build does not provide, one bind, the banner, the shutdown signal, and the final durable
+//! checkpoint.
 //!
-//! WHY THE BIN DOES NOT DEPEND ON `typecrate_services`: the gateway integration (T6's `*-route.rs`
-//! discovery wiring) is a later stage, and an embedder that serves this mount inside the service
-//! gateway never runs this executable. Keeping the bin standalone means `cargo run --bin
-//! typecrate-harness-server` works on its own, and a gateway build cannot pull a CLI parse into the
-//! library.
+//! WHY THE BIN DOES NOT DEPEND ON `typecrate_services`: the gateway mount is a SEPARATE transport
+//! (`endpoint/harness/harness-route.rs`, shipped by T6) that serves the same library dispatcher
+//! inside the `typecrate-services` listener, and an embedder that runs that bridge never starts this
+//! executable. Keeping the bin standalone means `cargo run --bin typecrate-harness-server` works on
+//! its own, and a gateway build cannot pull a CLI parse into the library.
 //!
 //! EXIT CODES are the sibling crate's convention (`packages/typecrate/services/src/bin/server.rs`):
 //! 0 clean shutdown, 1 could not serve, 2 bad usage - a supervisor restarts the second and fixes the
-//! first. `main` builds the tokio runtime by hand rather than with `#[tokio::main]`, because
-//! `[profile.release] panic = "abort"` turns a `main -> Result` into an abort status instead of the
-//! promised code.
+//! first. A deployment that asked for `HARNESS_*_EXECUTION=worker` is the FIRST kind, not the second:
+//! the flags were valid and restarting is what will not help, so the environment edit is the fix and
+//! the code says "this process could not serve what it was asked to serve". `main` builds the tokio
+//! runtime by hand rather than with `#[tokio::main]`, because `[profile.release] panic = "abort"`
+//! turns a `main -> Result` into an abort status instead of the promised code.
 
 use std::ffi::OsString;
 use std::io::ErrorKind;
@@ -24,8 +27,12 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
 use tokio::net::TcpListener;
+use typecrate_harness::config;
 use typecrate_harness::contract;
+use typecrate_harness::environment;
+use typecrate_harness::error::ApiError;
 use typecrate_harness::package_root;
+use typecrate_harness::runtime;
 use typecrate_harness::server;
 
 /// The native bind of the standalone listener (`start.ts:103`, `DEFAULT_HOST`). Loopback on
@@ -67,6 +74,16 @@ OPTIONS:
                              boundary the TypeScript service uses.
         --help               Print this help and exit.
 
+RUNTIME EXECUTION:
+    This Rust build serves the inline lane only. A deployment that asks for
+    more - HARNESS_THREAD_EXECUTION=worker or HARNESS_IO_EXECUTION=worker - is
+    refused HERE, before this process binds: the message is printed and the
+    exit code is 1. The same refusal answers the first request of the gateway
+    mount with 400. Nothing degrades silently: the TypeScript server treats a
+    worker lane as a promise and aborts when it cannot be kept
+    (workers/capability.ts, workers/io-client.ts, sessions.ts), and this build
+    keeps that promise by refusing rather than by running inline anyway.
+
 WHERE IT ANSWERS:
     GET  /v1/harness           the bootstrap document (identity, limits,
                                capabilities, epoch, links)
@@ -79,7 +96,9 @@ WHERE IT ANSWERS:
 Every JSON response carries the contract's X-Harness-Epoch header, and an
 identified read or a write carries X-Harness-Revision.
 
-Exit codes: 0 clean shutdown, 1 could not serve, 2 bad usage.
+Exit codes: 0 clean shutdown, 1 could not serve (the bind was taken, or the
+deployment asked for a runtime mode this build does not provide - fixing the
+environment clears that one, restarting does not), 2 bad usage.
 
 The process stops on Ctrl+C (and SIGTERM on unix) after draining in-flight
 requests and writing its final durable document.";
@@ -109,6 +128,19 @@ fn main() {
         std::process::exit(EXIT_OK);
     }
 
+    // THE RUNTIME-SUPPORT GATE, before anything is bound. The TypeScript standalone start aborts on
+    // an unusable runtime setting (`start.ts` -> the config loader throws), and this build has no
+    // worker backend at all, so a `worker` deployment has to fail HERE rather than quietly serve
+    // every turn inline behind the operator's back.
+    //
+    // Exit 1, not 2: the CLI usage was valid - the DEPLOYMENT asked for something this executable
+    // cannot provide - so a supervisor restart does not help and the environment edit does.
+    if let Err(error) = startup_support_check() {
+        eprintln!("typecrate-harness-server: {}", error.message);
+
+        std::process::exit(EXIT_RUNTIME);
+    }
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -121,6 +153,19 @@ fn main() {
     };
 
     std::process::exit(runtime.block_on(run(config)));
+}
+
+/// Reads the deployment's configuration the same way the library runtime does (`environment`'s
+/// `.env` merge, then `config::load_server_config`) and refuses an execution mode this build cannot
+/// provide ([`runtime::validate_supported_execution`]).
+///
+/// The provider refusals ride along for free: a bad `HARNESS_BASE_URL` is a startup abort in
+/// TypeScript too, and printing it before the bind is what stops the banner from advertising a
+/// server whose first request would fail.
+fn startup_support_check() -> Result<(), ApiError> {
+    let loaded = config::load_server_config(&environment::harness_runtime_env())?;
+
+    runtime::validate_supported_execution(&loaded)
 }
 
 /// Parses the flags and applies the built-in defaults. Everything resolves through ONE pure function
@@ -451,6 +496,98 @@ mod tests {
             resolve(&owned(&["--help", "--nope"])).unwrap_err(),
             "unknown option `--nope`"
         );
+    }
+
+    /// The refusal this executable prints for a lane-worker deployment, kept as one literal so the
+    /// message the operator SEES is the message the test asserts.
+    const THREAD_WORKER_REFUSAL: &str = concat!(
+        "Invalid runtime settings: thread_execution \"worker\" is not supported in this Rust ",
+        "build; only \"inline\" is available. Unset HARNESS_THREAD_EXECUTION or set it to ",
+        "\"inline\" - this build never runs a \"worker\" deployment inline silently.",
+    );
+
+    /// The same for the durable-IO knob.
+    const IO_WORKER_REFUSAL: &str = concat!(
+        "Invalid runtime settings: io_execution \"worker\" is not supported in this Rust build; ",
+        "only \"inline\" is available. Unset HARNESS_IO_EXECUTION or set it to \"inline\" - this ",
+        "build never runs a \"worker\" deployment inline silently.",
+    );
+
+    /// Both knobs set: one pass, one refusal naming BOTH variables, so the operator fixes them in
+    /// one edit (the same aggregation `load_server_config` uses).
+    const BOTH_WORKER_REFUSAL: &str = concat!(
+        "Invalid runtime settings: thread_execution \"worker\" is not supported in this Rust ",
+        "build; only \"inline\" is available. Unset HARNESS_THREAD_EXECUTION or set it to ",
+        "\"inline\" - this build never runs a \"worker\" deployment inline silently.",
+        "; io_execution \"worker\" is not supported in this Rust build; only \"inline\" is ",
+        "available. Unset HARNESS_IO_EXECUTION or set it to \"inline\" - this build never runs a ",
+        "\"worker\" deployment inline silently.",
+    );
+
+    /// The loader + gate pair `startup_support_check` runs, driven from an EXPLICIT environment map:
+    /// writing the process environment is `unsafe` in edition 2024 and this crate forbids unsafe, so
+    /// the composition is pinned this way instead of through `set_var`.
+    fn support(env: &[(&str, &str)]) -> Result<(), ApiError> {
+        let values: std::collections::BTreeMap<String, String> = env
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect();
+
+        let loaded = config::load_server_config(&values)?;
+
+        runtime::validate_supported_execution(&loaded)
+    }
+
+    #[test]
+    fn the_default_deployment_passes_the_startup_support_gate() {
+        // An empty environment is `inline`/`inline`, i.e. exactly what this build serves, so the
+        // standalone start still binds.
+        assert_eq!(support(&[]), Ok(()));
+
+        // The spelled-out `inline` values pass as well - the gate is about the MODE, not about
+        // whether the variable happens to be set.
+        assert_eq!(
+            support(&[
+                ("HARNESS_THREAD_EXECUTION", "inline"),
+                ("HARNESS_IO_EXECUTION", "inline"),
+            ]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_worker_deployment_is_refused_before_the_bind() {
+        // `HARNESS_THREAD_EXECUTION=worker`: the PARSE succeeds (`config.rs` ports the TS loader
+        // verbatim, so `/config` can still report the value) and the SUPPORT gate refuses it as a 400.
+        assert_eq!(
+            support(&[("HARNESS_THREAD_EXECUTION", "worker")]),
+            Err(ApiError::bad_request(THREAD_WORKER_REFUSAL))
+        );
+        assert_eq!(
+            support(&[("HARNESS_IO_EXECUTION", "worker")]),
+            Err(ApiError::bad_request(IO_WORKER_REFUSAL))
+        );
+        assert_eq!(
+            support(&[
+                ("HARNESS_THREAD_EXECUTION", "worker"),
+                ("HARNESS_IO_EXECUTION", "worker"),
+            ]),
+            Err(ApiError::bad_request(BOTH_WORKER_REFUSAL))
+        );
+    }
+
+    #[test]
+    fn help_states_that_a_worker_deployment_is_refused_before_the_bind() {
+        // `--help` is the offline documentation, so the honesty promise is asserted rather than
+        // eyeballed: the mode this build serves, the two variables, and the exit code. HELP is
+        // hand-wrapped, so every fragment below sits on ONE printed line.
+        assert!(HELP.contains("serves the inline lane only"));
+        assert!(HELP.contains("HARNESS_THREAD_EXECUTION=worker"));
+        assert!(HELP.contains("HARNESS_IO_EXECUTION=worker"));
+        assert!(HELP.contains("before this process binds"));
+        assert!(HELP.contains("exit code is 1"));
+        assert!(HELP.contains("Nothing degrades silently"));
+        assert!(HELP.contains("1 could not serve (the bind was taken, or the"));
     }
 
     #[test]

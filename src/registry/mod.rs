@@ -148,6 +148,7 @@ impl HarnessRegistry {
                         subagents: Some(record.subagents.clone()),
                         agent_models: record.agent_models.clone(),
                         agent_instructions: record.agent_instructions.clone(),
+                        agent_colors: record.agent_colors.clone(),
                     },
                     agents,
                 )?;
@@ -203,6 +204,9 @@ impl HarnessRegistry {
                         .then_some(record.agent_models.clone().unwrap_or_default()),
                     agent_instructions: executable
                         .then_some(record.agent_instructions.clone().unwrap_or_default()),
+                    // R2: the third map is replayed by the same rule (`registry.ts:1040`, `:1102`).
+                    agent_colors: executable
+                        .then_some(record.agent_colors.clone().unwrap_or_default()),
                 },
                 agents,
             )?;
@@ -443,6 +447,14 @@ impl HarnessRegistry {
             None => std::collections::BTreeMap::new(),
         };
 
+        // The third map of the same shape (`registry.ts:1244-1250`): validated against the FINAL
+        // member set, because a swatch for an agent this harness does not select can never be
+        // painted.
+        let agent_colors = match &request.agent_colors {
+            Some(map) => normalize_agent_colors(map, &members)?,
+            None => std::collections::BTreeMap::new(),
+        };
+
         let title = match &request.title {
             Some(value) => normalize_title(value)?,
             // A created harness with no stated title is named by its id (`registry.ts:1062-1065`).
@@ -475,6 +487,7 @@ impl HarnessRegistry {
                 .collect(),
             agent_models,
             agent_instructions,
+            agent_colors,
             builtin: false,
             editable: true,
             template: Some("live".to_string()),
@@ -516,6 +529,7 @@ impl HarnessRegistry {
             && request.subagents.is_none()
             && request.agent_models.is_none()
             && request.agent_instructions.is_none()
+            && request.agent_colors.is_none()
         {
             return Err(ApiError::bad_request(
                 "A patch must change at least one field.",
@@ -566,13 +580,26 @@ impl HarnessRegistry {
             None => retain_members(&current.agent_instructions, &members),
         };
 
+        // Colors follow the identical rule for the identical reason (`registry.ts:1377-1389`): a
+        // swatch for an agent this patch removed can never be painted, so it is dropped, and a
+        // stated map REPLACES the stored one (`{}` clears every color).
+        let agent_colors = match &request.agent_colors {
+            Some(map) => normalize_agent_colors(map, &members)?,
+            None => retain_members(&current.agent_colors, &members),
+        };
+
         // An executable change on a SCRIPTED template upgrades it to a live harness and corrects the
         // descriptor fields that would otherwise still advertise the offline fixture
         // (`registry.ts:1203-1256`).
         let executable = request.primary.is_some()
             || request.subagents.is_some()
             || request.agent_models.is_some()
-            || request.agent_instructions.is_some();
+            || request.agent_instructions.is_some()
+            // R2: a color is display-only, but it is still EXECUTABLE in this sense (`registry.ts
+            // :1411-1416`): the map reaches every agent built from this definition, so a stated
+            // color must rebuild the factory - and, on the scripted demo, upgrade it to a live
+            // harness exactly like an instruction edit does.
+            || request.agent_colors.is_some();
 
         let upgraded = executable && current.template.as_deref() == Some("scripted");
 
@@ -608,6 +635,9 @@ impl HarnessRegistry {
             },
             agent_models,
             agent_instructions,
+            // Stated explicitly, not inherited from `current`: `{}` from a patch means "no
+            // colors", which `current` alone would not produce (`registry.ts:1460-1465`).
+            agent_colors,
             builtin: current.builtin,
             editable: true,
             template: if upgraded {
@@ -719,6 +749,13 @@ pub fn descriptor_record_of(definition: &HarnessDescriptor) -> HarnessDescriptor
         } else {
             Some(definition.agent_instructions.clone())
         },
+        // The color map follows the same non-empty rule (`descriptor.ts:117-119`), which is what
+        // lets a session frozen before colors existed persist with no key at all.
+        agent_colors: if definition.agent_colors.is_empty() {
+            None
+        } else {
+            Some(definition.agent_colors.clone())
+        },
         builtin: definition.builtin,
         editable: definition.editable,
         extra: serde_json::Map::new(),
@@ -743,6 +780,7 @@ pub fn definition_from_descriptor_record(record: &HarnessDescriptorRecord) -> Ha
         environment_tools: Vec::new(),
         agent_models: record.agent_models.clone().unwrap_or_default(),
         agent_instructions: record.agent_instructions.clone().unwrap_or_default(),
+        agent_colors: record.agent_colors.clone().unwrap_or_default(),
         builtin: record.builtin,
         editable: record.editable,
         template: Some("live".to_string()),
@@ -777,7 +815,11 @@ pub fn instruction_summary_of(
             // units and the wire states the unit (`projector::display_chars`, the one helper for that
             // count - `api.ts:2803` / `:2831` and `harness-api.ts`'s `chars` members).
             let chars = u64::try_from(override_text.map_or_else(
-                || profile.map_or(0, |profile| crate::projector::display_chars(&profile.instruction)),
+                || {
+                    profile.map_or(0, |profile| {
+                        crate::projector::display_chars(&profile.instruction)
+                    })
+                },
                 |text| crate::projector::display_chars(text),
             ))
             .unwrap_or(u64::MAX);
@@ -887,7 +929,8 @@ fn normalize_title(value: &str) -> Result<String, ApiError> {
         return Err(registry_bad_request("`title` cannot be empty.".to_string()));
     }
 
-    if title.chars().count() > presets::MAX_TITLE_LENGTH {
+    // The bound is TypeScript's `.length`, i.e. UTF-16 code units, not scalar characters.
+    if title.encode_utf16().count() > presets::MAX_TITLE_LENGTH {
         return Err(registry_bad_request(format!(
             "`title` cannot exceed {} characters.",
             presets::MAX_TITLE_LENGTH
@@ -902,7 +945,8 @@ fn normalize_title(value: &str) -> Result<String, ApiError> {
 fn normalize_description(value: &str) -> Result<String, ApiError> {
     let description = value.trim();
 
-    if description.chars().count() > presets::MAX_DESCRIPTION_LENGTH {
+    // The bound is TypeScript's `.length`, i.e. UTF-16 code units, not scalar characters.
+    if description.encode_utf16().count() > presets::MAX_DESCRIPTION_LENGTH {
         return Err(registry_bad_request(format!(
             "`description` cannot exceed {} characters.",
             presets::MAX_DESCRIPTION_LENGTH
@@ -961,7 +1005,8 @@ fn require_model_id(value: &str, agent: &str) -> Result<String, ApiError> {
         )));
     }
 
-    if model.chars().count() > presets::MAX_MODEL_ID_LENGTH {
+    // The bound is TypeScript's `.length`, i.e. UTF-16 code units, not scalar characters.
+    if model.encode_utf16().count() > presets::MAX_MODEL_ID_LENGTH {
         return Err(registry_bad_request(format!(
             "`agentModels.{agent}` cannot exceed {} characters.",
             presets::MAX_MODEL_ID_LENGTH
@@ -1012,7 +1057,8 @@ fn require_instruction(value: &str, agent: &str) -> Result<String, ApiError> {
         )));
     }
 
-    if instruction.chars().count() > presets::MAX_INSTRUCTION_LENGTH {
+    // The bound is TypeScript's `.length`, i.e. UTF-16 code units, not scalar characters.
+    if instruction.encode_utf16().count() > presets::MAX_INSTRUCTION_LENGTH {
         return Err(registry_bad_request(format!(
             "`agentInstructions.{agent}` cannot exceed {} characters.",
             presets::MAX_INSTRUCTION_LENGTH
@@ -1045,6 +1091,56 @@ fn normalize_agent_instructions(
         }
 
         resolved.insert(agent.clone(), require_instruction(instruction, agent)?);
+    }
+
+    Ok(resolved)
+}
+
+/// `requireAgentColor` (`registry.ts:564-594`). Trimmed, then matched against the hex shape. A
+/// blank value is a rejection rather than "no color", for the same reason a blank model id and a
+/// blank instruction are: a client that means "drop this swatch" must omit the key (or send `{}`),
+/// so an accidental paste cannot silently discard a saved color while the UI still paints the old
+/// one.
+fn require_agent_color(value: &str, agent: &str) -> Result<String, ApiError> {
+    let color = value.trim();
+
+    if color.is_empty() {
+        return Err(registry_bad_request(format!(
+            "`agentColors.{agent}` cannot be empty. Omit the key to leave this agent uncolored."
+        )));
+    }
+
+    if !presets::is_agent_color(color) {
+        // `JSON.stringify(value)` quotes the RAW value the client sent, not the trimmed one
+        // (`registry.ts:589`), so the refusal shows exactly what was rejected.
+        return Err(registry_bad_request(format!(
+            "`agentColors.{agent}` must be a CSS hex color (#rgb, #rgba, #rrggbb or #rrggbbaa). Received {}.",
+            serde_json::Value::String(value.to_owned())
+        )));
+    }
+
+    Ok(color.to_string())
+}
+
+/// `normalizeAgentColors` (`registry.ts:596-629`), against the FINAL member set - the third map of
+/// the same shape with the same two rules as the model and instruction maps: an entry for an agent
+/// this harness does not select can never be painted, so it is a visible 400 rather than a stored
+/// no-op, and the whole map is validated all-or-nothing.
+fn normalize_agent_colors(
+    value: &std::collections::BTreeMap<String, String>,
+    members: &[String],
+) -> Result<std::collections::BTreeMap<String, String>, ApiError> {
+    let mut resolved = std::collections::BTreeMap::new();
+
+    for (agent, color) in value {
+        if !members.iter().any(|member| member == agent) {
+            return Err(registry_bad_request(format!(
+                "`agentColors` names \"{agent}\", which is not a member of this harness. Members: {}.",
+                members.join(", ")
+            )));
+        }
+
+        resolved.insert(agent.clone(), require_agent_color(color, agent)?);
     }
 
     Ok(resolved)
@@ -1149,6 +1245,9 @@ pub fn preset_records_equal(left: &HarnessPresetRecord, right: &HarnessPresetRec
         && same_list(&left.environment_tools, &right.environment_tools)
         && same_map(&left.agent_models, &right.agent_models)
         && same_map(&left.agent_instructions, &right.agent_instructions)
+        // R2: colors are part of the fixed shape too, so a saved row that carries them compares
+        // equal to the entry rebuilt from it (`registry.ts:790-795`).
+        && same_map(&left.agent_colors, &right.agent_colors)
         && left.builtin == right.builtin
         && (left.template.clone().unwrap_or_else(|| "live".to_string())
             == right.template.clone().unwrap_or_else(|| "live".to_string()))
@@ -1186,6 +1285,10 @@ pub fn is_legacy_shipped_definition(
             .clone()
             .unwrap_or_default()
             .is_empty()
+        // R2: a saved color is a customisation as well (`registry.ts:979-982`) - the prose-only
+        // refresh would drop the row's map, so an operator who colored one member of a built-in
+        // keeps that decision instead of losing it to an upgrade.
+        && record.agent_colors.clone().unwrap_or_default().is_empty()
 }
 
 /// Trims and de-duplicates a name list while preserving order (`persistence.ts:1158-1171` and the

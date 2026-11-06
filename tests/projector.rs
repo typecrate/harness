@@ -370,6 +370,12 @@ fn a_root_flow_opens_one_section_and_streams_its_answer() {
                 "startedAt": 1_000,
                 "endedAt": 1_004,
                 "tail": {"kind": "assistant", "nodeId": "n1", "chars": 12, "truncated": false},
+                // The context bar is EMPTY here on purpose: TypeScript mints an `assistant`
+                // segment per prose window, and this fold carries a streamed answer in the node
+                // and the tail only - the `done` fallback fires solely when no delta streamed
+                // (`turn-display.ts:373-376`). The member is still PRESENT, because a client maps
+                // over it without a presence check.
+                "context": [],
                 "answerNodeId": "n1",
                 "nodes": [{
                     "kind": "text",
@@ -519,10 +525,71 @@ fn a_tool_round_becomes_one_step_row_with_its_result() {
             "section:open",
             "section:set",
             "step:set",
+            // The call mints the bar entry beside the step row (`turn-projector.ts:2043`)...
+            "context:add",
             "step:set",
+            // ...and its result rewrites THAT entry, in the same frame as the step patch (`:2195`).
+            "context:set",
             "attempt:commit",
         ],
         "the call opens a step row and its result PATCHES that same row: one row per call"
+    );
+
+    // The bar is a second, METADATA-only view of the same round: one segment for the call, which
+    // its result settles. No text rides on a segment - the bytes come from the recorded range.
+    let added = ops
+        .iter()
+        .find_map(|frame| op_with(frame, "context:add", None))
+        .expect("the call mints one context-bar segment");
+
+    assert_eq!(
+        added,
+        &json!({
+            "op": "context:add",
+            "turnId": "",
+            "sectionId": "s0",
+            "block": {
+                // The key is the OPENING event's index, the same derivation as the step id, so
+                // the step row and the segment name the same round by construction.
+                "kind": "tool",
+                "id": "1-tool-1",
+                "turnId": "",
+                "sectionId": "s0",
+                "name": "read",
+                "at": 1_001,
+                "chars": 16,
+                "argsChars": 16,
+                "inPrompt": true,
+                "eventFrom": 1,
+                "eventTo": 1,
+            },
+        }),
+        "an open call reports its argument bytes and nothing else"
+    );
+
+    let settled = ops
+        .iter()
+        .find_map(|frame| op_with(frame, "context:set", None))
+        .expect("the result settles that same segment");
+
+    assert_eq!(
+        settled,
+        &json!({
+            "op": "context:set",
+            "turnId": "",
+            "sectionId": "s0",
+            "blockId": "1-tool-1",
+            "patch": {
+                // 16 argument code units + 8 result code units, counted exactly (invariant 5).
+                "chars": 24,
+                "resultChars": 8,
+                "state": "ok",
+                "endedAt": 1_002,
+                "eventTo": 2,
+                "durationMs": 4,
+            },
+        }),
+        "one segment per call: the result patches the segment its call opened, identity members intact"
     );
 
     let nodes = display["sections"][0]["nodes"].clone();
@@ -565,6 +632,27 @@ fn a_tool_round_becomes_one_step_row_with_its_result() {
             "result": "one two",
         }),
         "a tool block is the newest eligible block, and its tail is always marked truncated"
+    );
+    assert_eq!(
+        display["sections"][0]["context"],
+        json!([{
+            "kind": "tool",
+            "id": "1-tool-1",
+            "turnId": "",
+            "sectionId": "s0",
+            "name": "read",
+            "at": 1_001,
+            "chars": 24,
+            "argsChars": 16,
+            "inPrompt": true,
+            "eventFrom": 1,
+            "eventTo": 2,
+            "resultChars": 8,
+            "state": "ok",
+            "endedAt": 1_002,
+            "durationMs": 4,
+        }]),
+        "the compiled tree carries the settled segment the ops built, so a cold replay says the same thing"
     );
     assert_eq!(summary["stepCount"], json!(1));
     assert_eq!(summary["status"], json!("done"));

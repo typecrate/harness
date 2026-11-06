@@ -146,6 +146,15 @@ pub fn harness_definition_of_revision(
         } else {
             Some(definition.agent_models.clone())
         },
+        // The per-agent display colors, emitted under the same non-empty rule as `agent_models`, so
+        // an uncolored definition keeps its exact pre-R2 shape (`api-reads.ts:1099-1106`). This is
+        // the field a client paints swatches from; a member it omits is uncolored and the host
+        // applies its own derivation.
+        agent_colors: if definition.agent_colors.is_empty() {
+            None
+        } else {
+            Some(definition.agent_colors.clone())
+        },
         instruction_summary: Some(crate::registry::instruction_summary_of(definition, agents)),
     }
 }

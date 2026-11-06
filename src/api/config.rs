@@ -143,14 +143,16 @@ pub async fn patch_config(ctx: &mut Ctx) -> ApiResult {
 
     // Bounds and the non-empty rule, ALL before the commit (`api.ts:1410-1422`). The caps measure
     // the trimmed value, because that is the string `merge_settings` later validates and sends.
-    if next_base_url.chars().count() > config::MAX_BASE_URL_LENGTH {
+    // The bound is TypeScript's `.length`, i.e. UTF-16 code units, not scalar characters.
+    if next_base_url.encode_utf16().count() > config::MAX_BASE_URL_LENGTH {
         return Err(ApiError::bad_request(format!(
             "A provider base URL cannot exceed {} characters.",
             config::MAX_BASE_URL_LENGTH
         )));
     }
 
-    if next_model.chars().count() > config::MAX_MODEL_LENGTH {
+    // The bound is TypeScript's `.length`, i.e. UTF-16 code units, not scalar characters.
+    if next_model.encode_utf16().count() > config::MAX_MODEL_LENGTH {
         return Err(ApiError::bad_request(format!(
             "A model name cannot exceed {} characters.",
             config::MAX_MODEL_LENGTH

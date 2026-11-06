@@ -92,6 +92,12 @@ enum Script {
     Fail { error: String },
     /// Drains ONE steer out of the conversation's channel, then answers with both texts.
     Steer { answer: Answer },
+    /// Waits for a steer the way a live run does, drains whatever else is queued, and then FAILS.
+    ///
+    /// This is `harness.ts:6820-6837`'s catch arm: the guidance was drained into the transcript, the
+    /// rollback unwound it, and the run reports it as `unused_steering` so the store can hand it back
+    /// to the conversation instead of losing the user's input.
+    SteerFail { error: String },
 }
 
 /// Everything one run was handed, kept so a test can assert what the store prepared.
@@ -221,6 +227,7 @@ impl TurnExecutor for MockExecutor {
                         cancelled: false,
                         messages: Vec::new(),
                         stop_reason: None,
+                        unused_steering: Vec::new(),
                     };
                 }
                 Script::Steer { answer } => {
@@ -236,6 +243,50 @@ impl TurnExecutor for MockExecutor {
                         text: format!("{}>{steered}", answer.text),
                         ..answer
                     }
+                }
+                Script::SteerFail { error } => {
+                    let mut receiver = steering
+                        .take()
+                        .expect("a live run owns its conversation's steer channel");
+                    let mut drained: Vec<String> = Vec::new();
+
+                    // Wait for the steer (the deterministic half), then take anything that arrived
+                    // behind it, in order.
+                    drained.push(
+                        receiver
+                            .recv()
+                            .await
+                            .expect("the store delivers a steer to the live run"),
+                    );
+
+                    while let Ok(text) = receiver.try_recv() {
+                        drained.push(text);
+                    }
+
+                    emit(HarnessEvent::Start {
+                        agent: AGENT.to_owned(),
+                        model: model.clone(),
+                        thread: None,
+                    });
+                    emit(HarnessEvent::Error {
+                        agent: AGENT.to_owned(),
+                        error: HarnessErrorInfo {
+                            message: error.clone(),
+                        },
+                        thread: None,
+                    });
+
+                    return typecrate_harness::contract::TurnOutcome {
+                        usage: None,
+                        error: Some(error),
+                        cancelled: false,
+                        // A failed run hands back no messages: the conversation keeps what it had.
+                        messages: Vec::new(),
+                        stop_reason: None,
+                        // Everything this run drained is owed back, because the transcript it was
+                        // appended into is rolled back (`harness.ts:6826-6837`).
+                        unused_steering: drained,
+                    };
                 }
             };
 
@@ -259,6 +310,7 @@ impl TurnExecutor for MockExecutor {
                     },
                 ],
                 stop_reason: Some("stop".to_owned()),
+                unused_steering: Vec::new(),
             }
         })
     }
@@ -357,6 +409,12 @@ impl ToolRuntime for MockRuntime {
     }
 
     fn summaries(&self) -> Vec<typecrate_harness::contract::ToolSummary> {
+        self.entries.clone()
+    }
+
+    /// The mock has no listing rule: every row it holds is both listed and part of a session
+    /// toolbox (`ports.rs`'s two summaries methods).
+    fn catalogue_summaries(&self) -> Vec<typecrate_harness::contract::ToolSummary> {
         self.entries.clone()
     }
 
@@ -464,6 +522,12 @@ struct Fixture {
 
 impl Fixture {
     fn with_scripts(name: &str, scripts: Vec<Script>) -> Self {
+        Self::with_fold(name, scripts, Arc::new(MockProjectorFactory))
+    }
+
+    /// The same fixture over a caller-chosen display fold, so a test can pin what the REAL projector
+    /// produces (`projector::TurnProjectorFactory`) while every other double stays scripted.
+    fn with_fold(name: &str, scripts: Vec<Script>, projector: Arc<dyn ProjectorFactory>) -> Self {
         let sequence = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let directory = typecrate_harness::package_root::repo_root()
             .join("Temp")
@@ -486,7 +550,7 @@ impl Fixture {
             Arc::new(AgentCatalogue::builtin()),
             runtime.clone(),
             executor.clone(),
-            Arc::new(MockProjectorFactory),
+            projector,
             registry.clone(),
             Arc::new(EventHub::new()),
             Some(task_host.clone()),
@@ -3156,14 +3220,21 @@ async fn an_action_request_waits_answers_and_expires_with_its_run() {
     );
 
     // And a question cannot outlive its run: the expiry rejects the promise with the sentence the
-    // model reads back (`sessions.ts:7377-7382`).
+    // model reads back (`sessions.ts:7377-7382`). The settled ids are what the store announces, one
+    // `action.closed` per settlement (`sessions.ts:2325-2335`, T16).
+    let parked: Vec<String> = fixture
+        .waiting_actions(&id)
+        .iter()
+        .map(|row| row.request.request_id.clone())
+        .collect();
     let expired = {
         let mut inner = store.lock();
         let state = inner.session_mut(&id).expect("the session");
 
         state.expire_actions(store::session::ACTION_RUN_ENDED_MESSAGE, None)
     };
-    assert_eq!(expired, 4);
+    assert_eq!(expired, parked);
+    assert_eq!(expired.len(), 4);
     assert!(fixture.waiting_actions(&id).is_empty());
 
     for task in waiting_tasks {
@@ -3787,4 +3858,480 @@ async fn an_unfocused_submit_opens_its_own_host_conversation() {
     assert_eq!(fixture.resource(&id).await.session.thread_count, 2);
 }
 
-// TESTS
+// ---------------------------------------------------------------------------
+// T7a - the live host view, the session's own endpoint, stop-all, and steering
+// that outlives a failed run
+// ---------------------------------------------------------------------------
+
+/// The LIVE `display.ops` channel and the display snapshot carry the SAME section ids.
+///
+/// The fold has no turn record (`ProjectorFactory::create()` takes none), so it mints `s{ordinal}` and
+/// stamps `turnId: ""` on every op (`projector.rs:418-434`), while the wire identity is
+/// `${turnId}:${ordinal}` (`turn-projector.ts:698`). Before T7a only the REST read re-stamped
+/// (`store/read.rs`'s display merge), so a listener that applied the ops it streamed and then read the
+/// snapshot had two different id spaces for one turn. Both readers now run through
+/// `projector::stamp_display_ops` / `projector::section_wire_id`, which this test pins against the REAL
+/// projector with a scripted run.
+#[tokio::test]
+async fn the_live_display_ops_carry_the_snapshot_section_ids() {
+    let factory: Arc<dyn ProjectorFactory> =
+        typecrate_harness::projector::TurnProjectorFactory::new();
+    let fixture = Fixture::with_fold(
+        "display-identity",
+        vec![Script::Ok(Answer::new("the answer", 3, 2))],
+        factory,
+    );
+    let id = fixture.session(None).await;
+
+    // Every `display.ops` frame the recorder publishes, exactly as a stream listener sees them.
+    let frames: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&frames);
+    let _subscription = fixture.store.hub().subscribe(Arc::new(
+        move |event: &typecrate_harness::events::HubEvent| {
+            if event.kind == "display.ops" {
+                sink.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(json!({
+                        "turn_id": event.turn_id,
+                        "session_id": event.session_id,
+                        "ops": event.ops,
+                    }));
+            }
+        },
+    ));
+
+    let receipt = fixture
+        .task(&id, "say something", None)
+        .await
+        .expect("the submit is accepted");
+
+    fixture
+        .wait_until("the turn to answer", || {
+            (fixture.turn_status(&id, &receipt.turn_id) == SessionTurnStatus::Done).then_some(())
+        })
+        .await;
+
+    // The snapshot the display read builds (`GET /turns/:id/display` reads exactly this fold).
+    let display = {
+        let inner = fixture.store.lock();
+
+        inner
+            .session(&id)
+            .expect("the session")
+            .turn(&receipt.turn_id)
+            .expect("the turn")
+            .display()
+    };
+    let snapshot_ids: Vec<String> = display["sections"]
+        .as_array()
+        .expect("a display document carries sections")
+        .iter()
+        .map(|section| section["id"].as_str().expect("a section id").to_owned())
+        .collect();
+
+    assert!(
+        !snapshot_ids.is_empty(),
+        "a streamed answer mints at least the root flow: {display}"
+    );
+    assert!(
+        snapshot_ids
+            .iter()
+            .all(|section| section.starts_with(&format!("{}:", receipt.turn_id))),
+        "every snapshot id is `{}`-prefixed, got {snapshot_ids:?}",
+        receipt.turn_id
+    );
+
+    let seen = frames
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+
+    assert!(!seen.is_empty(), "a running turn publishes `display.ops`");
+
+    let mut live_ids: Vec<String> = Vec::new();
+
+    for frame in &seen {
+        assert_eq!(frame["session_id"], json!(id));
+        assert_eq!(frame["turn_id"], json!(receipt.turn_id));
+
+        for op in frame["ops"].as_array().expect("ops are an array") {
+            // No live op still carries the seam's empty turn id, at the top level or inside an
+            // embedded section / step payload.
+            assert!(
+                !op.to_string().contains("\"turnId\":\"\""),
+                "a live op must state the turn it belongs to, got {op}"
+            );
+
+            for key in ["sectionId", "parentSectionId"] {
+                if let Some(section) = op.get(key).and_then(Value::as_str) {
+                    // The turn-level `usage` frame addresses the whole turn, not a section
+                    // (`projector.rs:1152`, `sectionId: "turn"`), and that sentinel is not an id the
+                    // snapshot mints - it must survive the stamp unchanged.
+                    if section == "turn" {
+                        continue;
+                    }
+
+                    assert!(
+                        section.starts_with(&format!("{}:", receipt.turn_id)),
+                        "the live `{key}` `{section}` is stamped with the turn id, got {op}"
+                    );
+
+                    if !live_ids.contains(&section.to_owned()) {
+                        live_ids.push(section.to_owned());
+                    }
+                }
+            }
+
+            // A `section:open` carries the whole section payload, whose `id` is the same identity.
+            if let Some(section) = op.pointer("/section/id").and_then(Value::as_str) {
+                assert!(
+                    section.starts_with(&format!("{}:", receipt.turn_id)),
+                    "an opened section announces its wire id, got {op}"
+                );
+
+                if !live_ids.contains(&section.to_owned()) {
+                    live_ids.push(section.to_owned());
+                }
+            }
+        }
+    }
+
+    live_ids.sort();
+    let mut expected = snapshot_ids.clone();
+
+    expected.sort();
+
+    assert_eq!(
+        live_ids, expected,
+        "the ids a listener applied from the stream are the ids the snapshot prints"
+    );
+}
+
+/// `SessionResource.endpoint` is `providerDefaultsOf(record.settings)` (`api-reads.ts:225`): the
+/// SESSION's merged pair plus the presence of the credential THAT session holds. The deployment's own
+/// defaults are `/config`'s document. The three cases below are the whole credential rule as it reads
+/// on this member: same origin inherits the deployment key, a foreign origin never does, and a key the
+/// client supplied is the session's own (and never reaches the document).
+#[tokio::test]
+async fn the_session_endpoint_is_the_sessions_own_provider_view() {
+    let fixture = Fixture::with_scripts("endpoint-view", vec![Script::Ok(Answer::new("x", 1, 1))]);
+    let store = fixture.store.clone();
+
+    // A keyed deployment, pushed the way `PATCH /config` pushes it.
+    store.set_host_view(
+        store.registry(),
+        store.agents(),
+        typecrate_harness::config::ServerConfig {
+            api_key: "deployment-key".to_owned(),
+            ..typecrate_harness::config::ServerConfig::default()
+        },
+    );
+
+    let deployment = typecrate_harness::config::ServerConfig::default();
+
+    // (a) No session settings at all: the merged pair IS the deployment's, and so is its key.
+    let inherited = resource_of(
+        &store
+            .create_session(&CreateSessionRequest {
+                harness: "instruct".to_owned(),
+                title: None,
+                settings: None,
+            })
+            .await
+            .expect("a session on the deployment endpoint"),
+    );
+
+    assert_eq!(
+        inherited.endpoint,
+        contract::ProviderDefaults {
+            base_url: deployment.base_url.clone(),
+            model: deployment.model.clone(),
+            has_api_key: true,
+        },
+        "a session on the configured origin runs with the deployment credential"
+    );
+
+    // (b) The regression: a session pointed at a FOREIGN origin, given no key. The scoped-credential
+    // rule refuses to move the operator's secret, so `has_api_key` is false - and the block states the
+    // session's own base URL and model, not the deployment's.
+    let foreign = resource_of(
+        &store
+            .create_session(&CreateSessionRequest {
+                harness: "instruct".to_owned(),
+                title: None,
+                settings: Some(contract::RunnerSettingsInput {
+                    base_url: Some("http://elsewhere.example/v1".to_owned()),
+                    api_key: None,
+                    model: Some("other/model".to_owned()),
+                }),
+            })
+            .await
+            .expect("a session on its own endpoint"),
+    );
+
+    assert_eq!(
+        foreign.endpoint,
+        contract::ProviderDefaults {
+            base_url: "http://elsewhere.example/v1".to_owned(),
+            model: "other/model".to_owned(),
+            has_api_key: false,
+        },
+        "a keyed deployment never makes a foreign session look authenticated"
+    );
+    assert_eq!(
+        foreign.session.model, "other/model",
+        "and the session reports the model it actually runs"
+    );
+
+    // (c) A key the client supplied for its own origin: present on the resource, absent from the disk.
+    let keyed = resource_of(
+        &store
+            .create_session(&CreateSessionRequest {
+                harness: "instruct".to_owned(),
+                title: None,
+                settings: Some(contract::RunnerSettingsInput {
+                    base_url: Some("http://elsewhere.example/v1".to_owned()),
+                    api_key: Some("session-key".to_owned()),
+                    model: None,
+                }),
+            })
+            .await
+            .expect("a session with its own credential"),
+    );
+
+    assert_eq!(
+        keyed.endpoint,
+        contract::ProviderDefaults {
+            base_url: "http://elsewhere.example/v1".to_owned(),
+            model: deployment.model.clone(),
+            has_api_key: true,
+        },
+        "the session's own key is what the presence flag states"
+    );
+
+    let document = std::fs::read_to_string(fixture.store.config().state_dir().join("state.json"))
+        .expect("the document is written");
+
+    assert!(
+        !document.contains("session-key") && !document.contains("deployment-key"),
+        "neither credential ever enters the durable document"
+    );
+}
+
+/// A cancel-all on a session with no live run and no backlog still reports `cancelled: true` when it
+/// stopped a host conversation: `sessions.ts:7765-7788` counts the threads `stopThread` actually
+/// transitioned (`if (stopped > 0) cancelled = true`), and a second stop of the same conversation is
+/// the no-op TS answers `false` for.
+#[tokio::test]
+async fn cancel_all_reports_a_stop_of_host_threads_on_an_idle_session() {
+    let fixture = Fixture::with_scripts("cancel-all-idle", Vec::new());
+    let id = fixture.session(None).await;
+    let thread = fixture
+        .thread(&id, &json!({"agent": "instruct", "origin": "host"}))
+        .await;
+
+    assert_eq!(fixture.session_status(&id), "idle");
+
+    let stopped = serde_json::from_value::<CancelSessionResult>(
+        fixture
+            .store
+            .cancel_session(&id, true)
+            .await
+            .expect("a cancel-all on an idle session succeeds"),
+    )
+    .expect("a cancel answer is the contract's result");
+
+    assert!(
+        stopped.cancelled,
+        "stopping a live host conversation IS a cancellation"
+    );
+    assert_eq!(stopped.dropped_queued_tasks, 0);
+    assert_eq!(
+        stopped.active_turn_id, None,
+        "no turn was running or recorded"
+    );
+    assert_eq!(
+        fixture.thread_status(&id, &thread),
+        "stopped",
+        "and the conversation is marked stopped, exactly as `stopThread` leaves it"
+    );
+
+    // Every host thread is stopped, so the next stop-all has nothing left to do.
+    let again = serde_json::from_value::<CancelSessionResult>(
+        fixture
+            .store
+            .cancel_session(&id, true)
+            .await
+            .expect("the second cancel-all succeeds"),
+    )
+    .expect("a cancel answer is the contract's result");
+
+    assert!(
+        !again.cancelled,
+        "an already-stopped conversation is the no-op `cancelled: false` (`api.ts:2341`)"
+    );
+}
+
+/// `api-reads.ts:226` states `runtime_execution` as `context.runtime.threadExecution`, i.e. the
+/// DEPLOYMENT's live configuration - not a constant. The store's host view is what carries it, so a
+/// `HARNESS_THREAD_EXECUTION=worker` deployment (or a host that changes its mind) is visible on the
+/// next session read.
+#[tokio::test]
+async fn the_session_resource_reports_the_live_thread_execution() {
+    let fixture = Fixture::with_scripts("thread-execution", Vec::new());
+    let store = fixture.store.clone();
+    let id = fixture.session(None).await;
+
+    assert_eq!(
+        fixture.resource(&id).await.runtime_execution,
+        "inline",
+        "a store built from the trio alone states the built-in default"
+    );
+
+    store.set_host_view(
+        store.registry(),
+        store.agents(),
+        typecrate_harness::config::ServerConfig {
+            thread_execution: "worker".to_owned(),
+            io_execution: "worker".to_owned(),
+            ..typecrate_harness::config::ServerConfig::default()
+        },
+    );
+
+    let resource = fixture.resource(&id).await;
+
+    assert_eq!(
+        resource.runtime_execution, "worker",
+        "the session resource follows the LIVE runtime configuration"
+    );
+
+    // A session created AFTER the change resolves the same way.
+    let created = resource_of(
+        &store
+            .create_session(&CreateSessionRequest {
+                harness: "instruct".to_owned(),
+                title: None,
+                settings: None,
+            })
+            .await
+            .expect("a session after the runtime view moved"),
+    );
+
+    assert_eq!(created.runtime_execution, "worker");
+}
+
+/// R5 preservation (`harness.ts:6826-6837`): steering a run drained and then FAILED is rolled back
+/// with the transcript, so the store hands it back to the conversation instead of losing the user's
+/// guidance. The hand-back is skipped for a stop - the conversation was stopped on purpose.
+#[tokio::test]
+async fn a_failed_run_hands_its_drained_steering_back_to_the_conversation() {
+    let fixture = Fixture::with_scripts(
+        "steer-requeue",
+        vec![
+            Script::SteerFail {
+                error: "the provider refused".to_owned(),
+            },
+            Script::Steer {
+                answer: Answer::new("second", 1, 1),
+            },
+        ],
+    );
+    let id = fixture.session(None).await;
+
+    let first = fixture.task(&id, "start", None).await.expect("accepted");
+    let thread = first.thread_id.clone();
+
+    // The run owns its steer channel once the turn is `running` (`turns.rs:834-846`), which is the
+    // gate `submit_queued` uses to decide steer-or-queue (`sessions.ts:6359-6504`).
+    fixture
+        .wait_until("the first turn to be running", || {
+            (fixture.turn_status(&id, &first.turn_id) == SessionTurnStatus::Running).then_some(())
+        })
+        .await;
+
+    let steered = fixture
+        .task(&id, "guide me", Some(&thread))
+        .await
+        .expect("a text submit on a live conversation steers");
+
+    assert_eq!(
+        steered.steered,
+        Some(true),
+        "the guidance joined the live run, it did not open a turn"
+    );
+
+    fixture
+        .wait_until("the drained run to fail", || {
+            (fixture.turn_status(&id, &first.turn_id) == SessionTurnStatus::Error).then_some(())
+        })
+        .await;
+
+    // The guidance is back where the next run of THIS conversation will find it.
+    let mailbox = {
+        let inner = fixture.store.lock();
+        let state = inner.session(&id).expect("the session");
+
+        (
+            state
+                .steer_mailbox
+                .get(&thread)
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|record| record.prompt.clone())
+                .collect::<Vec<_>>(),
+            state.steer_active,
+        )
+    };
+
+    assert_eq!(
+        mailbox.0,
+        vec!["guide me".to_owned()],
+        "the drained guidance is re-queued on the conversation, in order"
+    );
+    assert_eq!(
+        mailbox.1, 1,
+        "and it counts as accepted-but-undelivered again"
+    );
+
+    // The NEXT run on that conversation receives it before its first model boundary, so nothing the
+    // user paid for is lost, and the mailbox is drained as it is delivered.
+    let second = fixture
+        .task(&id, "try again", Some(&thread))
+        .await
+        .expect("the retry is accepted");
+
+    fixture
+        .wait_until("the retry to answer", || {
+            (fixture.turn_status(&id, &second.turn_id) == SessionTurnStatus::Done).then_some(())
+        })
+        .await;
+
+    let transcript = fixture.transcript(&id, &thread);
+    let last = transcript.last().expect("the retry wrote a transcript");
+
+    assert_eq!(
+        match last {
+            HarnessMessage::Assistant { content, .. } => content.clone(),
+            other => panic!("the last entry is the answer, got {other:?}"),
+        },
+        "second>guide me",
+        "the answer carries the steer the failed run had drained"
+    );
+
+    let cleared = {
+        let inner = fixture.store.lock();
+        let state = inner.session(&id).expect("the session");
+
+        (
+            state.steer_mailbox.contains_key(&thread),
+            state.steer_active,
+        )
+    };
+
+    assert_eq!(
+        cleared,
+        (false, 0),
+        "delivery consumes the mailbox and the accepted counter"
+    );
+}

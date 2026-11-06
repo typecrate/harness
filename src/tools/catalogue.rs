@@ -5,7 +5,9 @@
 //! tag list, visibility and argument JSON Schema below is copied byte-for-byte out of
 //! `packages/underload/harness/src/core/tool-manifest.ts` (the scan of `src/tools/**/*.tool.ts`)
 //! plus the `metadata` literals of `packages/underload/harness/src/server/tools/shared/*.tool.ts`.
-//! Regenerate instead of editing.
+//! Regenerate instead of editing. The table keeps EVERY discovered row, including the four the
+//! manifest marks `listed: false`, because [`find`] is also the session toolbox lookup and the
+//! execution dispatch; only the server LISTING applies the flag (see [`is_listed`]).
 //!
 //! ORDER is the order `GET /tools` emits rows (`api.test.ts:133-165` `TOOL_NAMES`): the
 //! harness-owned core rows first (`harnesses/core.ts:76-89`), then the package presets and the
@@ -13,10 +15,14 @@
 //! (`harnesses/index.ts:195-218`). Rows are never sorted by name.
 //!
 //! DEVIATIONS from the TypeScript table, stated rather than hidden:
-//!   * TS lists only the 14 runtime descriptors whose descriptor `listed !== false`;
-//!     `toolCancel`, `threadSend`, `threadRead` and `threadList` are `listed: false` there and
-//!     are therefore ABSENT from the TS `/tools` page. This port lists them (the stage contract
-//!     wants every runtime capability visible), still in manifest `order`.
+//!   * TS's server list is `createCoreToolEntries()` - the RUNTIME rows with `listed !== false`
+//!     (`tools/descriptors.ts:290-328`) - plus `createToolCatalogue()` (the preset/app rows, which
+//!     the manifest marks `listed: false` as a GROUP rule, so that flag is not applied to them -
+//!     `tools/descriptors.ts:92-98, 280-281`) plus the two environment rows. The net effect is that
+//!     exactly four runtime rows are absent from `GET /tools`: `toolCancel`, `threadSend`,
+//!     `threadRead`, `threadList` (`tool-manifest.ts:1002, 1046, 1692, 1811`). [`is_listed`] spells
+//!     that set out, and `ToolRuntime::summaries`/`detail` apply it; `search`/`fetch` stay listed
+//!     because the server appends them through their own factories (`harnesses/{websearch,webfetch}.ts`).
 //!   * TS's `search`/`fetch` rows are not session-bound (`api.test.ts:1148-1152`, "without
 //!     being falsely session-bound"); they are session-bound in the descriptor table. The
 //!     catalogued rows follow the SERVER (not bound); execution still happens inside a session
@@ -499,7 +505,35 @@ pub const ENTRIES: [Entry; 35] = [
     },
 ];
 
+/// The runtime rows the manifest marks `listed: false` (`tool-manifest.ts:1002, 1046, 1692, 1811`),
+/// i.e. the four names the TS server does NOT advertise in its global catalogue: they exist only
+/// inside a live session's harness, and `tools/descriptors.ts:290-328` filters them out of
+/// `RUNTIME_DESCRIPTORS`, which is what `createCoreToolEntries()` maps.
+///
+/// Stated as a name set rather than a per-row field so `ENTRIES` stays a byte-for-byte projection of
+/// the manifest (its header rule) and the LISTING rule stays one readable decision in one place.
+const UNLISTED: [&str; 4] = ["toolCancel", "threadSend", "threadRead", "threadList"];
+
+/// Whether one row belongs in the server's tool listing (`GET /tools`, the identified `/tools/{name}`
+/// read and `ToolRuntime::summaries`), i.e. `descriptor.listed !== false` for the runtime group
+/// (`tools/descriptors.ts:326-328`) with every preset/app/environment row kept
+/// (`tools/descriptors.ts:280-288`).
+#[must_use]
+pub fn is_listed(name: &str) -> bool {
+    !UNLISTED.contains(&name)
+}
+
+/// Every row the server lists, in catalogue order - the TS composition
+/// `[...coreEntries, ...catalogue.entries]` (`api.ts:750`).
+pub fn listed_entries() -> impl Iterator<Item = &'static Entry> {
+    ENTRIES.iter().filter(|entry| is_listed(entry.name))
+}
+
 /// Looks one row up by wire name (case-sensitive: the registry is keyed by name).
+///
+/// Unfiltered on purpose: the session toolbox and the execution dispatch resolve a name the global
+/// listing withholds (a `threadRead` call still reaches its honest "not supported here" answer), so
+/// only the LISTING applies [`is_listed`].
 #[must_use]
 pub fn find(name: &str) -> Option<&'static Entry> {
     ENTRIES.iter().find(|entry| entry.name == name)

@@ -13,22 +13,21 @@
 
 use serde_json::{Value, json};
 
+use axum::http::StatusCode;
+
 use crate::api::{self, ApiResult, Ctx, missing};
 use crate::contract::{
     self, CreateHarnessRequest, HarnessDefinitionResponse, HarnessInstructionIndexResponse,
     HarnessInstructionTextResponse, InstructionSource,
 };
 use crate::error::ApiError;
+use crate::events;
 use crate::events::ResourceRef;
 use crate::read;
 use crate::registry::{self, HarnessDescriptor};
 
-/// The five body fields `POST /harnesses` accepts (`api.ts:1515-1524`).
-///
-/// `agent_colors` is NOT in this set: the Rust contract has no color map
-/// (`contract::CreateHarnessRequest`, T1), so a body that sends one is refused rather than silently
-/// dropped. See `knowledge.md` "T5a".
-const CREATE_FIELDS: [&str; 7] = [
+/// The eight body fields `POST /harnesses` accepts (`api.ts:1515-1524`).
+const CREATE_FIELDS: [&str; 8] = [
     "name",
     "title",
     "description",
@@ -36,17 +35,21 @@ const CREATE_FIELDS: [&str; 7] = [
     "subagents",
     "agent_models",
     "agent_instructions",
+    // `api.ts:1523`: display colors ride the same edge as the other two maps; membership and the
+    // hex shape are the registry's decision (`registry.ts:604-629`).
+    "agent_colors",
 ];
 
 /// The seven body fields `PATCH /harnesses/{name}` accepts (`api.ts:1572-1580`), the same set as
 /// the create minus the immutable `name`.
-const UPDATE_FIELDS: [&str; 6] = [
+const UPDATE_FIELDS: [&str; 7] = [
     "title",
     "description",
     "primary",
     "subagents",
     "agent_models",
     "agent_instructions",
+    "agent_colors",
 ];
 
 /// `GET {root}/harnesses` (`api.ts:1488-1510`): the whole catalogue, paged, with an optional
@@ -88,7 +91,18 @@ pub async fn get_harnesses(ctx: &mut Ctx) -> ApiResult {
     let total = cards.len();
     let slice = crate::paging::slice_page(cards, cursor, limit, Some(total));
 
-    Ok(api::page_response(ctx, revision, slice))
+    // `api.ts:1503-1509` calls `json(200, pageMeta(...))` with only TWO arguments: the collection
+    // revision rides the page BODY (`pageMeta`'s `revision` field) and never the `X-Harness-Revision`
+    // header. Every other page route passes the third argument (`api.ts:1842` for `/tools`,
+    // `:1696-1704` for `/agents`), so this one is the exception and not the rule.
+    let body = crate::paging::page_slice_body(
+        ctx.runtime.hub.epoch(),
+        slice,
+        revision,
+        events::now_millis(),
+    );
+
+    Ok(api::json(StatusCode::OK.as_u16(), body))
 }
 
 /// `POST {root}/harnesses` (`api.ts:1512-1559`): create one definition, durably, before the 201.

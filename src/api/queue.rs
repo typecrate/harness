@@ -14,7 +14,7 @@ use super::sessions::{page_revision, require_session, session_of};
 
 /// `GET {root}/sessions/{session_id}/queue` (`api.ts:2180-2194`).
 pub async fn get_session_queue(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
 

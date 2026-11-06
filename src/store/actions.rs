@@ -20,7 +20,6 @@ use serde_json::{Map, Value, json};
 use crate::contract::{
     ActionAnswerSource, ActionChoiceInput, AnswerActionResult, HarnessActionAnswer,
     HarnessActionChoice, HarnessActionRequest, HarnessEvent, PendingAction,
-    PendingActionListResponse,
 };
 use crate::error::{ApiError, HarnessResult};
 use crate::ports::{ActionHost, Query};
@@ -645,30 +644,46 @@ impl ActionHost for StoreActionHost {
                     extra: Map::new(),
                 });
 
-                // The payload is the LIVE list as it stands after the push (`action.opened` carries
-                // `actions: PendingAction[]`, `sessions.ts:2660-2672`). `state` is re-borrowed immutably
-                // because `pending_action_row_of` reads the session to resolve a question's owning turn,
-                // and the row list borrows that same session.
+                // The payload is the ONE question that just opened (`WsUpdateActionOpened`,
+                // `harness-stream.ts:586-598`: `action.opened` carries `action`, one ready-to-answer
+                // row, and NO other payload field), projected the way the actions read projects it
+                // (`api-reads.ts:1323 pendingActionRowOf`). `api.ts:1105-1125` is the bridge this
+                // mirrors: it looks the request up by id and publishes that single row. `state` is
+                // re-borrowed immutably because the row resolves its owning turn through the session.
                 let view: &SessionState = state;
-                let rows: Vec<PendingAction> = view
-                    .live_actions()
-                    .into_iter()
-                    .map(|entry| read::pending_action_row_of(view, entry))
-                    .collect();
+                let action = view
+                    .pending_actions
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.request.request_id == parsed.request_id)
+                    .map(|entry| read::pending_action_row_of(view, entry));
 
-                // The session bump comes before the publish (`api-events.ts:302-306`), so a subscriber
-                // that re-reads the list after this frame sees a revision at least this new.
-                let revision = hub.bump("session", Some(&session_id));
-                let payload = serde_json::to_value(PendingActionListResponse {
-                    session_id: session_id.clone(),
-                    actions: rows,
-                    revision,
-                })
-                .unwrap_or(Value::Null);
+                // The `actions` counter is the one this frame reports (`api.ts:1109`
+                // `events.bumpRevision('actions', record.id)`), so a listener that re-reads
+                // `GET /sessions/:id/actions` after this frame compares equal figures. The `session`
+                // counter is NOT the addressed resource here.
+                let _revision = hub.bump("actions", Some(&session_id));
+
+                let (kind, payload) = match action {
+                    Some(row) => ("action.opened", serde_json::json!({ "action": row })),
+                    // The question vanished between the push and the read (a session removed while
+                    // its run parked); `api.ts:1111-1114` answers that case with an `action.closed`
+                    // and reason `ended`, never with an empty `action.opened`.
+                    None => (
+                        "action.closed",
+                        serde_json::json!({
+                            "action_closed": {
+                                "request_id": parsed.request_id,
+                                "reason": "ended",
+                            }
+                        }),
+                    ),
+                };
+
                 let _ = hub.publish(
-                    "action.opened",
+                    kind,
                     &[crate::events::ResourceRef::new(
-                        "session",
+                        "actions",
                         Some(&session_id),
                     )],
                     Some(&session_id),
@@ -706,7 +721,8 @@ pub fn parse_action_request(request: &Value) -> Result<HarnessActionRequest, Str
     if question.is_empty() {
         return Err("An action request needs a question.".to_owned());
     }
-    if question.chars().count() > ACTION_QUESTION_MAX_CHARS {
+    // The bound is `.length`, i.e. UTF-16 code units (`core/action.ts`).
+    if question.encode_utf16().count() > ACTION_QUESTION_MAX_CHARS {
         return Err(format!(
             "An action question cannot exceed {ACTION_QUESTION_MAX_CHARS} characters."
         ));
@@ -766,6 +782,54 @@ pub fn parse_action_request(request: &Value) -> Result<HarnessActionRequest, Str
     })
 }
 
+/// `actionClosedReason` (`sessions.ts:361-370`): the contract's closed `action.closed` reason set
+/// (`WsActionClosed.reason`, `shared/harness-stream.ts`), derived from the REJECTION TEXT the runtime
+/// already sees rather than from a guess. The store's sentences are stable constants, so the
+/// classification is a phrase test on them: cancellation wording is `cancelled`, a run that finished
+/// without an answer is `ended`, and everything else (a removed session, a stale promise) is
+/// `expired`.
+#[must_use]
+pub fn action_closed_reason(message: &str) -> &'static str {
+    let text = message.to_lowercase();
+
+    if text.contains("cancel") {
+        "cancelled"
+    } else if text.contains("ended") {
+        "ended"
+    } else {
+        "expired"
+    }
+}
+
+impl Store {
+    /// Publishes one `action.closed` per settled question (`api.ts:1126-1138`), advancing `actions`
+    /// once per settlement BEFORE the frame that reports it.
+    ///
+    /// T16's rule is that every settlement announces itself, from the ONE point that settles
+    /// (`sessions.ts:2325-2335`), so an owner answer, a stop, a run that ended, a session delete and
+    /// a reset all clear the client's question card. The caller hands over the ids
+    /// [`SessionState::expire_actions`] returned; nothing here re-decides which questions settled.
+    pub fn publish_actions_closed(&self, session_id: &str, request_ids: &[String], reason: &str) {
+        for request_id in request_ids {
+            let _ = self.hub.bump("actions", Some(session_id));
+
+            self.publish(
+                "action.closed",
+                &[("actions", Some(session_id))],
+                session_id,
+                None,
+                None,
+                json!({
+                    "action_closed": {
+                        "request_id": request_id,
+                        "reason": reason,
+                    }
+                }),
+            );
+        }
+    }
+}
+
 impl SessionState {
     /// The questions still waiting for their owner.
     #[must_use]
@@ -782,8 +846,12 @@ impl SessionState {
     ///
     /// The rejection text is what the model reads back from the tool call, so the caller states it:
     /// "the session was reset", "the run was cancelled", "the session was deleted".
-    pub fn expire_actions(&mut self, message: &str, thread_id: Option<&str>) -> usize {
-        let mut expired = 0usize;
+    ///
+    /// Returns the request ids that settled, IN ORDER — the caller owes one `action.closed` frame per
+    /// settlement (`sessions.ts:2325-2335`, T16), and the readable rejection text stays with the
+    /// runtime while the CONTRACT reason comes from `action_closed_reason`.
+    pub fn expire_actions(&mut self, message: &str, thread_id: Option<&str>) -> Vec<String> {
+        let mut expired: Vec<String> = Vec::new();
         for entry in &mut self.pending_actions {
             if !entry.is_live() {
                 continue;
@@ -805,7 +873,7 @@ impl SessionState {
                 let _ = sender.send(Err(message.to_owned()));
             }
             entry.resolved_at = Some(now_ms());
-            expired += 1;
+            expired.push(entry.request.request_id.clone());
         }
         // The guidance the run was going to consume goes with it: an expired run never drains the
         // mailbox it was pointed at (`sessions.ts:6461-6495`).
@@ -1056,12 +1124,23 @@ impl Store {
         state.answered_actions += 1;
         let sender = entry.responder.take();
 
+        // T16: the settlement frame is the contract's `action.closed` with reason `answered`
+        // (`sessions.ts:2325-2335` + `api.ts:1126-1138`), addressed at the `actions` resource the
+        // same write just moved. `action.answered` is not one of the eighteen update kinds
+        // (`harness-stream.ts:62`), so a frame named that reaches no subscriber.
         outcome = outcome.event(
-            "action.answered",
-            &[("session", Some(session_id))],
+            "action.closed",
+            &[("actions", Some(session_id))],
             thread_id.as_deref(),
             Some(&turn_id),
-            json!({ "session_id": session_id, "request_id": request_id, "resolved_at": at }),
+            json!({
+                "action_closed": {
+                    "request_id": request_id,
+                    // An owner answer is `answered` by definition; the message-keyed classifier below
+                    // is for the settlements that REJECTED the promise.
+                    "reason": "answered",
+                }
+            }),
         );
 
         state.prune_actions();

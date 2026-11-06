@@ -25,11 +25,37 @@ stage can re-check it instead of re-deriving it.
 5. **T5a (done)** - the HTTP surface: the per-root runtime (`runtime.rs`), the `/v1/harness`
    dispatcher and route table (`api/mod.rs`), the host handlers (`api/{root,config,harnesses,
    agents,tools,models}.rs`), the router + graceful serve + shutdown flush (`server.rs`), the
-   standalone executable (`bin/server.rs`). The session-domain routes are reachable stubs; their
-   bodies land with T5b. See "T5a" below.
-6. Still to port - the WebSocket stream (`stream/**`, T5c), the session-domain route bodies
-   (`api.ts:1958-2820`, T5b), and the `*-route.rs` discovery wiring, plus the runtime-compiler
-   tools the catalogue lists but this build cannot execute (see "T4").
+   standalone executable (`bin/server.rs`). The session-domain routes shipped as reachable stubs;
+   their bodies landed with T5b. See "T5a" below.
+6. **T5b (done)** - the session-domain route bodies (`api.ts:1958-3898`): the nine
+   `api/{sessions,actions,queue,usage,threads,transcript,turns,session_agents,session_tools}.rs`
+   handlers, the projector / turn-record merge at the read boundary (`store/read.rs`), and
+   `tests/http_sessions.rs`. See "T5b" below for the contract-shape deltas a reader must know.
+7. **T5c (done)** - the update stream (`stream/**`): the wire vocabulary and the client-frame
+   validator (`stream/protocol.rs`), the subscription/sequence/replay broker (`stream/broker.rs`),
+   the per-connection conversation (`stream/connection.rs`), the handshake gates (`stream/mod.rs`),
+   the `Arc<StreamBroker>` the runtime owns (`runtime.rs`), `api::handle_stream` delegating to it,
+   and `tests/stream.rs`. See "T5c" below for the deviations the port had to make.
+8. **T6 (done)** - the `typecrate-services` gateway bridge: `endpoint/harness/harness-route.rs`, the
+   generated `service_routes!` table, the `ANY` arm it forced into the services macro, and the gateway
+   tests in `packages/typecrate/services/tests/`. See "T6" below for the two facts that bridge rests on.
+9. **T7a (done)** - the audit remediation of T2-T6 against the TypeScript spec: the LIVE host view
+   inside the store, the session's own provider endpoint, the `actions` stream scope, snapshot section
+   ids on live display ops, the durable lane backlog, the `action.opened` / `action.closed` frames, the
+   host shutdown step, sampling on the provider request, and steering that survives a failed run. See
+   "T7a" below - it changes facts stated in T3, T5c and T6.
+10. **T7b (done)** - the second audit remediation: `agentColors`, the list-route revision, the
+    replace-on-duplicate tool create, the 31-row LISTED tool surface, the context bar's tool and
+    assistant segments, body-less verbs, ECMAScript paging coercion, the usage fold, UTF-16 measures,
+    the gateway's harness shutdown hook, and the playground fixture. See "T7b" below.
+11. **T9 (done)** - the final honesty pass: the runtime-SUPPORT gate that refuses a `worker` deployment
+    instead of silently running it inline (`runtime::validate_supported_execution`, the standalone
+    startup abort, the gateway's 400), the route-table pin (`tests/routes.rs`), and the documentation
+    corrections the independent verification asked for. See "T9" below.
+12. Still to port - the module host that turns a session-created tool's installed source into a callable
+    registration, and the runtime-compiler tools the catalogue lists but this build cannot execute (see
+    "T4"). A worker backend for the two `*_EXECUTION=worker` knobs is the other unported half: today the
+    knobs validate and REPORT, and the runtime refuses to start on them (see "T9").
 
 ## Decisions
 
@@ -156,6 +182,13 @@ type, so a later stage cannot send a misspelled field on those paths.
   `parseIoExecutionMode` REUSES `parseThreadExecutionMode` (`config.ts:249-250`), so TS has no
   `off` spelling and the refusal message names both accepted words. Default is `inline`
   (`config.ts:119`).
+- **ACCEPTANCE is the parser's, SUPPORT is the runtime's (T9).** This loader accepts `worker` for both
+  knobs, exactly like TS, because it is also the channel `GET /config` reports through and the config
+  tests feed it explicit maps. What this BUILD provides is `inline` only, so
+  `runtime::validate_supported_execution` refuses a `worker` deployment at runtime-construction time
+  (400, naming the variable) and the standalone executable aborts before binding. Do not move the
+  check into `load_server_config`: that would make a worker deployment unreportable and would change
+  every config-loader test.
 - `ServerConfig.max_retries` / `retry_delay_ms` / `request_timeout_ms` are Rust-side additions (the
   TS retry policy is an agent constructor option, not an environment). Defaults come from
   `core/agent.ts:175-176` (10 retries, 1000 ms base); `request_timeout_ms` defaults to **0 = no
@@ -553,9 +586,12 @@ expires that conversation's unanswered action requests, and checkpoints before i
 * `reset_session` refuses with its own sentence while a run or a backlog exists; the shared busy
   sentence is used by exactly two verbs (`agents.rs:174`, `threads.rs:376`), and a declarative PATCH
   lands during a run. `delete_thread` states the specific "still has live work" refusal first.
-* `initialize` does not start a lane pump. The durable queue is the LEGACY array
-  (`mod.rs:1502`), so a per-lane backlog comes back as unclaimed `queued` rows and drains only when
-  the next submit starts that lane (`tests/store_restore.rs`).
+* `initialize` does not start a lane pump: the restored backlog waits for the next submit or the next
+  free slot in that lane to claim it (`sessions.ts:6461-6495` starts a pump on submit, not on open).
+  It IS durable, though - `record.queue` is the union of the legacy array and every lane's queue, in
+  turn-index order, and `restore_session` re-homes each row into its own lane exactly as TS's F1
+  distribution does (`mod.rs:1660-1682`, and the split in `restore_session`). T3 shipped this as the
+  LEGACY array only, which made a per-lane backlog memory-only; T7a closed that simplification.
 
 ### Tests
 
@@ -794,7 +830,10 @@ The route table is `pub static ROUTES: [Route; 45]` - one id, the verbatim TS te
 operations in TS declaration order - paired with an `Operation` enum and ONE match in
 `dispatch_operation`. It maps to operations rather than fn pointers because an async fn's future
 cannot live in a `static`; the table stays data and the dispatcher stays the only place a handler
-is named.
+is named. `tests/routes.rs` is the pin: the 45 `(id, template)` pairs in table order copied from
+`shared/harness-api.ts:54-100`, the 64 operations, the verb split (GET 37, POST 13, PATCH 7,
+DELETE 6, PUT 1), one reachable mount per operation, and the parameter-grammar/mount-prefix rules
+`mount_segments` + `match_route` rely on.
 
 ### Deliberate deviations (stated, not hidden)
 
@@ -820,7 +859,9 @@ is named.
    FOLLOW-UP for the owners of the other two producers: `registry/mod.rs:776-778`
    (`instruction_summary_of`) and `store/agents.rs:123` still use `chars().count()`. The two
    spellings differ only for astral text, and the difference is invisible in every shipped
-   instruction, but one shared helper is the right end state.
+   instruction, but one shared helper is the right end state. CLOSED by T5b: both sites now call
+   `projector::display_chars`, and the astral case is pinned through the instruction ladder in
+   `tests/http_sessions.rs`.
 5. **The provider display URL is `URL.origin + URL.pathname`** (`transport/models.ts:97`), including
    WHATWG's literal `"null"` origin for `file:` - so a `file:///tmp/provider` base URL answers
    `"null/tmp/provider" must use http or https to list models.`, and the request-failure sentence
@@ -914,3 +955,716 @@ failure class verbatim, and the body policy), the body policy itself (the 64 KiB
 submit boundary in both directions, the 415, the malformed-JSON 400, and the two laziness proofs),
 the origin gate's whole policy table, and strict paging (`limit` refusals, the four cursor
 refusals, and the exact `limit` echo of a short page).
+
+## T5b - the session domain (`api/{sessions,actions,queue,usage,threads,transcript,turns,session_agents,session_tools}`)
+
+### What landed
+
+* The nine session files, all 64 declared operations, no stub body left: session CRUD + the
+  definition / usage / commands / queue / tasks / reset / cancel rail, the owner-question pair, the
+  conversation roster with its transcript trio, the turn surface (page, identified read, display tree,
+  event page, step, block, attachment), the session agent roster with the instruction subresource, and
+  the session toolbox (page, create, detail, source, patch, delete, manual call).
+* `api/sessions.rs` also carries the helpers every sibling uses, because the same three problems recur
+  on every session route: `session_of` / `require_session` / `require_thread` / `require_turn` (the
+  contract's ownership sentences - the store's own 404s name only the id, so the route wraps them with
+  `api::missing_in` to print `Unknown thread "t" in session "s".`), `thread_key` (the hub addresses a
+  conversation as `session:thread`), `number_of` / `page_revision` (read the figure the BODY reports
+  and stamp the header with it, which is the only race-free way to satisfy "one counter per
+  comparison"), `stamped` / `plain` (a response with a revision header and one without), and
+  `empty_patch` (TS's `bodyObject` plus the "must change at least one field" arm).
+* `store/read.rs` - the projector / record merge, at the narrowest point that touches neither the
+  projector nor the turn record: `TurnState::row()` and `TurnState::display()` now stamp the record's
+  identity and bounded text onto the fold (`id`, `index`, `threadId`, `threadLabel`, `startedAt`,
+  `promptPreview` + `promptChars`, `attachments`, `references`, `steers`), stamp `turnId` on every
+  display node, and rename the projector's per-turn section ordinals (`s0`) to the wire ids the
+  contract prints (`{turnId}:0`), rewriting `parentSectionId` and each step's `sectionId` to match.
+  `promptChars` / `content_chars` count UTF-16 units through `projector::display_chars`, and the two
+  `chars()` sites T5a listed as follow-ups (`registry/mod.rs:776`, `store/agents.rs:123`) now use the
+  same helper, so the "one shared helper" end state T5a asked for exists.
+* `api/mod.rs` - three seam edits, each reported: (1) the body is drained AFTER the handler answers, so
+  a handler that refuses early cannot leave a 16 MiB upload half-read; (2) the declared-length 413 moved
+  BEFORE the handler using `body_limit_for` plus a new `declared_length`, which is what makes
+  `POST {root}/sessions/{id}/tasks` reject an over-budget submit against an UNKNOWN session - the order
+  `service.ts:502-506` proves (`api.ts:503-509`'s cap check runs before the route's id lookup); (3)
+  `assert_dispatch_future_is_send` documents the `Ctx` rule below as a compile-time probe.
+
+### The wire contract, not the TypeScript response object
+
+`src/contract.rs` (generated from `shared/harness-api.ts`) is what this port serialises, and it is
+NARROWER than what `src/server/api.ts` builds in the TypeScript rail. The five differences a session
+stage must not re-derive:
+
+1. **The mounted surface is 45 templates / 64 operations.** `api.ts` also answers a bare
+   `{root}/session`, a `{root}/sessions/{id}/toolbox`, and the instruction ladder reads
+   (`/agents/{a}/instructions`, `/agents/{a}/prompt`); `POST {root}/sessions/{id}/actions` and
+   `DELETE /agents/{a}/instruction` are not contract operations either. The generated table wins, and
+   `tests/http_sessions.rs` pins the `Unknown API route: GET ...` / `Use GET, PATCH for ...` sentences
+   so nobody later mistakes them for a handler that was never written.
+2. **`SessionResource` is a `SessionSummary` plus eight members.** No `recentTurns`, no `threads`, no
+   `projection`, no `settings` block. Its `endpoint` member is `ProviderDefaults` - the DEPLOYMENT's
+   key-free defaults - not the session's own `settings`, which is why the create response does not echo
+   the base URL it was given while the run still uses it.
+3. **Two spellings in one API.** A turn PAGE answers camelCase display rows (`threadLabel`,
+   `promptPreview`, `sectionCount`, `stepCount`, `activeAgents`, `latestInput`, `detail`) and the
+   identified turn read answers the snake_case `SessionTurnDetail` (`event_count`, `attachment_count`,
+   `steer_count`). `TaskReceipt`, `QueuedTask` and `SessionAgentBinding` are snake_case;
+   `TurnSummary`, `TurnDisplay*` and the step detail are camelCase. Both are pinned per route.
+4. **Usage is a fold summary** (`{session_id, turn_count, reported_turns, usage?, by_thread, truncated,
+   revision}`) and there is no per-record `records` member on this route. `usage` is ABSENT (not zeroed)
+   for a session nothing was billed for, and `by_thread` is keyed by the conversation that ran.
+5. **Transcript metadata is size and role counts only** - no `turns` array; the messages page reports
+   `total` for the WHOLE transcript regardless of the `role` filter; the document response has no
+   `links` member. `GET /transcript` is metadata, `/transcript/messages` is the page, and
+   `/transcript/document` is the raw text - three reads, three different revisions-figures (T3's list).
+
+### Counters: what actually moves
+
+* A mutation that lists its own bump targets AND builds its hub event from the same list bumps TWICE:
+  `CommitOutcome::with_event` pushes every event target into `bumps` (`store/mod.rs:274-278`) and
+  `Store::commit` then bumps each entry once (`store/mod.rs:1109-1116`). That is why one declared session
+  patch moves `session` by two (1 -> 3 -> 5) and a thread create moves `threads` by two, while a roster
+  write (which does not double-list) moves `session_agents` by exactly one. `api.ts:2079-2082` bumps two
+  DIFFERENT kinds where this store bumps one key twice; what the contract pins - and what both suites
+  assert - is that the header and the body's `revision` member are the same number.
+* `submit_queued` publishes without bumping, so `TaskReceipt.session_revision` is the un-bumped figure
+  and the 202 header equals it.
+* The roster list, the instruction read, the instruction PATCH and the tool source read stamp NO header
+  at all (`plain`), because their bodies already state the figure or the contract declares none.
+
+### Behaviour the store owns and the route reports
+
+* A lane's FIRST submit answers `status: queued` with `queue_position: 1` (`tests/store.rs:1108`); a
+  TEXT submit addressed at a RUNNING conversation STEERS (`steered: true`, the live `turn_id`, no
+  ordinal, no new row); only a submit carrying attachments or references falls through to the lane
+  backlog (`store/turns.rs:143-159`), which is the only way an ordinal above 1 is observable over HTTP.
+* An accepted cancel lands the session `error`: `SessionStatus` is `idle | running | error`
+  (`contract.rs:790`), so "interrupted" has no other spelling. A run parked on an owner question is
+  still steerable, and steering does not un-park it.
+* A slash command is a TERMINAL turn: `202 status: done`, `thread_id: ""` with `links.thread` falling
+  back to `/turns` (`api.ts:2259-2263`), and events `[start, tool_call, tool_result]` under the agent
+  name. A model flow labels its display section `primary`, a command flow labels it with the roster id -
+  the projector's choice, mirrored in the event rows. An unmatched leading slash is a failed `command`
+  call (`isError: true`, `outcome: "failed"`), still a 202 with an `error` turn, not a 4xx.
+* An answered owner question records `[start, usage, tool_call, action_answer, tool_result,
+  attempt_commit, text, usage, done]`. There is no `action_request` event in this build's record even
+  though `HarnessEvent::ActionRequest` exists and the projector handles it (`projector.rs:1256`): the
+  RUNTIME never emits it, so the pending list is the only place the question itself is visible. OWNER
+  gap for the stage that wires `actionRequest` end to end.
+* A tool CREATED by this session has a declaration, an installed source revision, budget slot and check
+  list, but NO callable body: `POST .../tools/{name}/executions` answers `200 ok:false` with the
+  kernel's "not registered" sentence. The module host that turns installed source into a registration is
+  T6. `POST .../tools` honours `replace: true` (api.ts answers a 403 capability refusal that contradicts
+  this kernel's own `replace` field), and a name that fails the created-name grammar is refused BEFORE
+  any "already installed" conflict, so `timeNow` is a 400 and `toolRegistry` is the 409.
+* An instruction override reports `source: "session"`; api.ts's preset answers `'harness'` for the same
+  write. `{"instruction": null}` restores the catalogue text through the `""`-forwarding arm in
+  `api/session_agents.rs` (serde maps JSON null to absence on `Option<Option<String>>`, and the store
+  filters `""` back to "no override"). The bind path requires a trusted catalogue profile whose `name`
+  equals its `profile`; there is no session-invented (R7) member here, and an already-bound name is the
+  store's 409.
+* The transcript write receipt's links are REBUILT by the handler (`api/transcript.rs:142-160`):
+  `store/transcript.rs:397` still emits the pre-R5 pair (`{root}/sessions/{id}/transcript/{thread}`),
+  which this router does not mount and which duplicates `transcript` into `messages`. TS builds the
+  three from the mount it is served under (`api.ts:3705-3715`), and the handler is the layer this stage
+  owns.
+* Step ids are the recorded EVENT INDEX of the step's opening event, not the projector's `s{n}` label; a
+  step whose call has not answered has no `result` member at all (`sessions.ts:3955-3963`). Block ids
+  are the display tree's context-segment ids, and this projector emits no `context:*` ops, so every
+  block read is the honest `Unknown context block "..." in turn "..."` 404 until the context bar lands.
+* `PATCH` bodies refuse an UNKNOWN FIELD before the session lookup (`api.ts:2055-2058`), so a typo
+  against an unknown session is a 400, and an empty `{}` against one is the 404.
+
+### Tests
+
+`tests/http_sessions.rs` - 14 tests over the library router on a real `axum::serve` listener, each with
+its own database root under `Temp/typecrate-harness/http-sessions/<pid>-<test>/` and a local
+OpenAI-compatible provider that speaks SSE (scripted answers, scripted 500s, and a HELD-BACK answer for
+every assertion that needs a live run). Pinned: the lifecycle with the 404/409/field-order refusals and
+the header-equals-body rule on every write; a submitted task and every read that describes it (receipt,
+detail, camelCase page row, display tree with the minted section ids, event page with the ordinal filter
+and the cursor, step pair by recorded index, block 404, document, messages page, usage fold); the queue
+ordinal behind a clipped submit; the steer path; reset both busy and idle plus cancel; the transcript
+write, its optimistic lock, the raw-acceptance path and the three reads; conversation CRUD with the
+descendant cascade and the thread cancel; the roster with the instruction ladder, the UTF-16 `chars`
+discriminator, the unbind/rebind pair and every bind refusal; the toolbox page, budget, create, source,
+patch, delete, the protected/inherited policy refusals and the replace path; the manual call of a real
+tool and of a created one; paging and the route-level refusals (405 wording, 415, the body-less routes,
+the malformed-JSON 400); a slash command end to end; and the owner-question round trip including the
+parked turn's `partial: true`, the result-less step, the answer event and the custom-choice twin.
+
+Two pre-existing assertions moved, both forced by deleting a stub rather than by weakening a check:
+`tests/http_host.rs`'s submit-cap boundary now expects the real `404 Unknown session "session-1".`
+instead of the stub's `500 not implemented` (the 16 MiB refusal below it still answers 413, which is the
+proof that test exists for), and `tests/store.rs:1162`'s display-row block now expects the merged
+`promptPreview` / `promptChars` pair plus the `id` / `index` / `threadId` stamps T5b added, replacing the
+empty-pair expectation T4 recorded while the projector was the only source.
+
+### Facts the stream and runtime stages must not rediscover
+
+* `Ctx` is `Send` but NOT `Sync`: an `async fn` that takes `&Ctx` holds a non-`Sync` reference across an
+  await, which breaks axum's `Handler` bound at the `router()` call site with "future cannot be sent
+  between threads safely". Route handlers take `&mut Ctx`; anything called from inside one with `&Ctx`
+  must be synchronous (e.g. `assert_idle_for_tool_mutation`).
+* A handler that refuses BEFORE reading the body still has to let the dispatcher drain it
+  (`api/mod.rs`, the post-dispatch drain), or a large upload turns the refusal into a reset. This is how
+  `POST /sessions/{id}/turns` with a body answers 400 and how an over-budget submit to an unknown
+  session answers 413.
+* The display tree a listener reads and the `display.ops` a stream publishes are the SAME fold
+  (`turn_display`), so the ids the section-rename mints here are the ids the stream must reuse.
+* The usage route's `by_thread` shares the turn page's conversation labels; the queue page's `position`
+  is the 0-based slot while the receipt's ordinal is 1-based (`read.rs:1160-1162`) - both figures appear
+  in one test on purpose.
+
+## T5c - the update stream (`stream/{mod,protocol,broker,connection}`)
+
+### What landed
+
+* `stream/protocol.rs` - `protocol.ts`: the twelve close codes, the per-scope `publishes` /
+  `ids_required` / `ids_forbidden` / `optional_filters` / baseline tables, `kind_resources`,
+  `stream_resource_id_for`, `default_stream_link`, the `base64url(epoch:sequence)` codec (split on the
+  LAST colon), `chunk_stream_payload`, `resolve_stream_limits` with the six tunable bounds, the frame
+  builders for all seven server frames, and `parse_client_frame` with TS's exact precedence and
+  sentences. The 18 limit numbers come from `contract::ws_stream_limits()` - the module restates none.
+* `stream/broker.rs` - `broker.ts`: subscriptions, per-subscription monotonic sequences and cursors,
+  the 512-frame / 60 s retained window, the parked windows a reconnect resumes from, the three
+  `resync_required` reasons, the subscribe validation ladder, `matches`/`narrow`, the
+  `display.ops`(32) / `run.event`(16) / ids(64) chunking, `pace:"ack"` stop-and-wait with its 5 s
+  deadline, and `close_all`.
+* `stream/connection.rs` - `connection.ts`: `welcome` first, the read loop, `hello` (first-only, no
+  reply), subscribe -> `subscription_state` + replay, ping/pong, `bye` -> 1000, the 15 s heartbeat with
+  the 3-interval 4408 timeout, the 32/s budget -> `rate_limited` + 4429, three consecutive union
+  failures -> 1007, the drop-oldest-droppable send queue -> one `frames_dropped` per subscription, the
+  10 s stalled-write 1013, and `broker.detach` on the way out (a run is never cancelled).
+* `stream/mod.rs` - the handshake gates + `is_websocket_upgrade` + `pathname_of`, in `transport.ts`'s
+  order, and the upgrade itself (`protocols(["harness.v1"])`, `X-Harness-Epoch` on the 101).
+* `runtime.rs` - `HarnessRuntime::stream_broker`, built with `store.clone()` as
+  `ports::StreamExists` and `StreamBroker::with_hub_listener`, so every `hub.publish` fans out to the
+  live streams without `api/**` importing the stream module at all.
+* `api::handle_stream` - one delegation to `stream::upgrade`. `api::root::stream_route` stays as the
+  capability refusal for a request that arrives through the JSON dispatcher instead of the mount.
+* `tests/stream.rs` - 19 real-socket tests; `tokio-tungstenite = "0.29"` added as a dev-dependency (the
+  version axum's `ws` feature already resolves, so the lock gains one dev edge and no new crate).
+
+### The counters are the hub's, not the broker's
+
+TS's broker owns a counter `Map` and moves it inside `publish`. This crate cannot: a stream revision
+must equal the `X-Harness-Revision` a REST read carries, and `events.rs` is explicit that `publish` is
+REPORT-ONLY because the PUBLISHER owns the bump (`api-events.ts:302-306`, `knowledge.md` "T5b"). So
+`StreamBroker::publish` takes the `HubEvent` the hub already settled and never bumps; the baseline and
+the resync links are counter READS against the same hub. Consequences a later stage must not re-derive:
+
+* A child-scoped counter is keyed `session:child` (`events::ResourceRef::normalized`, the composite the
+  REST write stamped). `StreamScopeIds::hub_resource_id` builds that key for the frames;
+  `protocol::stream_resource_id_for` keeps TS's PLAIN id spelling and is exported for callers that want
+  the contract table verbatim. They differ for `turn*`/`thread`/`transcript*` only.
+* `protocol::default_stream_link` is the contract's table and quotes `?limit=25` on `turns`,
+  `display`, `events`, `threads`, `actions`, `agents`, `tools`, `commands` and `messages`;
+  `events::baseline_link` is the hub's own table and prints `/display` and `/agents` WITHOUT a limit.
+  `resync_required.resources` uses the contract's (so a resync's links match swagger), and the two
+  tables are therefore NOT interchangeable - do not "unify" them without checking swagger lines
+  2197-2245.
+* Because `ack`/`ping`/`subscribe` all read the store or the hub, the lock order is
+  **store -> broker -> hub counters**. A REST mutation publishes while it still holds the store lock
+  (`Store::commit` -> `hub.publish` -> `fan_out` -> `StreamBroker::publish`), which is why
+  `StreamBroker::unknown_resource` (a store read) runs BEFORE the broker lock is taken. The cost is one
+  reordered pair: a `subscribe` that is both a duplicate id and an unknown resource reports
+  `unknown_resource` here where TS reports `invalid_payload`.
+
+### Deliberate deviations (stated, not hidden)
+
+* **Frames are `serde_json::Value`, not serde models.** The union is discriminated twice (`type`, then
+  `scope`/`kind`) and `payload` is whatever the mutation published, so a typed model would either lose
+  the payload's shape or re-serialize it. Field names are pinned by the builders and by the tests.
+* **No transport module.** hyper + tokio-tungstenite own the codec, masking, fragmentation and the close
+  handshake, so `transport.ts`'s 677 lines collapse into `stream/mod.rs`'s gates and one sentence:
+  `This conversation carries JSON text frames only` (close 1003, sent for a binary frame, with no error
+  frame - it is below the JSON layer).
+* **The client-frame byte cap is enforced in the parser, not on the wire.** tungstenite's default
+  message cap is left alone, so an oversize text message reaches `parse_client_frame` and the client
+  reads `error{frame_too_large, close_code:1009}` BEFORE the close. TS's transport closes 1009 without
+  the frame; this is the same outcome plus the reason.
+* **Parked windows carry a deadline instead of a timer**, pruned at the next lookup; a refused resume
+  (`cursor_expired` / `epoch_mismatch`) leaves the window in place, which is TS's behaviour too
+  (`dropParked` sits inside the resume arm only).
+* **The ack deadline is a tokio task** guarded by a per-subscription token, so an `ack` that arrives
+  first makes the timer a no-op. Outside a runtime (`Handle::try_current` fails) there is no clock and
+  the hold simply waits - the equivalent of TS's `unref()`'d timer in a process on its way out.
+* **Two hub-shape adaptations at the payload level**: `display.ops` folds `HubEvent::ops` into the
+  contract's `ops` field, and `run.event` wraps the ONE recorded row (`store/turns.rs:1424-1429`) into
+  `{turn_id, events:[row]}` because `WsUpdateRunEvent` forbids any other top-level field.
+* **Replayed frames are re-sent exactly as minted** (`broker.ts:774` maps the retained frames
+  themselves), so a replayed `update` still names the `subscription_id` that first received it. Only
+  `subscription_state` identifies the new subscription. A test that asserts the new id here is wrong.
+* **`resolve_stream_limits` takes an override map, not `Partial<WsStreamLimits>`**, and nothing in this
+  crate overrides anything yet: the deployment knob is `welcome`'s contract, not a config file.
+
+### Facts the runtime and T6 stages must not rediscover
+
+* A `session.updated` payload's `session.revision` is the PRE-write counter for a PATCH
+  (`store/session.rs:339-354` builds the patch before `Store::commit` moves the bumps, and the patch
+  lists its own bump targets, so `session` moves twice: 1 -> 3), while the CREATE payload is settled
+  (`built_session_payload` bumps first). The freshness rule to assert is therefore
+  `subscription_state.revisions` vs `X-Harness-Revision` (equal), not the payload's own `revision`
+  (`tests/stream.rs` pins both facts).
+* `stream::upgrade`'s two 400 sentences are different conditions: a GET with NEITHER upgrade token is
+  the JSON dispatcher's case and answers TypeScript's own
+  `GET /stream expects a WebSocket upgrade (Sec-WebSocket-Key/Version) for the harness.v1 subprotocol.`
+  (the sentence `api.ts:3911`, `queue.test.ts:1090`, `view.test.ts:779` and `tests/http_host.rs:628`
+  pin); tokens present but wrong answers `The request is not a WebSocket upgrade.` (`transport.ts:623`).
+  The capability refusal runs before both, and the exact-path gate runs after the version gate - it is
+  only observable by calling `stream::upgrade` directly, because `server::router` mounts exactly one
+  path at the stream and sends everything else to the REST dispatcher.
+* The handshake carries NO resume state, so a query string on the stream path is ignored (not an error)
+  and `hello` is the only resume input: a `hello` after the first `subscribe` is `late_hello` and changes
+  nothing, and a repeat `hello` is silently ignored rather than an invented error.
+* An `error` frame with `close_code` closes the connection immediately AFTER the frame is on the wire.
+  That is how 4401, 4429, 1009, 1003 and the host's 1001/1012 reach a client with their reason.
+* The subscription budget (64) is per CONNECTION, and the same `scope`+ids pair may be subscribed twice
+  with different ids. 65 subscribe frames cannot be sent in one second: the 32/s message budget refuses
+  at 4429 long before the budget refuses at 4401, which is why the budget probe paces itself.
+* The stream's epoch is the process epoch (`events::process_epoch`), shared by every hub in the process.
+  A test that wants two epochs needs two cursor strings, not two hubs.
+
+### T6's seam
+
+`runtime::cached_runtime(root).stream_broker()` is the only way in. A service route that wants the
+stream mounts `stream::upgrade(root, request)` on its own upgrade path (it already has the epoch gate and
+the runtime cache), and calls `broker.close_all(1012)` on an epoch change or `close_all(1001)` on host
+shutdown. T7a CLOSED the second half: `server::begin_shutdown` / `begin_shutdown_all` and
+`runtime::close_streams` are the production callers (`server.rs:118-138`), and `serve_on`'s shutdown arm
+runs the stream half before the listener drains.
+
+### Tests
+
+`cargo test` is 247 (was 209): 19 unit tests in `stream/protocol.rs` (the cursor codec including a colon
+inside the epoch, every refusal sentence, the scope tables, the tunable bounds, the chunker, the frame
+builders) and 19 in `tests/stream.rs` (handshake + subprotocol + epoch header; the exact 18-number
+`welcome`; `hello` silence and `pong`; `subscription_state` with the baseline records equal to the REST
+counters; a REST patch arriving as an `update`; cursor replay with `replayed_frames`;
+`epoch_mismatch`; ack-ordered silence vs `unknown_subscription`; ack-paced hold-then-release; 1007 /
+1009 / 1003 closes; `bye` 1000; the five HTTP gates plus the path gate; `unknown_resource`, duplicate
+id, `unsupported_filter`, `late_hello`; 4401 at 65 subscriptions; 4429 at 33 messages; and
+`close_all(1012)`).
+
+## T6 - the `typecrate-services` gateway bridge (`endpoint/harness/harness-route.rs`)
+
+### What landed
+
+`packages/typecrate/services` now serves `/v1/harness`, and it serves it THROUGH its own build-time
+route discovery rather than through a special case: one new file in this package,
+
+```text
+packages/typecrate/harness/endpoint/harness/harness-route.rs
+```
+
+is discovered by the services `build.rs` scanner (suffix rule `<stem>-route.rs` + a directory named
+`endpoint`/`endpoints`, scanned from the REPOSITORY root - `services/build_support/mod.rs`), compiled
+into the services crate as `<identifier>::register` + `<identifier>::ENDPOINTS`, and mounted on the
+same `Router` that `typecrate-services-server` serves. The file is three handlers and one
+`crate::service_routes!` block, and nothing else:
+
+```rust
+ANY "/v1/harness"          => harness_root,    // api::handle_request
+ANY "/v1/harness/stream"   => harness_stream,  // api::handle_stream
+ANY "/v1/harness/{*rest}"  => harness_api,     // api::handle_request
+```
+
+`State(crate::server::AppState).database_root` is handed to the dispatcher as the harness runtime root,
+which is the SAME value the standalone `--database-root` takes, so the store, the registry, the epoch
+and the durable document are per-root in both hosts and no path is re-derived from `cwd`.
+
+### The two facts a future stage must not re-derive
+
+* **`server::router(root)` and this bridge are alternative mounts of one dispatcher, not two
+  implementations.** `src/server.rs` still owns the standalone surface (including its `fallback` for
+  paths outside the mount, which the services router does NOT need: services answers those with axum's
+  own 404, and the harness's "this server serves /v1/harness" sentence still comes from the dispatcher
+  for anything UNDER the mount). A route file must never re-implement a harness answer.
+* **`axum::extract::Request` must reach `api::handle_request` whole.** The dispatcher reads headers,
+  the query, and the body itself (`api::mod.rs::BodyReader`), so a gateway that pre-extracts (`Json`,
+  `Bytes`, a `FromRequest` guard, or a body-limit middleware that actually wraps the body) changes the
+  contract: the 413/415/400 sentences, the laziness rule (`api.ts:4009`, `:4022-4024`) and the drain
+  behaviour all live below the router. Services' `DefaultBodyLimit` is safe here for exactly one
+  reason: that layer only governs extractors that ask for it, not a handler that reads `Request`
+  (`axum-core-0.5.6/src/extract/default_body_limit.rs`), so the gateway's 1 MiB never becomes the
+  harness's cap - the 1 000 000 / 16 MiB caps in `body_limit_for` stay in force, and
+  `services/tests/harness_gateway.rs::the_gateway_body_cap_governs_extractors_not_the_harness_route`
+  pins the three-way difference (harness 404 for a 1.5 MiB submit, harness 413 with its own sentence at
+  1 000 500, axum's plain-text 413 for the same size on `POST /v1/services/echo`).
+
+### Why `ANY`, and what the router must not decide
+
+The bridge registers `ANY`, matching `src/server.rs:53-62`, and the services macro had to grow an `ANY`
+arm for it: axum 0.8.9 has no `MethodFilter::Any` constant, so the verb resolves to
+`axum::routing::any(handler)` while every real verb keeps `MethodFilter`. A verb-agnostic mount is what
+keeps the contract's own answers on the wire: the 405 names the allowed verbs of the route the
+DISPATCHER matched (`api.ts:4006-4013`), and the stream answers a `GET` with no upgrade headers with the
+TypeScript sentence. A per-verb router registration would replace both with axum's generic 405.
+
+Two properties of the services table are pinned over a socket in `services/tests/`:
+
+* matchit prefers the STATIC `/v1/harness/stream` to the `/v1/harness/{*rest}` catch-all. The proof is a
+  pair of sentences, not a status code: `DELETE /v1/harness/stream` must be
+  `The stream upgrade is a GET.` (`stream::upgrade`'s method gate) while
+  `DELETE /v1/harness/stream/anything` must be the dispatcher's
+  `Unknown API route: DELETE /v1/harness/stream/anything`. A precedence inversion would keep the status
+  (405/404) and lose the WebSocket.
+* the harness rows are the FIRST rows of `GET /v1/services/routes`, because
+  `packages/typecrate/harness/...` sorts before `packages/typecrate/services/examples/...` in the
+  scanner's byte-wise order, and they are listed as `ANY`.
+
+### Deviations from the TS host (stated)
+
+* The TS harness reaches the world through `@underload/service`'s Hono gateway, which forks worker
+  processes and answers a cross-origin hop with `307`. The Rust gateway is one process, one listener, no
+  redirect tier; the CORS/`Access-Control-Allow-Private-Network` header set and the preflight `204` ARE
+  reproduced (`services/src/server/mod.rs::gateway`, mirroring
+  `packages/underload/service/src/server/start.ts:415-444`), including hono's condition that a preflight
+  is an `OPTIONS` **that carries `Access-Control-Request-Method`** - a bare `OPTIONS` stays routable, so
+  `OPTIONS /v1/harness` still reaches the dispatcher and still answers `Use GET for /v1/harness.`
+* The stream's `close_all(1001)` on host shutdown (the seam above) has an API since T7a -
+  `server::begin_shutdown_all()` stops every runtime this process cached - but the services EXECUTABLE
+  still has to call it: `AppState` owns no runtime handle, because the runtime is per database root and
+  lazily created, so closing it stays a host-lifecycle step in `packages/typecrate/services`, not a
+  routing one in this package's route file.
+
+### Tests
+
+`cargo test` in this package is unchanged at 247 (the bridge adds no code to this crate's module graph:
+`endpoint/**` is not a cargo target, it is compiled by the CONSUMER's generated table). What moved is
+the consumer: `packages/typecrate/services` went from 84 to 96 tests, adding
+`tests/harness_gateway.rs` (8: service document + epoch header + `api_root`; `health` and an exact empty
+page; a created session listed and persisted at `<root>/harness/state.json`; the 35-row tool catalogue
+with `timeNow`; the `harness.v1` 101 through the gateway layer with `welcome` + `subscription_state` on
+the REST epoch; the non-upgrade 400; the static-vs-catch-all sentences; preflight `204` vs routed
+`OPTIONS`; the body-cap triangle), one repo-root discovery test, one `ANY` macro test, two gateway-layer
+unit tests, and the 18-row pin of `GET /v1/services/routes` inside `tests/server_http.rs` (whose dispatch
+plan now sends the literal `ANY` verb to the three harness rows). `cargo check --target
+wasm32-unknown-unknown` still passes: `cargo tree --target wasm32-unknown-unknown` lists `wasm-bindgen`
+and nothing else, which is the proof that the non-wasm path dependency did not leak.
+
+## T7a - the audit remediation (`store/**`, `projector`, `runtime`, `server`, `transport`, `turn`)
+
+An independent audit of T2-T6 against the TypeScript spec produced ten defects. All ten are closed here,
+in the audit's priority order, and every fix is a SPEC alignment - nothing was redesigned. Three facts
+stated in earlier sections changed, and those sections were corrected in place: T3's "the durable queue is
+the LEGACY array" bullet, T5c's "T6's seam" sentence, and T6's shutdown deviation.
+
+### The ten fixes, and where each one lives
+
+1. **A host write is live state, not boot state** (`runtime.rs:460-468`, `:589`, `:599`, `store/mod.rs:666-704`).
+   `POST /harnesses`, `PATCH /config` and the agent routes mutate the runtime's OWN
+   `RwLock<HarnessRegistry>` / `RwLock<AgentCatalogue>` / `RwLock<ServerConfig>`, while `create_session`
+   resolved the harness, the provider trio and the instruction layers from the copies the store was
+   `open`ed with. TS has no such split: `api.ts:1974` / `sessions.ts:1827` read `getLoadedConfig()` and
+   `getAgentCatalogue()` fresh. The store now owns a HOST VIEW - `StoreInner::host_registry`,
+   `host_agents`, `host_config` (`store/mod.rs:666-678`) with `registry()` / `agents()` / `settings()`
+   accessors on the guard (`:684`, `:690`, `:697`) - and the runtime PUSHES a copy of its own three
+   values into it at creation (`runtime.rs:464`) and after every save, every `save_agents` and every
+   rollback (`:542`, `:589`, `:674`, `:700`, `:715`, all through `sync_store`).
+2. **The session's endpoint is the session's own provider view** (`store/read.rs:467-478`,
+   `api-reads.ts:225` `providerDefaultsOf(record.settings)`). `session_endpoint_of` joins the SESSION's
+   base URL / model / key-name with the deployment credential, so a session created against
+   `https://deep.example` no longer reports the deployment's URL. `Store::provider_of` and
+   `Store::session_resource` now take `(inner, state)` (`store/session.rs:887`) because the host view
+   they consult is a field of the same guard.
+3. **The question channel reaches the wire** (`store/actions.rs:610-690`). `StoreActionHost::request`
+   records the entry, projects the ONE ready-to-answer row through the same `read::pending_action_row_of`
+   the REST read uses, bumps `actions`, and publishes `action.opened` addressed at
+   `("actions", session_id)` - the payload field is `action`, and a question that vanished between the
+   push and the read answers `action.closed{reason:"ended"}` instead of an empty `action.opened`
+   (`api.ts:1105-1125`).
+4. **Live display ops carry the snapshot's section ids** (`projector.rs:2070` `section_wire_id`,
+   `:2090` `stamp_turn_identity`, `:2127` `stamp_display_ops`; called from `store/mod.rs` `record_event`
+   and from `store/read.rs:739-743`). The projector mints per-turn-local ids (`s1`); the REST display doc
+   prints them qualified (`<turnId>:1`). TS stamps once, in the projector, so both reads see the same
+   string (`server/turn-display.ts` `qualifySectionId`). The rule is now ONE string function used by both
+   paths, and the turn-level `usage` frame's `sectionId: "turn"` sentinel passes through unchanged
+   because it is not an id the snapshot mints.
+5. **A cancel-all reports the stops it made** (`store/session.rs:636-770`, `sessions.ts:7765-7788`,
+   `api.ts:2334-2358`). TS's answer is not "a run was aborted": it counts the host conversations
+   `stopThread` ACTUALLY transitioned (`if (stopped > 0) cancelled = true`), so an idle session with a
+   live HOST conversation is still a real cancellation - while an internal `agent:<name>` conversation is
+   plumbing and stays out of it, and a second stop-all over already-stopped conversations is the
+   `cancelled: false` no-op. The response also names the running turn, falling back to the newest row
+   while `record.busy` is set, and drops BOTH queues (legacy and every lane).
+6. **The lane backlog is durable** (`store/mod.rs:1660-1682` write, `:2421-2451` restore).
+   `record.queue` is the union of the legacy array and every lane queue, sorted by the turn `index`
+   minted at enqueue, and `restore_session` re-homes each id into its own lane exactly as TS's F1
+   distribution does (`sessions.ts:3202-3228`, `:5947-5953`). A lane's ACTIVE turn is already out of its
+   queue (`claim_next_turn` peeks), so no id appears twice. This removes the ordering hole the T3 stage
+   note admitted: before, a restart dropped a lane's backlog and a fresh submit overtook it.
+7. **The session resource reports live execution** (`store/read.rs:480-493`): `runtime_execution` is
+   `api-reads.ts:226` `context.runtime.threadExecution`, i.e. the host view's CURRENT `thread_execution`,
+   not the built-in default substituted at open time. `session_resource_of` therefore lost its `settings`
+   parameter - the runtime it already took IS the deployment view.
+8. **A graceful host says goodbye** (`server.rs:100-138`, `runtime.rs:594-653`, `store/mod.rs:1047-1055`).
+   `serve_on`'s shutdown arm calls `begin_shutdown(root)` BEFORE the listener finishes draining:
+   `Store::begin_shutdown` sets the `shutting_down` flag TS's `dispose()` sets (`sessions.ts:8638`, so no
+   pump claims queued work behind the checkpoint) and `runtime::close_streams(STREAM_SHUTDOWN_CODE)` fans
+   the contract's `error{close_code:1001}` frame plus the close to every live connection. `flush` keeps
+   calling `runtime::shutdown` (flag, sockets, then the durable document - the order
+   `start.ts:319-340` states), and both steps are idempotent. The same item closed the settlement half
+   of the action contract: `action_closed_reason` (`store/actions.rs:784-801`) reproduces TS's
+   `actionClosedReason` phrase test (`sessions.ts:361-370` - `cancel` -> `cancelled`, `ended` -> `ended`,
+   else `expired`), `SessionState::expire_actions` returns the ids it settled, and
+   `Store::publish_actions_closed` (`store/actions.rs:803-829`) fans one `action.closed` per settlement,
+   bumping `actions` once before each frame. Every terminal path routes through it: an owner answer
+   (`store/actions.rs:1129-1146`), a stop and a cancel-all (`store/session.rs:416`, `:748`), a run that
+   ended (`store/turns.rs:1359-1364`), a reset and a delete.
+9. **Sampling reaches the provider request** (`transport.rs:271-300`, `:922`, `:937`;
+   `store/read.rs:1762-1817`). `ProviderConfig` gained `sampling: Option<Value>` (`contract.rs:2935`),
+   `read::default_sampling()` reproduces the toolbox default (`server/harnesses/toolbox.ts:242-246`:
+   `temperature: 0.3`), `read::effective_provider` attaches it to the session's provider view, and
+   `transport::sampling_body` merges ONLY the five numeric `HarnessSampling` keys
+   (`SAMPLING_KEYS`) into the body - a server-side knob a client can never supply
+   (`transport/openai.ts:126-140`).
+10. **Steering a failed run never consumed goes back to the conversation**
+    (`turn.rs:228`, `:248`, `contract.rs:2913`, `store/turns.rs:1239-1264`). `Run` tracks
+    `delivered`, the mailbox drain hands those texts to the outcome as `TurnOutcome::Failed::unused_steering`,
+    and `settle_turn` re-queues them into the conversation's steer mailbox and puts `steer_active` back,
+    so the next run reads guidance the user already typed (`sessions.ts:6461-6495`, which re-queues on a
+    failed turn rather than dropping it).
+
+### Why the host view is a store field and not a second runtime lock
+
+The alternative was for `create_session` to reach the runtime for the live registry. It cannot: the
+documented lock order is **host lock -> store lock**, because `Store::commit` publishes while it still
+holds the store mutex and the hub's listener is the stream broker
+(see T5c's "the lock order is store -> broker -> hub counters"). A store-side read of a runtime
+`RwLock` would invert that and deadlock the first `PATCH /config` that raced a submit. So the value moves
+INTO the store (one push, no read back), and the rule is now:
+
+* `Store::registry()` / `agents()` / `settings()` (`store/mod.rs:1022`, `:1028`, `:1038`) TAKE the store
+  lock and return owned clones. **Never call one while holding a store guard** - use the guard's own
+  `inner.registry()` / `inner.agents()` / `inner.settings()`, which borrow. This is the one trap the
+  change created, and it is a runtime deadlock, not a compile error.
+* A runtime method that wants the view calls `sync_store()` (`runtime.rs:599`) - which clones each value
+  out of its own lock and releases all three before touching the store - and nothing in the store ever
+  calls back into the runtime.
+
+### Facts a later stage must not re-derive
+
+* `record.queue` is the WHOLE pending set, in turn-index order. A writer that pushes only `self.queue`
+  silently makes a lane's backlog memory-only again, and the restore split (`store/mod.rs:2421-2451`)
+  will re-home nothing.
+* The `actions` counter is the resource `action.opened` / `action.closed` are addressed at. Publishing
+  those frames without bumping `actions` leaves a client that re-reads `GET /sessions/:id/actions` with a
+  stale figure, and bumping without publishing leaves the baseline a reconnect reconciles against one
+  ahead of the frames.
+* Section ids are a STRING rule in one place (`projector::section_wire_id`). A second formatter that
+  derives the qualified id from the ordinal alone is fine for this projector (the positional and ordinal
+  mappings are identical because the projector emits sections in increasing ordinal order) and wrong for
+  any projector that reuses an ordinal.
+* `ProviderConfig` is no longer `Eq` (it carries a `Value`), and its `sampling` is server-side state:
+  a route must not accept sampling fields from a request body.
+* The frame key order this crate emits is the union's DECLARED order (`type, subscription_id, sequence,
+  cursor, kind, at, <payload>`), because `serde_json` here runs with `preserve_order`. Tests that pin
+  `frame.keys()` must state the declaration, not a sorted copy.
+
+### Tests
+
+`cargo test` is 256 (was 247), and `cargo clippy --all-targets -- -D warnings` plus `cargo fmt --check`
+are clean. The ten tests below - nine new, one rewritten - pin one observable behaviour per audit item:
+
+| Test | Pins |
+| --- | --- |
+| `tests/http_sessions.rs::a_host_write_is_visible_to_the_next_session_without_a_restart` | fix 1 (a saved harness, model and instruction reach the NEXT session over HTTP) |
+| `tests/store.rs::the_session_endpoint_is_the_sessions_own_provider_view` | fix 2 |
+| `tests/stream.rs::the_action_channel_publishes_the_opened_and_closed_frames` | fixes 3 + 8 (both frame kinds, the row shape, the reason vocabulary, the per-subscription fan, and the counter the baseline reports) |
+| `tests/store.rs::the_live_display_ops_carry_the_snapshot_section_ids` | fix 4 (a real `TurnProjectorFactory`, live ops equal to the snapshot's ids) |
+| `tests/store.rs::cancel_all_reports_a_stop_of_host_threads_on_an_idle_session` | fix 5 |
+| `tests/store_restore.rs::a_durable_backlog_survives_a_restart_and_runs_in_order` | fix 6 (rewritten: a per-lane backlog, restarted in order) |
+| `tests/store.rs::the_session_resource_reports_the_live_thread_execution` | fix 7 |
+| `tests/stream.rs::the_host_shutdown_closes_a_live_stream_with_the_1001_frame` | fix 8 (the `error` frame plus close 1001, and the store's flag) |
+| `tests/transport.rs::sampling_fields_merge_into_the_request_body` | fix 9 |
+| `tests/store.rs::a_failed_run_hands_its_drained_steering_back_to_the_conversation` | fix 10 |
+
+Three existing assertions encoded the OLD behaviour and were corrected to the spec, not to the code: the
+session resource's `endpoint` in `tests/http_sessions.rs` (it now names the session's own base URL),
+`the_provider_credential_is_never_persisted` in the same file (the credential rides the endpoint
+read-model, the document still never carries it), and `a_durable_backlog_survives_a_restart_and_runs_in_order`
+(which used to assert that a lane backlog came back UNCLAIMED).
+
+**The one flake this stage removed (test-side, not one of the ten):**
+`tests/stream.rs::the_per_second_message_budget_answers_rate_limited_and_closes_4429` failed on Windows
+about one run in three - in isolation as well as under load - with
+`Io(Os { code: 10054, kind: ConnectionReset })` (it failed the same way, at the same read, in the FIRST
+baseline run before any T7a edit: `Temp/typecrate-harness/t7a/baseline-harness.txt`). The burst sent 40
+frames past a 32-frame budget, so the server closed with seven of them still unread in its receive queue;
+a socket closed with unread data is RESET rather than FIN'd, and the reset discards the pongs and the
+close frame the server had already written. The burst now stops AT the trip (33 frames), which is the
+same contract question with no race - every assertion is unchanged, and the test passed six consecutive
+runs after the change where it had failed inside three before it.
+
+---
+
+## T7b - the second audit remediation (`projector`, `api/**`, `store/**`, `tools/**`, `registry/**`, `paging`, `read`, plus the `typecrate-services` shutdown hook)
+
+Thirteen findings from a fresh audit of the port against the TypeScript spec. Each row states the
+defect, the fix, the TypeScript authority, and the test that pins it. Nothing here is a redesign: the
+spec is the TS source, and where a fix could not reach the seam it says so.
+
+### What changed
+
+| # | Defect | Fix | TypeScript authority | Test |
+| --- | --- | --- | --- | --- |
+| 1 | The harness registry dropped `agentColors`: the preset row, the durable document, the PATCH body and the resource read all lacked it. | `agent_colors: Option<BTreeMap<String, String>>` threaded through `registry/{mod,descriptor,presets}.rs`, `persistence.rs`, `contract.rs`, `read.rs`, `store/{read,session}.rs` and `api/harnesses.rs`, with the hex / membership / blank refusals. | `server/harnesses/registry.ts:430,569,589`, `persistence.ts:131`, `shared/harness-api.ts:454,694` | `tests/data_plane.rs::the_agent_color_map_follows_the_same_rules_as_the_other_two`, plus the `/harnesses` colour assertions already in `tests/http_host.rs` |
+| 2 | `GET /harnesses` stamped `X-Harness-Revision`; the page route has no per-resource revision to quote. | The list route answers through the plain json helper, so only `X-Harness-Epoch` is stamped; the one-harness detail routes keep their revision. | `api.ts` (`getHarnesses` returns `json(...)` with no `revision` argument) | `tests/http_host.rs:983-998` (the header is asserted absent) |
+| 3 | `POST .../tools` over an existing CREATED name answered 409, and `replace: true` was accepted silently. | A duplicate create REPLACES: `201 {created: false, replaced: true, previousRevision}` and the create slot is not spent; `replace: true` is refused as a capability, and `checks` is omitted from every registration receipt (this build has no runtime compiler to run them). | `core/creation.ts` (a created name is not reserved), `api.ts`'s `toolCreate` arm, `harness-api.ts:1355` (`checks` is the compiler's answer) | `tests/http_sessions.rs::a_tool_registration_replaces_by_name_and_refuses_the_replace_flag` |
+| 4 | The global `/tools` surface listed all 35 catalogue rows, including the four the manifest withholds. | A name set `catalogue::UNLISTED` + `is_listed()`/`listed_entries()`, so `ENTRIES` stays a byte-for-byte projection of the generated manifest; `ToolRuntime::summaries()` answers **31** and the new `catalogue_summaries()` keeps a SESSION toolbox at **35**. | `core/tool-manifest.ts:1002, 1046, 1692, 1811` (`listed: false`), `tools/descriptors.ts:290-328`, `api-reads.ts:831-836` (`sessionToolRowsOf` reads the live registry) | `tests/tools.rs::the_catalogue_lists_every_group_in_the_published_order`, `tests/http_host.rs:1805-1840` |
+| 5 | The projector minted no context segments, so `TurnSection.context` was always empty and `GET .../blocks/{id}` could never resolve. | `Section.context` plus `pushBlock`/`patchBlock` (`add_block`/`patch_block`): a `tool` segment per call, keyed by its own event index with `argsChars`, settled in place by its result with `chars = argsChars + resultChars`, `resultChars`, `state`, `endedAt`, `eventTo` and the recorded `durationMs`; the `done` fallback mints the `assistant` segment when no delta streamed. Both publish real `context:add` / `context:set` ops, and every wired section carries the `context` member. | `turn-projector.ts:1029-1082` (`pushBlock`, `blockIdOf`, `updateToolBlock`), `:2043`, `:2195`, `:2378-2390`; `turn-display.ts:370-559` (the bar's source list, the `ContextBlock` shape, invariant 5) | `tests/projector.rs::a_root_flow_opens_one_section_and_streams_its_answer`, `a_tool_round_becomes_one_step_row_with_its_result`; `tests/http_sessions.rs` (the display publishes `1-tool-2`, `GET .../blocks/1-tool-2` answers 200 with the recorded `args`/`result`) |
+| 6 | Body-less verbs called `require_empty_body`, which PARSED a body they are meant to ignore. | Every `GET`/`DELETE`-style handler calls `ctx.ignore_body()` (drain, never parse); `require_empty_body` stays only for the one unit test of the TS `readEmptyBody` helper. | `api.ts`'s read handlers (`readEmptyBody` is applied where a body is meaningful) | the unchanged `tests/http_host.rs` read suite, which now exercises the drain path |
+| 7 | Paging compared query strings by hand, so `?limit=` (empty) fell back to the default instead of the TS answer. | `paging::number_value` / `is_safe_integer` reproduce ECMAScript `Number()` coercion, so `?limit=` is `0` (a 400), a non-numeric value is a 400, and anything above `Number.MAX_SAFE_INTEGER` is refused. | `api-paging.ts:41,46,50,56,89` | the paging cases in `tests/http_host.rs` and `tests/data_plane.rs` |
+| 8 | The usage fold invented a `cached` member and ordered threads by name. | The tally states `{input, output, total}` and preserves FIRST-APPEARANCE thread order; `cached` stays a transport-side figure. | `api-reads.ts`'s usage page builder, `sessions.ts`'s usage fold | `tests/store.rs` / `tests/turn.rs` usage cases |
+| 9 | Several display bounds counted `chars().count()` (code points) where TypeScript counts UTF-16 code units. | `display_chars` is the single UTF-16 measure, used by every preview, notice, tail and block count. | `turn-projector.ts:134-190`, `turn-display.ts:95-99,412-416` (invariant 5) | `tests/foundation.rs::character_figures_are_utf16_code_units`, `tests/data_plane.rs::the_harness_text_bounds_are_measured_in_utf16_units` |
+| 10 | The `typecrate-services` listener never told the harness runtime it was going away, so a live turn stream held the graceful drain open. | `bin/server.rs` runs `typecrate_harness::server::begin_shutdown_all()` as soon as the signal resolves, before axum stops accepting: every cached root's store flips `shuttingDown` and every live stream closes with `1001`. A process that serves no harness root (remote-hosts mode) is unaffected. | `start.ts:319-327`, `sessions.ts:8638` (`dispose`'s `shuttingDown`) | the harness side is pinned by `tests/stream.rs::the_host_shutdown_closes_a_live_stream_with_the_1001_frame`; the services wiring is a one-line hook in the bin |
+| 11 | The playground checker's listing fixture was the pre-T6 fifteen-row table, so it validated a listing the server no longer produces. | `LISTING_JSON` is the eighteen-row listing with the three `ANY /v1/harness` rows first; the eight expectations that encoded the fifteen-row order moved with it. | `tests/server_http.rs::route_table`, `tests/discovery.rs` (R2 sort order) | `node scripts/check-playground.mjs` - 122/122 |
+| 12 | `README.md` still described stage T1. | Rewritten as the crate's real manual: layout, commands, the standalone listener's flags and defaults, the environment ladder, the data-root and journal formats, the parity matrix, the full deviation list, and the verification counts. | - | - |
+
+### Assertions that encoded the old behaviour, and were corrected to the spec
+
+* `tests/http_host.rs::the_harness_page_lists_the_shipped_registry` - the page now stamps no
+  `X-Harness-Revision` (fix 2).
+* `tests/tools.rs::the_catalogue_lists_every_group_in_the_published_order` and
+  `tests/http_host.rs`'s tool page cases - 35 rows became 31 for the LISTED surface, with the four
+  withheld rows named in the message (fix 4). The session toolbox pin stays 35.
+* `tests/http_sessions.rs`'s `?limit=` cases - an empty limit is `Number("") == 0`, which is a 400
+  with the "A limit must be between 1 and 100." sentence, not a silent default (fix 7).
+* `tests/projector.rs`'s two display fixtures - every wired section now carries `context`, and the
+  tool round publishes `context:add` beside its `step:set` and `context:set` beside the result patch
+  (fix 5). The op-name lists and the compiled tree were rewritten to the shapes above, not loosened.
+* `tests/http_sessions.rs`'s block-segment block - `0-user-prompt` stays the honest 404 (the
+  projector seam has no prompt to mint a `user` segment from), and the tool segment the fold DOES
+  mint is now fetched by id and answers 200 with the recorded pair.
+
+### Deliberate deviations added or sharpened this stage
+
+1. **No `user` / `system` segments.** `ProjectorFactory::create(&self)` (`ports.rs:239-241`) receives
+   no prompt, and the protocol's event enum (closed for this stage) has no user or instruction event,
+   so the two kinds TypeScript mints from the RECORD have no input. The block route resolves every
+   segment that exists and answers the recorded 404 for the rest - `0-user-prompt` is the pinned case.
+2. **No prose-window segments.** TypeScript opens a `reasoning`/`assistant` block per window of
+   consecutive deltas and patches it on each append (`turn-projector.ts:2044-2063`, `:1061`). This
+   fold carries those bytes in the node and the section `tail` and mints the `assistant` segment only
+   through the `done` fallback TypeScript uses when the window held no deltas
+   (`turn-display.ts:373-376`). The `context:*` op vocabulary, the block id rule and the route are all
+   in place, so widening the fold is a fold change, not a contract change.
+3. **Block ids are one ordinal lower than TypeScript's.** The id rule is
+   `${section.sections.length}-${kind}-${key}`, and TypeScript's array holds its prompt section at
+   index 0 from the constructor. This fold has no prompt section, so the root flow's first tool
+   segment is `1-tool-7` where TypeScript prints `2-tool-7`. Stable across live and replay, and
+   internally consistent with this build's `s{ordinal}` section ids (T4's recorded deviation).
+4. **A result-only frame settles no segment.** TypeScript's `updateToolBlock` returns when there is no
+   block to update (`:1065`); the same rule here means a `tool_result` whose `tool_call` was never
+   folded renders as a step row (T4's rule) and adds nothing to the bar.
+5. **A pending segment is consumed even on a mismatch.** `pending_block` pairs a result with the
+   segment the last call opened; when that segment belongs to another flow the entry is dropped rather
+   than left to settle a later, unrelated result.
+
+### Facts a later stage must not re-derive
+
+* The listing rule lives in the catalogue (`UNLISTED` / `is_listed` / `listed_entries`), NOT in a
+  per-row field: `ENTRIES` stays the generated manifest projection, and the two read surfaces
+  (`summaries` for `/tools`, `catalogue_summaries` for a session toolbox) differ by exactly the four
+  withheld names.
+* The context bar is METADATA ONLY: no `text`, no `preview` on a segment. A segment names the
+  recorded range `[eventFrom..=eventTo]`, and `api::turns::build_turn_block_detail` reads those bytes
+  out of the journal. Anything that puts text on a segment breaks the wire bound the contract is built
+  around (`turn-display.ts:397-410`).
+* `display_chars` is the only character measure in this crate. A new bound that counts code points
+  disagrees with TypeScript on any astral-plane text.
+* A duplicate `POST .../tools` is a REPLACE, not a conflict, for a CREATED name; the 409 is reserved
+  for a name owned by the catalogue or the harness, which this port cannot override.
+
+### Verification (T7b's last run)
+
+`cargo fmt -- --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --no-fail-fast`
+in `packages/typecrate/harness`: **261 passed, 0 failed** across 13 targets (56 lib, 5 bin, 15
+`data_plane`, 23 `foundation`, 17 `http_host`, 17 `http_sessions`, 15 `projector`, 27 `store`, 4
+`store_restore`, 21 `stream`, 24 `tools`, 24 `transport`, 13 `turn`).
+
+`cargo check --locked --target wasm32-unknown-unknown` in `packages/typecrate/services` is clean, and
+`node scripts/check-playground.mjs` is 122/122. `cargo test --locked` there is 71 tests with one
+expected failure: `tests/harness_gateway.rs::health_the_empty_page_a_created_session_and_the_catalogue_reads_answer_through_the_gateway`
+pins `GET /v1/harness/tools?limit=100` at **35** rows, and fix 4 makes the listed surface **31**. The
+assertion belongs to a services test file, which T7b's brief did not put in scope - it needs the same
+15 → 18 style fixture move as the playground checker (35 → 31 rows, `limit` 35 → 31, and the default
+page's "25 of 31" cursor arithmetic).
+
+The thirteenth finding - the lowest-priority group of the audit list - was not attempted: each item in
+it needs an input channel the current seams do not carry (an agent-results registry behind
+`TurnSummary.blocks`, the instruction-source snapshot reaching the projector, and the two remaining
+`edit` matching tiers), and the stage's rule was to close the listed defects without redesigning.
+
+## T9 - the runtime-support gate, the route-table pin, and the documentation honesty pass
+
+An independent verification found three things: a `worker` execution mode that was accepted and
+advertised but never provided (turns silently ran inline), no test that referenced the route table, and
+documentation that had drifted. No architecture changed.
+
+### What landed
+
+| # | Change | TypeScript authority | Test |
+| --- | --- | --- | --- |
+| 1 | `runtime::validate_supported_execution(&ServerConfig)` + `runtime::SUPPORTED_EXECUTION_MODE`: a deployment whose `thread_execution` or `io_execution` is not `inline` is refused with a 400 that names the value AND the variable, and both knobs are reported in one pass. Called as step 2 of `build_runtime`, i.e. from `runtime_for`/`runtime_for_with` before the first filesystem read. | `workers/capability.ts`, `workers/io-client.ts:282`, `sessions.ts:1513-1516` - TS aborts on an unavailable isolation lane, it never downgrades to inline | `tests/runtime_execution.rs::the_default_inline_deployment_is_supported`, `a_worker_thread_lane_is_refused_with_the_support_sentence`, `a_worker_io_lane_is_refused_with_the_support_sentence`, `both_worker_knobs_are_refused_in_one_pass`, `anything_but_inline_is_refused_and_the_value_is_quoted` |
+| 2 | `runtime::runtime_for_with(&Path, ServerConfig)` - the test/embedder seam - over a new private `cached_or_build`, so the "one build per root, a failed build is not cached" rule has ONE implementation. `build_runtime` now takes `(root, environment, config)` instead of reading the environment itself. | `runtime.ts:296-308` (a refused creation leaves nothing cached) | `tests/runtime_execution.rs::the_runtime_refuses_a_worker_deployment_before_touching_the_disk`, `the_runtime_refuses_an_io_worker_deployment`, `an_injected_configuration_passes_the_same_gate`, `the_default_deployment_still_starts_and_serves_the_mount` |
+| 3 | The standalone executable refuses an unusable deployment BEFORE binding: `startup_support_check()` (config load + support gate) runs in `main` after `--help`, prints `typecrate-harness-server: <refusal>` on stderr, and exits 1 with no banner. `HELP` gained the RUNTIME EXECUTION section. | `start.ts` - the TS start throws on a bad runtime configuration, and node reports an uncaught startup failure as exit 1 | `src/bin/server.rs::the_default_deployment_passes_the_startup_support_gate`, `a_worker_deployment_is_refused_before_the_bind`, `help_states_that_a_worker_deployment_is_refused_before_the_bind`; end-to-end: `tests/runtime_execution.rs::the_standalone_executable_refuses_a_worker_thread_lane_before_binding`, `the_standalone_executable_refuses_a_worker_io_lane_before_binding`, `the_standalone_executable_starts_the_default_inline_deployment` |
+| 4 | The gateway answer for a worker deployment is the refusal's own status: the runtime is resolved at dispatcher step 2, so EVERY mounted route (and even an unknown path) answers 400 until the environment is fixed. | `service.ts:515-528`, `:553-556` ("a rejected runtime creation should answer before any body work") | `tests/worker_execution_http.rs::a_worker_deployment_answers_every_mounted_request_with_400` |
+| 5 | `tests/routes.rs` - the route table pinned against `shared/harness-api.ts:54-100` and `api.ts:3925-3974`. | the contract's own tables | 6 tests; see "The dispatcher order is the contract" in T5a for what each one pins |
+| 6 | Documentation corrected: the services test count (71-with-one-expected-failure -> **96 passed, 0 failed**, `tests/harness_gateway.rs` pinning **31 LISTED** rows), the wasm claim (the harness lib is **excluded** from the wasm32 build - `cargo tree --target wasm32-unknown-unknown` resolves zero `typecrate-harness` packages - not "linked into" it), the standalone flags (`--host`/`-h`/`--port`/`--database-root`; `--addr` is the services gateway's spelling and THIS binary rejects it with exit 2), the default database root (`<repo>/../temporary/dump`, i.e. four levels up to the repo root and then one above it), the route-table owner (`tests/routes.rs`, not `tests/foundation.rs`), the tool counts (31 listed / 35 catalogue / 21 executable arms = 19 catalogue tools + `task` + `actionRequest`), the stream vocabulary (**18** display-op kinds, `harness-stream.ts:142` - not 64), the banner description (this bin has no LAN probe - that is the services banner), the shared-default-data-root warning, and `src/lib.rs`'s "STILL TO PORT" list (the `*-route.rs` wiring shipped with T6). `package.json`'s `#rust` note now describes a real listener. | - | the numbers in "Verification" below |
+
+### Why the gate is NOT in `load_server_config`
+
+`config::load_server_config` is a faithful port of `config.ts`, and it is also the channel that
+REPORTS a deployment: `GET /config` prints `runtime.thread_execution`, and the config tests feed it
+explicit environment maps. Refusing `worker` inside the parser would make the value unreportable and
+would break the loader's contract for every caller that only inspects settings. So acceptance stays
+the parser's business and SUPPORT is a separate, named gate in `runtime.rs` - which is also the only
+place that knows what this build actually provides.
+
+### Facts a later stage must not re-derive
+
+* A refusal from the gate is a `bad_request` (400), and a failed runtime build is never cached
+  (`cached_or_build`), so a fixed environment starts on the next request without a restart.
+* The standalone exit code for an unusable deployment is **1** (could not serve), not 2 (bad usage):
+  the flags were valid, so restarting will not help and the environment edit will.
+* Tests cannot write the process environment - `set_var` is `unsafe` in edition 2024 and
+  `[lints.rust] unsafe_code = "forbid"`. Everything therefore either passes an explicit map to
+  `load_server_config`, injects a `ServerConfig` through `runtime_for_with`, sets the CHILD's
+  environment via `Command::env` (`CARGO_BIN_EXE_typecrate-harness-server`), or points
+  `environment::set_harness_environment_path` at a `.env` fixture.
+* The `.env` route leaks: dotenvy fills the PROCESS environment when it loads a file, and nothing can
+  undo it from safe code. That is why `tests/worker_execution_http.rs` is its own test binary with one
+  test - the leak cannot reach a test that reads `HARNESS_*`.
+* `contract::RuntimeSettings` still reports whatever the deployment stated, including `worker`: the
+  gate stops the START, it never rewrites the reported configuration.
+
+### Verification (T9's last run)
+
+`cargo fmt -- --check`, `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings` and
+`cargo test --no-fail-fast` in `packages/typecrate/harness`: **283 passed, 0 failed** across 16 targets
+(56 lib, 8 `bin/server`, 15 `data_plane`, 23 `foundation`, 17 `http_host`, 17 `http_sessions`,
+15 `projector`, 6 `routes`, 12 `runtime_execution`, 27 `store`, 4 `store_restore`, 21 `stream`,
+24 `tools`, 24 `transport`, 13 `turn`, 1 `worker_execution_http`).
+
+In `packages/typecrate/services`: `cargo fmt -- --check`, `cargo clippy --all-targets --locked --
+-D warnings` and `cargo check --locked --target wasm32-unknown-unknown` are clean, `cargo test --locked
+--no-fail-fast` is **96 passed, 0 failed** (13 lib, 15 `bin/server`, 1 `api`, 29 `discovery`,
+8 `harness_gateway`, 30 `server_http`), and `node scripts/check-playground.mjs` is **122/122**. T7b's
+"71 tests with one expected failure" paragraph above is the state AT THAT RUN; the `harness_gateway`
+35-row pin has since moved to the 31 LISTED rows, which is what the gateway test asserts today.
+
+Smoke check of the standalone abort, with `HARNESS_THREAD_EXECUTION=worker` in the shell:
+
+```text
+typecrate-harness-server: Invalid runtime settings: thread_execution "worker" is not supported in this
+Rust build; only "inline" is available. Unset HARNESS_THREAD_EXECUTION or set it to "inline" - this
+build never runs a "worker" deployment inline silently.        (exit code 1, banner never printed)
+```
+
+
+
+---
+

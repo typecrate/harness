@@ -117,7 +117,7 @@ pub(crate) fn time_now(arguments: &Value) -> Result<Value, String> {
         }
     };
 
-    if label.trim().is_empty() || label.chars().count() > MAX_TIMEZONE_CHARS {
+    if label.trim().is_empty() || label.encode_utf16().count() > MAX_TIMEZONE_CHARS {
         return Err(format!(
             "timeNow timezone must be a non-empty string of at most {MAX_TIMEZONE_CHARS} characters."
         ));
@@ -312,7 +312,7 @@ pub(crate) fn text_summarize(arguments: &Value) -> Result<Value, String> {
     // The bound is a CHARACTER count in TS (`notes.length`), so the cut is made on
     // UTF-16 code units to keep the same answer.
     let units: Vec<char> = notes.chars().collect();
-    let truncated = notes.chars().count() > MAX_SUMMARIZE_NOTES;
+    let truncated = notes.encode_utf16().count() > MAX_SUMMARIZE_NOTES;
     let bounded: String = units.iter().take(MAX_SUMMARIZE_NOTES).collect();
     let truncation_note = if truncated {
         format!("\n\n{NOTES_TRUNCATED}")

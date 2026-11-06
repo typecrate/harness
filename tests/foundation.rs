@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde_json::{Value, json};
 use typecrate_harness::{
     config, contract, environment, error::ApiError, events, ids, origin, package_root, paging,
-    version,
+    projector, store, version,
 };
 
 /// Serializes every test that mutates the process environment or the `.env` cache.
@@ -414,6 +414,44 @@ fn paging_cursors_are_epoch_bound_and_opaque() {
     assert_eq!(paging::decode_cursor(epoch, Some("")).unwrap(), 0);
     assert_eq!(paging::decode_cursor(epoch, None).unwrap(), 0);
 
+    // T7b: the ordinal half goes through the SAME `Number()` coercion TS applies
+    // (`api-paging.ts:74`), so a client that re-encoded our token still gets its window, while a
+    // value that is not a safe non-negative integer is the stale/foreign refusal.
+    for (spelling, wanted) in [("+5", 5_u64), ("1e2", 100), ("0x10", 16), ("", 0)] {
+        let token = base64url(&format!("{epoch}.{spelling}"));
+
+        assert_eq!(
+            paging::decode_cursor(epoch, Some(&token))
+                .unwrap_or_else(|error| panic!("{spelling} must decode: {}", error.message)),
+            wanted,
+            "{spelling}"
+        );
+    }
+
+    // Every refused spelling here is DOT-FREE on purpose: the token splits on the LAST dot
+    // (`api-paging.ts:71`), so `epoch.5.5` would already fail the epoch compare rather than the
+    // ordinal rule. These exercise the coercion itself.
+    for refused in ["-1", "abc", "1e400", "0x", "1_0", "+-5"] {
+        let token = base64url(&format!("{epoch}.{refused}"));
+        assert_eq!(
+            paging::decode_cursor(epoch, Some(&token))
+                .unwrap_err()
+                .message,
+            "Query parameter \"cursor\" is stale or foreign; restart from the first page.",
+            "{refused}"
+        );
+    }
+
+    // A coerced ordinal from a FOREIGN epoch is still the stale refusal (`:79`): the ordinal rule
+    // never overrides the epoch compare.
+    let foreign_ordinal = base64url("other-epoch.+3");
+    assert_eq!(
+        paging::decode_cursor(epoch, Some(&foreign_ordinal))
+            .unwrap_err()
+            .message,
+        "Query parameter \"cursor\" is stale or foreign; restart from the first page."
+    );
+
     // A cursor from another epoch (a restart, or another server) is a 400 with the exact text.
     let stale = paging::decode_cursor("other-epoch", Some(&cursor)).unwrap_err();
     assert_eq!(stale.status, 400);
@@ -461,17 +499,74 @@ fn paging_limit_names_the_parameter_on_every_refusal() {
     assert_eq!(paging::resolve_limit(Some("100")).unwrap(), 100);
     assert_eq!(paging::resolve_limit(Some(" 7 ")).unwrap(), 7);
 
-    // `?limit=` is ABSENT, not zero: the extractor is TS `paramOf` (`api.ts:482-488`), which
-    // trims and maps an empty value to `undefined`, and `resolveLimit(undefined)` is the
-    // contract default (`api-paging.ts:95`).
-    assert_eq!(paging::resolve_limit(Some("")).unwrap(), 25);
-    assert_eq!(paging::resolve_limit(Some("   ")).unwrap(), 25);
+    // T7b: TS coerces the raw query value with `Number()` (`api-paging.ts:101`), so every spelling
+    // that JS can read as an integer inside the bounds resolves - including a sign, a radix, an
+    // exponent and a trailing dot.
+    for (spelling, wanted) in [
+        ("+25", 25_u64),
+        ("25.0", 25),
+        ("25.", 25),
+        ("1e2", 100),
+        ("3e1", 30),
+        (".5e1", 5),
+        ("0x19", 25),
+        ("0o17", 15),
+        ("0b110", 6),
+    ] {
+        assert_eq!(
+            paging::resolve_limit(Some(spelling)).unwrap(),
+            wanted,
+            "{spelling}"
+        );
+    }
 
-    for refused in ["0", "101", "-1", "1.5", "abc", "1e3", "255"] {
+    // `?limit=` is NOT absent: the route passes the raw `URLSearchParams` value, `Number("")` is
+    // `0`, and 0 is below the bound (`api-paging.ts:95-103`). Only a MISSING parameter is the
+    // default.
+    for refused in [
+        "", "   ", "0", "101", "-1", "1.5", "abc", "1e3", "255", "0x", "0x1f.5", "1_000", "1e400",
+        "Infinity", "NaN", "12px",
+    ] {
         let error = paging::resolve_limit(Some(refused)).unwrap_err();
         assert_eq!(error.status, 400, "{refused}");
         assert_eq!(error.message, MESSAGE, "{refused}");
     }
+}
+
+/// 3d. T7b: every character figure TypeScript takes from `String.length` counts UTF-16 CODE UNITS
+/// (`turn-display.ts:412-416`, invariant 5). An astral character is TWO characters here, and a
+/// preview cut never splits a surrogate pair.
+#[test]
+fn character_figures_are_utf16_code_units() {
+    let astral = "a😀b";
+
+    assert_eq!(
+        projector::display_chars(astral),
+        4,
+        "one astral glyph is two UTF-16 units"
+    );
+    assert_eq!(
+        astral.chars().count(),
+        3,
+        "the scalar count is NOT the unit the contract states"
+    );
+
+    // `previewText` (`turn-projector.ts:150-156`) keeps `limit - 1` UNITS and appends one `…`, so a
+    // glyph straddling the cut is dropped whole rather than emitted as a lone surrogate.
+    let long = "😀".repeat(8);
+
+    assert_eq!(long.encode_utf16().count(), 16);
+    assert_eq!(store::read::prompt_preview(&long, 7), "😀😀😀…");
+    assert_eq!(
+        projector::display_chars(&store::read::prompt_preview(&long, 7)),
+        7,
+        "the preview is exactly the bound, in units"
+    );
+
+    // An already-short prompt travels verbatim, decided on the RAW unit length
+    // (`api-reads.ts:328-329`), and the flattening never runs on it.
+    assert_eq!(store::read::prompt_preview("😀😀😀", 7), "😀😀😀");
+    assert_eq!(store::read::prompt_preview("😀😀😀", 5), "😀😀…");
 }
 
 /// 3c. A page body echoes the EFFECTIVE page size and a null cursor at the end.

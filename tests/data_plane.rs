@@ -1011,6 +1011,7 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                     "research".to_string(),
                     "Cite every claim.".to_string(),
                 )])),
+                agent_colors: None,
             },
             &agents,
         )
@@ -1036,6 +1037,7 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                     subagents: None,
                     agent_models: None,
                     agent_instructions: None,
+                    agent_colors: None,
                 },
                 &agents,
             )
@@ -1056,6 +1058,7 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                     subagents: None,
                     agent_models: None,
                     agent_instructions: None,
+                    agent_colors: None,
                 },
                 &agents,
             )
@@ -1075,6 +1078,7 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                 subagents: None,
                 agent_models: None,
                 agent_instructions: None,
+                agent_colors: None,
             },
             &agents,
         )
@@ -1098,6 +1102,7 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                     subagents: None,
                     agent_models: None,
                     agent_instructions: None,
+                    agent_colors: None,
                 },
                 &agents,
             )
@@ -1121,6 +1126,7 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                         "m".to_string()
                     )])),
                     agent_instructions: None,
+                    agent_colors: None,
                 },
                 &agents,
             )
@@ -1160,6 +1166,7 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                 subagents: None,
                 agent_models: None,
                 agent_instructions: Some(std::collections::BTreeMap::new()),
+                agent_colors: None,
             },
             &agents,
         )
@@ -1190,6 +1197,7 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                         "planner".to_string(),
                         "x".to_string()
                     )])),
+                    agent_colors: None,
                 },
                 &agents,
             )
@@ -1213,6 +1221,7 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                         "research".to_string(),
                         "   ".to_string()
                     )])),
+                    agent_colors: None,
                 },
                 &agents,
             )
@@ -1233,6 +1242,7 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                     subagents: Some(vec!["research".to_string()]),
                     agent_models: None,
                     agent_instructions: None,
+                    agent_colors: None,
                 },
                 &agents,
             )
@@ -1251,6 +1261,7 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                     subagents: Some(vec!["reviewer".to_string(), "reviewer".to_string()]),
                     agent_models: None,
                     agent_instructions: None,
+                    agent_colors: None,
                 },
                 &agents,
             )
@@ -1320,6 +1331,7 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                 subagents: None,
                 agent_models: None,
                 agent_instructions: None,
+                agent_colors: None,
             },
             &agents,
         )
@@ -1338,6 +1350,367 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
     assert_eq!(
         clean_restart.referenced_by_agent("summarizer"),
         vec!["instruct", "research", "workspace", "reviewer", "planner"]
+    );
+}
+
+/// T7b: `agent_colors` is the THIRD map of the same shape (`harness-api.ts:454-510`,
+/// `registry.ts:564-629`), so it follows the same four rules as `agent_models` and
+/// `agent_instructions`: validated against the FINAL member set, trimmed, REPLACE-on-patch with `{}`
+/// as the explicit clear, and dropped for a member the patch removes. It is also durable metadata,
+/// projected onto the frozen descriptor a session records (`descriptor.ts:117-119`).
+#[test]
+fn the_agent_color_map_follows_the_same_rules_as_the_other_two() {
+    let agents = AgentCatalogue::builtin();
+    let mut registry = HarnessRegistry::shipped(&settings(), Vec::new());
+    let hub = EventHub::new();
+
+    let colors = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(agent, color)| ((*agent).to_string(), (*color).to_string()))
+            .collect()
+    };
+
+    let created = registry
+        .create(
+            contract::CreateHarnessRequest {
+                name: "painted".to_string(),
+                title: None,
+                description: None,
+                primary: "research".to_string(),
+                subagents: Some(vec!["reviewer".to_string()]),
+                agent_models: None,
+                agent_instructions: None,
+                // A padded value is stored trimmed (`registry.ts:577`), and every accepted shape
+                // is 3/4/6/8 hex digits (`registry.ts:164`).
+                agent_colors: Some(colors(&[("reviewer", " #0a86ff "), ("research", "#fff")])),
+            },
+            &agents,
+        )
+        .expect("a colored harness creates");
+
+    assert_eq!(
+        created.agent_colors,
+        colors(&[("research", "#fff"), ("reviewer", "#0a86ff")]),
+        "the map is validated and trimmed"
+    );
+
+    // The four hex-digit form is legal too, and the DEFINITION read emits the map only when it
+    // carries something (`api-reads.ts:1099-1106`).
+    let definition = created.definition(&hub, &agents);
+
+    assert_eq!(
+        definition.agent_colors,
+        Some(colors(&[("research", "#fff"), ("reviewer", "#0a86ff")]))
+    );
+
+    let uncolored = HarnessRegistry::shipped(&settings(), Vec::new())
+        .get("instruct")
+        .expect("shipped")
+        .definition(&hub, &agents);
+
+    assert_eq!(
+        uncolored.agent_colors, None,
+        "a shipped template carries no colors, so the read keeps its pre-R2 shape"
+    );
+
+    // An unknown member is refused with the membership sentence, and a bad value with the shape
+    // sentence - both naming the agent, both BEFORE anything is stored (`registry.ts:604-629`).
+    assert_eq!(
+        registry
+            .create(
+                contract::CreateHarnessRequest {
+                    name: "miscolored".to_string(),
+                    title: None,
+                    description: None,
+                    primary: "research".to_string(),
+                    subagents: None,
+                    agent_models: None,
+                    agent_instructions: None,
+                    agent_colors: Some(colors(&[("planner", "#fff")])),
+                },
+                &agents,
+            )
+            .unwrap_err()
+            .message,
+        "`agentColors` names \"planner\", which is not a member of this harness. Members: research."
+    );
+
+    for (value, message) in [
+        (
+            "reddish",
+            "`agentColors.research` must be a CSS hex color (#rgb, #rgba, #rrggbb or #rrggbbaa). Received \"reddish\".",
+        ),
+        (
+            "   ",
+            "`agentColors.research` cannot be empty. Omit the key to leave this agent uncolored.",
+        ),
+        (
+            "#ab",
+            "`agentColors.research` must be a CSS hex color (#rgb, #rgba, #rrggbb or #rrggbbaa). Received \"#ab\".",
+        ),
+        (
+            "#abcde",
+            "`agentColors.research` must be a CSS hex color (#rgb, #rgba, #rrggbb or #rrggbbaa). Received \"#abcde\".",
+        ),
+    ] {
+        let error = registry
+            .create(
+                contract::CreateHarnessRequest {
+                    name: "miscolored".to_string(),
+                    title: None,
+                    description: None,
+                    primary: "research".to_string(),
+                    subagents: None,
+                    agent_models: None,
+                    agent_instructions: None,
+                    agent_colors: Some(colors(&[("research", value)])),
+                },
+                &agents,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.status, 400, "`{value}` is refused");
+        assert_eq!(error.message, message, "`{value}` names the rule");
+    }
+
+    // A colors-only PATCH is EXECUTABLE, not prose (`registry.ts:1406-1416`), and it REPLACES the
+    // stored map.
+    let recolored = registry
+        .update(
+            "painted",
+            contract::UpdateHarnessRequest {
+                agent_colors: Some(colors(&[("research", "#000000")])),
+                ..contract::UpdateHarnessRequest::default()
+            },
+            &agents,
+        )
+        .expect("a colors-only patch is a change");
+
+    assert_eq!(
+        recolored.agent_colors,
+        colors(&[("research", "#000000")]),
+        "the stated map replaces the stored one"
+    );
+
+    // `{}` clears every color, and an omitted map keeps the current one while dropping any entry
+    // whose member the patch removed (`registry.ts:1377-1389`).
+    let cleared = registry
+        .update(
+            "painted",
+            contract::UpdateHarnessRequest {
+                agent_colors: Some(std::collections::BTreeMap::new()),
+                ..contract::UpdateHarnessRequest::default()
+            },
+            &agents,
+        )
+        .expect("the clear is a change");
+
+    assert!(
+        cleared.agent_colors.is_empty(),
+        "an explicit empty map clears every color"
+    );
+
+    let repainted = registry
+        .update(
+            "painted",
+            contract::UpdateHarnessRequest {
+                agent_colors: Some(colors(&[("research", "#111"), ("reviewer", "#222")])),
+                ..contract::UpdateHarnessRequest::default()
+            },
+            &agents,
+        )
+        .expect("repaint");
+
+    let narrowed = registry
+        .update(
+            "painted",
+            contract::UpdateHarnessRequest {
+                subagents: Some(Vec::new()),
+                ..contract::UpdateHarnessRequest::default()
+            },
+            &agents,
+        )
+        .expect("a team change without restating the colors");
+
+    assert_eq!(
+        narrowed.agent_colors,
+        colors(&[("research", "#111")]),
+        "a swatch for the removed member is dropped, not rejected (`registry.ts:1380-1384`)"
+    );
+    assert_eq!(
+        repainted.agent_colors.len(),
+        2,
+        "the entry the patch did not name keeps its map"
+    );
+
+    // Durable both ways: the preset row under `agentColors`, and the FROZEN descriptor a session
+    // persists inside its own record (`persistence.ts:131`, `protocol.ts:301`).
+    let row = created.to_record();
+
+    assert_eq!(
+        row.agent_colors,
+        Some(colors(&[("research", "#fff"), ("reviewer", "#0a86ff")])),
+        "the preset row carries the map under the document key"
+    );
+    assert_eq!(
+        HarnessRegistry::from_records(&settings(), vec![row.clone()], Vec::new(), &agents)
+            .expect("the saved row replays")
+            .get("painted")
+            .expect("replayed")
+            .agent_colors,
+        created.agent_colors,
+        "a replay rebuilds exactly the map that was saved"
+    );
+
+    let frozen = typecrate_harness::registry::descriptor_record_of(&created);
+
+    assert_eq!(
+        frozen.agent_colors,
+        Some(colors(&[("research", "#fff"), ("reviewer", "#0a86ff")])),
+        "the frozen descriptor carries the map, so a saved session paints the same swatches"
+    );
+    assert_eq!(
+        typecrate_harness::registry::definition_from_descriptor_record(&frozen).agent_colors,
+        created.agent_colors,
+        "and reading the frozen copy back loses nothing"
+    );
+
+    // An empty map is written as NO key at all, both on the row and on the descriptor.
+    assert_eq!(cleared.to_record().agent_colors, None);
+    assert_eq!(
+        typecrate_harness::registry::descriptor_record_of(&cleared).agent_colors,
+        None
+    );
+
+    // A saved built-in row that carries a color is NOT an unmodified shipped default, so the
+    // prose-only refresh must not replace it (`registry.ts:979-982`). The record is rebuilt from the
+    // LEGACY entry so the only difference under test is the color map.
+    let legacy = presets::legacy_preset_definitions()
+        .get("instruct")
+        .expect("a legacy row")
+        .clone();
+    let mut saved_builtin = persistence::HarnessPresetRecord {
+        name: "instruct".to_string(),
+        title: legacy.title.clone(),
+        description: legacy.description.clone(),
+        requires_endpoint: legacy.requires_endpoint,
+        primary: legacy.primary.clone(),
+        subagents: legacy.subagents.clone(),
+        agents: legacy.agents.clone(),
+        tools: legacy.tools.clone(),
+        environment_tools: Some(legacy.environment_tools.clone()),
+        agent_models: None,
+        agent_instructions: None,
+        agent_colors: None,
+        builtin: true,
+        editable: true,
+        template: Some(legacy.template.clone()),
+        live: None,
+        extra: serde_json::Map::new(),
+    };
+
+    assert!(
+        typecrate_harness::registry::is_legacy_shipped_definition(&legacy, &saved_builtin),
+        "an untouched row of the shipped defaults is refreshable"
+    );
+
+    saved_builtin.agent_colors = Some(colors(&[("instruct", "#ff0000")]));
+
+    assert!(
+        !typecrate_harness::registry::is_legacy_shipped_definition(&legacy, &saved_builtin),
+        "a colored built-in row is an operator decision, not a default"
+    );
+}
+
+/// T7b: every harness TEXT bound is TypeScript's `.length`, i.e. UTF-16 code units
+/// (`registry.ts:323-336`, `:432`, `:512`). A scalar count would let 4001 astral glyphs - 8002
+/// units - into a bound the TypeScript server refuses at 8000.
+#[test]
+fn the_harness_text_bounds_are_measured_in_utf16_units() {
+    let agents = AgentCatalogue::builtin();
+    let mut registry = HarnessRegistry::shipped(&settings(), Vec::new());
+
+    let mut attempt = |name: &str, instruction: String| {
+        registry.create(
+            contract::CreateHarnessRequest {
+                name: name.to_string(),
+                title: None,
+                description: None,
+                primary: "research".to_string(),
+                subagents: None,
+                agent_models: None,
+                agent_instructions: Some(std::collections::BTreeMap::from([(
+                    "research".to_string(),
+                    instruction,
+                )])),
+                agent_colors: None,
+            },
+            &agents,
+        )
+    };
+
+    // 4000 astral glyphs are exactly 8000 units: inside the bound (`registry.ts:149`).
+    assert!(
+        attempt("astral-inside", "😀".repeat(4_000)).is_ok(),
+        "8000 units is the bound, not a refusal"
+    );
+
+    let over = attempt("astral-over", "😀".repeat(4_001)).unwrap_err();
+
+    assert_eq!(over.status, 400);
+    assert_eq!(
+        over.message,
+        "`agentInstructions.research` cannot exceed 8000 characters."
+    );
+
+    // The same rule on the title (120) and the description (2000) bounds.
+    let mut wide = HarnessRegistry::shipped(&settings(), Vec::new());
+
+    assert_eq!(
+        wide.update(
+            "instruct",
+            contract::UpdateHarnessRequest {
+                title: Some("😀".repeat(61)),
+                ..contract::UpdateHarnessRequest::default()
+            },
+            &agents,
+        )
+        .unwrap_err()
+        .message,
+        "`title` cannot exceed 120 characters."
+    );
+
+    assert_eq!(
+        wide.update(
+            "instruct",
+            contract::UpdateHarnessRequest {
+                description: Some("😀".repeat(1_001)),
+                ..contract::UpdateHarnessRequest::default()
+            },
+            &agents,
+        )
+        .unwrap_err()
+        .message,
+        "`description` cannot exceed 2000 characters."
+    );
+
+    // And on a per-agent model id (200 units, `registry.ts:432`).
+    assert_eq!(
+        wide.update(
+            "instruct",
+            contract::UpdateHarnessRequest {
+                agent_models: Some(std::collections::BTreeMap::from([(
+                    "instruct".to_string(),
+                    "😀".repeat(101),
+                )])),
+                ..contract::UpdateHarnessRequest::default()
+            },
+            &agents,
+        )
+        .unwrap_err()
+        .message,
+        "`agentModels.instruct` cannot exceed 200 characters."
     );
 }
 
@@ -1629,6 +2002,7 @@ fn catalogue_ships_six_profiles_and_replays_operator_edits() {
                 subagents: Some(vec!["summarizer".to_string()]),
                 agent_models: None,
                 agent_instructions: None,
+                agent_colors: None,
             },
             &replayed,
         )
@@ -1650,6 +2024,7 @@ fn catalogue_ships_six_profiles_and_replays_operator_edits() {
                 subagents: None,
                 agent_models: None,
                 agent_instructions: None,
+                agent_colors: None,
             },
             &replayed,
         )
@@ -1740,6 +2115,7 @@ fn instruction_resolution_follows_harness_global_then_catalogue() {
                     "instruct".to_string(),
                     "Harness-specific prompt.".to_string(),
                 )])),
+                agent_colors: None,
             },
             &catalogue,
         )
@@ -1786,6 +2162,7 @@ fn instruction_resolution_follows_harness_global_then_catalogue() {
                 subagents: None,
                 agent_models: None,
                 agent_instructions: Some(std::collections::BTreeMap::new()),
+                agent_colors: None,
             },
             &catalogue,
         )

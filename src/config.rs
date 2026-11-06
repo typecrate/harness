@@ -40,6 +40,11 @@ pub const DEFAULT_MODEL: &str = "merge/ds4-flash";
 /// How a session's logical threads get CPU (`config.ts:42`, `:113`). `worker` is a promise, not
 /// a hint: a session whose harness cannot be rebuilt from durable data is REJECTED rather than
 /// quietly executed inline.
+///
+/// THIS BUILD PARSES `worker` AND REFUSES IT. The loader ports TS verbatim and also backs
+/// `GET /config`, which must keep reporting what the deployment asked for; the support statement
+/// lives in `runtime::validate_supported_execution` / `runtime::SUPPORTED_EXECUTION_MODE`, which
+/// refuses to construct a runtime on anything but `inline` (`knowledge.md` "T9").
 pub const DEFAULT_THREAD_EXECUTION: &str = "inline";
 /// How the durable writes get their CPU (`config.ts:60`, `:119`). Independent of
 /// `thread_execution`: one lane worker isolates a turn's CPU, this one isolates the
@@ -48,7 +53,9 @@ pub const DEFAULT_THREAD_EXECUTION: &str = "inline";
 /// TS accepts exactly `inline` | `worker` (`parseIoExecutionMode` REUSES
 /// `parseThreadExecutionMode`, `config.ts:249-250`); there is no `off` spelling.
 pub const DEFAULT_IO_EXECUTION: &str = "inline";
-/// The two accepted spellings for both execution knobs (`config.ts:237`).
+/// The two accepted SPELLINGS for both execution knobs (`config.ts:237`). Accepted by the parser is
+/// not the same as provided by this build: `runtime::SUPPORTED_EXECUTION_MODE` is `inline`, and the
+/// runtime-support gate refuses every other value (`knowledge.md` "T9").
 pub const EXECUTION_MODES: [&str; 2] = ["inline", "worker"];
 
 /// Reclaim a lane worker after this much idle time; 0 keeps it alive until the session goes
@@ -142,6 +149,32 @@ impl ServerConfig {
             base_url: self.base_url.clone(),
             api_key: self.api_key.clone(),
             model: self.model.clone(),
+        }
+    }
+}
+
+/// The configuration of a process with an EMPTY environment: `config.ts:119-133`'s defaults, which is
+/// byte-for-byte what `load_server_config(&{})` produces without validating anything.
+///
+/// A host that owns only the provider trio — a bare `Store::open`, a test, an embedder — takes every
+/// runtime knob from here, so `runtime_execution` never depends on an environment read happening
+/// inside a request (`knowledge.md` T3's "runtime_snapshot" simplification, now a named default).
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            base_url: DEFAULT_BASE_URL.to_owned(),
+            api_key: String::new(),
+            model: DEFAULT_MODEL.to_owned(),
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+            request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
+            thread_execution: DEFAULT_THREAD_EXECUTION.to_owned(),
+            io_execution: DEFAULT_IO_EXECUTION.to_owned(),
+            worker_idle_ms: DEFAULT_WORKER_IDLE_MS,
+            max_lane_workers: DEFAULT_MAX_LANE_WORKERS,
+            worker_handshake_ms: DEFAULT_WORKER_HANDSHAKE_MS,
+            worker_entry: None,
+            io_worker_entry: None,
         }
     }
 }
@@ -304,7 +337,8 @@ fn validate_provider(base_url: &str, model: &str, issues: &mut Vec<String>) {
             _ => {}
         }
 
-        if base_url.chars().count() > MAX_BASE_URL_LENGTH {
+        // The bound is TypeScript's `.length`, i.e. UTF-16 code units, not scalar characters.
+        if base_url.encode_utf16().count() > MAX_BASE_URL_LENGTH {
             issues.push(format!(
                 "A provider base URL cannot exceed {MAX_BASE_URL_LENGTH} characters."
             ));
@@ -315,7 +349,8 @@ fn validate_provider(base_url: &str, model: &str, issues: &mut Vec<String>) {
         issues.push("A model name cannot be empty.".to_string());
     }
 
-    if model.chars().count() > MAX_MODEL_LENGTH {
+    // The bound is TypeScript's `.length`, i.e. UTF-16 code units, not scalar characters.
+    if model.encode_utf16().count() > MAX_MODEL_LENGTH {
         issues.push(format!(
             "A model name cannot exceed {MAX_MODEL_LENGTH} characters."
         ));
@@ -505,13 +540,15 @@ pub fn merge_settings(
         _ => defaults.model.clone(),
     };
 
-    if base_url.chars().count() > MAX_BASE_URL_LENGTH {
+    // The bound is TypeScript's `.length`, i.e. UTF-16 code units, not scalar characters.
+    if base_url.encode_utf16().count() > MAX_BASE_URL_LENGTH {
         return Err(ApiError::bad_request(format!(
             "A provider base URL cannot exceed {MAX_BASE_URL_LENGTH} characters."
         )));
     }
 
-    if model.chars().count() > MAX_MODEL_LENGTH {
+    // The bound is TypeScript's `.length`, i.e. UTF-16 code units, not scalar characters.
+    if model.encode_utf16().count() > MAX_MODEL_LENGTH {
         return Err(ApiError::bad_request(format!(
             "A model name cannot exceed {MAX_MODEL_LENGTH} characters."
         )));
@@ -612,13 +649,15 @@ pub fn apply_settings_patch(
 
     // Bounds and the non-empty rule, ALL before the commit (`api.ts:1410-1422`). The caps measure
     // the TRIMMED value, because that is the string the provider request later sends.
-    if next_base_url.chars().count() > MAX_BASE_URL_LENGTH {
+    // The bound is TypeScript's `.length`, i.e. UTF-16 code units, not scalar characters.
+    if next_base_url.encode_utf16().count() > MAX_BASE_URL_LENGTH {
         return Err(ApiError::bad_request(format!(
             "A provider base URL cannot exceed {MAX_BASE_URL_LENGTH} characters."
         )));
     }
 
-    if next_model.chars().count() > MAX_MODEL_LENGTH {
+    // The bound is TypeScript's `.length`, i.e. UTF-16 code units, not scalar characters.
+    if next_model.encode_utf16().count() > MAX_MODEL_LENGTH {
         return Err(ApiError::bad_request(format!(
             "A model name cannot exceed {MAX_MODEL_LENGTH} characters."
         )));

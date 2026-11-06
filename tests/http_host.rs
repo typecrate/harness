@@ -983,7 +983,16 @@ async fn the_definition_catalogue_is_listed_read_and_described() {
     let page = Reply::send(client().get(server.url("/v1/harness/harnesses"))).await;
 
     assert_eq!(page.status, StatusCode::OK);
-    assert_contract_headers(&page, Some(0));
+    // T7b: `GET /harnesses` is the ONE page route that stamps no `X-Harness-Revision`. TS calls
+    // `json(200, pageMeta(...))` with two arguments (`api.ts:1503-1509`), so the collection
+    // revision lives only in the page BODY - while every other page route passes the third
+    // argument (`/tools` at `api.ts:1842`, `/agents` at `:1696-1704`).
+    assert_contract_headers(&page, None);
+    assert!(
+        page.header(&REVISION_HEADER).is_none(),
+        "the harness list carries no revision header (`api.ts:1503-1509`)"
+    );
+    assert_eq!(page.body["revision"], 0, "the figure still rides the body");
     assert_eq!(
         Root::page_names(&page.body),
         SHIPPED_HARNESSES,
@@ -992,7 +1001,6 @@ async fn the_definition_catalogue_is_listed_read_and_described() {
     // Five rows on one page, and `limit` echoes the EFFECTIVE size (`api-paging.ts:142-153`).
     assert_eq!(page.body["limit"], 5);
     assert_eq!(page.body["next_cursor"], Value::Null);
-    assert_eq!(page.body["revision"], 0);
     assert!(page.body["observed_at"].is_u64());
 
     // The filter is a case-insensitive substring over `name title description` joined with single
@@ -1173,6 +1181,10 @@ async fn a_harness_write_round_trips_persists_and_deletes() {
                 "subagents": ["research"],
                 "agent_models": { "research": "provider/model-y" },
                 "agent_instructions": { "research": "Suite-specific prose." },
+                // T7b: the third map of the same shape (`api.ts:1523`, `harness-api.ts:484`). The
+                // padded value is stored TRIMMED (`registry.ts:577`), and `#abc` is a legal 3-digit
+                // hex color (`registry.ts:164`).
+                "agent_colors": { "research": "  #0A86FF  ", "planner": "#abc" },
             })),
     )
     .await;
@@ -1191,7 +1203,38 @@ async fn a_harness_write_round_trips_persists_and_deletes() {
         created.body["harness"]["agent_models"],
         json!({ "research": "provider/model-y" })
     );
+    assert_eq!(
+        created.body["harness"]["agent_colors"],
+        json!({ "planner": "#abc", "research": "#0A86FF" }),
+        "the color map round-trips through the definition read, trimmed"
+    );
     assert_eq!(created.body["harness"]["definition_revision"], 1);
+
+    // A CARD never carries the maps: `harnessCardOf` (`api-reads.ts:1070-1081`) emits identity,
+    // membership and tools only, so the colors live on the identified read alone.
+    let card = Reply::send(client().get(server.url("/v1/harness/harnesses/t5a-suite"))).await;
+
+    assert_eq!(card.status, StatusCode::OK);
+    assert_eq!(
+        card.body["harness"].get("agent_colors"),
+        created.body["harness"].get("agent_colors"),
+        "the identified read answers the same map"
+    );
+    let listed = Reply::send(client().get(server.url("/v1/harness/harnesses?limit=100"))).await;
+    let listed_row = listed.body["items"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .find(|row| row["name"] == "t5a-suite")
+        .cloned()
+        .expect("the created card is listed");
+
+    assert!(
+        listed_row.get("agent_colors").is_none()
+            && listed_row.get("agent_models").is_none()
+            && listed_row.get("instruction_summary").is_none(),
+        "a card omits every map (`api-reads.ts:1070-1081`): {listed_row}"
+    );
 
     // The duplicate refusal is the registry's, and it is a CONFLICT (`api.ts:1534-1535`).
     let duplicate = Reply::send(
@@ -1234,7 +1277,29 @@ async fn a_harness_write_round_trips_persists_and_deletes() {
         ),
         (
             json!({ "name": "x", "primary": "planner", "color": "red" }),
-            "Unknown field \"color\". Allowed fields: name, title, description, primary, subagents, agent_models, agent_instructions.",
+            // T7b: `agent_colors` joined the accepted set (`api.ts:1523`), so the sentence the
+            // unknown key names lists eight fields, not seven.
+            "Unknown field \"color\". Allowed fields: name, title, description, primary, subagents, agent_models, agent_instructions, agent_colors.",
+        ),
+        (
+            json!({"name": "t5a-color", "primary": "planner", "agent_colors": {"ghost": "#fff"}}),
+            "`agentColors` names \"ghost\", which is not a member of this harness. Members: planner.",
+        ),
+        (
+            json!({"name": "t5a-color", "primary": "planner", "agent_colors": {"planner": "reddish"}}),
+            "`agentColors.planner` must be a CSS hex color (#rgb, #rgba, #rrggbb or #rrggbbaa). Received \"reddish\".",
+        ),
+        (
+            json!({"name": "t5a-color", "primary": "planner", "agent_colors": {"planner": "   "}}),
+            "`agentColors.planner` cannot be empty. Omit the key to leave this agent uncolored.",
+        ),
+        (
+            json!({"name": "t5a-color", "primary": "planner", "agent_colors": {"planner": "#ab"}}),
+            "`agentColors.planner` must be a CSS hex color (#rgb, #rgba, #rrggbb or #rrggbbaa). Received \"#ab\".",
+        ),
+        (
+            json!({"name": "t5a-color", "primary": "planner", "agent_colors": {"planner": "0xff0000"}}),
+            "`agentColors.planner` must be a CSS hex color (#rgb, #rgba, #rrggbb or #rrggbbaa). Received \"0xff0000\".",
         ),
         (json!([]), "The request body must be a JSON object."),
     ] {
@@ -1261,6 +1326,63 @@ async fn a_harness_write_round_trips_persists_and_deletes() {
     assert_contract_headers(&patched, Some(2));
     assert_eq!(patched.body["harness"]["title"], "Renamed Suite");
     assert_eq!(patched.body["harness"]["definition_revision"], 2);
+
+    // T7b: `agent_colors` REPLACES the map it names (`harness-api.ts:491`, `registry.ts:1386-1389`)
+    // - an omitted key of the old map is dropped, not merged - and a colors-only patch IS a change
+    // (`registry.ts:1406-1416`), so it moves the same two counters as a team edit.
+    let recolored = Reply::send(
+        client()
+            .patch(server.url("/v1/harness/harnesses/t5a-suite"))
+            .json(&json!({ "agent_colors": { "planner": "#000000" } })),
+    )
+    .await;
+
+    assert_eq!(
+        recolored.status,
+        StatusCode::OK,
+        "a colors-only patch is a change: {}",
+        recolored.body
+    );
+    assert_contract_headers(&recolored, Some(3));
+    assert_eq!(
+        recolored.body["harness"]["agent_colors"],
+        json!({ "planner": "#000000" }),
+        "the stated map replaces the stored one"
+    );
+    assert_eq!(
+        recolored.body["harness"]["agent_models"],
+        json!({ "research": "provider/model-y" }),
+        "replacing the colors leaves the other two maps alone"
+    );
+
+    // `{}` is the explicit clear, and an empty map is emitted as NO key at all
+    // (`api-reads.ts:1104-1106`), so the definition read keeps its pre-R2 shape.
+    let cleared = Reply::send(
+        client()
+            .patch(server.url("/v1/harness/harnesses/t5a-suite"))
+            .json(&json!({ "agent_colors": {} })),
+    )
+    .await;
+
+    assert_eq!(cleared.status, StatusCode::OK);
+    assert_contract_headers(&cleared, Some(4));
+    assert!(
+        cleared.body["harness"].get("agent_colors").is_none(),
+        "a cleared map is absent, not an empty object: {}",
+        cleared.body["harness"]
+    );
+
+    // The durable row states the map under its camelCase document key (`persistence.ts:131`), and
+    // a membership change drops a removed member's swatch - the drop rule itself is pinned in
+    // `tests/data_plane.rs`, where it cannot disturb this row's other assertions.
+    let repainted = Reply::send(
+        client()
+            .patch(server.url("/v1/harness/harnesses/t5a-suite"))
+            .json(&json!({ "agent_colors": { "planner": "#ff0000" } })),
+    )
+    .await;
+
+    assert_eq!(repainted.status, StatusCode::OK);
 
     let empty_patch = Reply::send(
         client()
@@ -1307,6 +1429,9 @@ async fn a_harness_write_round_trips_persists_and_deletes() {
         .expect("the created row is durable");
 
     assert_eq!(saved["title"], "Renamed Suite");
+    // T7b: the color map is durable metadata, written under the document's camelCase key
+    // (`persistence.ts:131`, `registry.ts:616-639`).
+    assert_eq!(saved["agentColors"], json!({ "planner": "#ff0000" }));
     assert_eq!(saved["builtin"], false);
     assert_eq!(saved["editable"], true);
     assert_eq!(saved["primary"], "planner");
@@ -1677,9 +1802,28 @@ async fn the_tool_read_carries_the_catalogue_the_filters_and_the_gate() {
 
     assert_eq!(
         summaries.len(),
-        35,
-        "the generated catalogue (`tools/catalogue.rs`)"
+        31,
+        "the LISTED catalogue: 35 generated rows minus the four `listed: false` runtime rows \
+         (`tool-manifest.ts:1002, 1046, 1692, 1811`)"
     );
+
+    // T7b: the four unlisted rows are absent from the page and from the identified read, exactly
+    // as `tools/descriptors.ts:290-328` withholds them from `RUNTIME_DESCRIPTORS`.
+    for withheld in ["toolCancel", "threadSend", "threadRead", "threadList"] {
+        assert!(
+            !summaries.iter().any(|row| row.name == withheld),
+            "{withheld} is `listed: false`"
+        );
+
+        let missing =
+            Reply::send(client().get(server.url(&format!("/v1/harness/tools/{withheld}")))).await;
+
+        assert_eq!(
+            missing.status,
+            StatusCode::NOT_FOUND,
+            "`GET /tools/{withheld}` is unknown, as `api.ts:1847` resolves it"
+        );
+    }
 
     let page = Reply::send(client().get(server.url("/v1/harness/tools?limit=100"))).await;
 
@@ -1690,10 +1834,10 @@ async fn the_tool_read_carries_the_catalogue_the_filters_and_the_gate() {
         serde_json::to_value(&summaries).expect("rows serialize"),
         "`GET /tools` is the deployment catalogue, in catalogue order and unsorted"
     );
-    assert_eq!(page.body["limit"], 35);
+    assert_eq!(page.body["limit"], 31);
     assert_eq!(page.body["next_cursor"], Value::Null);
 
-    // The default page is 25 of 35 rows, so it must advertise the next one.
+    // The default page is 25 of 31 rows, so it must advertise the next one.
     let first = Reply::send(client().get(server.url("/v1/harness/tools"))).await;
 
     assert_eq!(first.body["limit"], 25);
@@ -1716,7 +1860,7 @@ async fn the_tool_read_carries_the_catalogue_the_filters_and_the_gate() {
             .map(|row| row.name.clone())
             .collect::<Vec<_>>()
     );
-    assert_eq!(second.body["limit"], 10);
+    assert_eq!(second.body["limit"], 6);
     assert_eq!(
         second.body["next_cursor"],
         Value::Null,
@@ -2631,7 +2775,12 @@ async fn the_paging_parameters_are_strict_and_the_limit_echoes_the_page() {
         ("limit=-1".to_owned(), LIMIT_MESSAGE),
         ("limit=abc".to_owned(), LIMIT_MESSAGE),
         ("limit=1.5".to_owned(), LIMIT_MESSAGE),
-        ("limit=1e2".to_owned(), LIMIT_MESSAGE),
+        // T7b: `?limit=` is NOT absent. The route passes the raw `URLSearchParams` value
+        // (`api.ts:1489`), `Number("")` is `0`, and 0 is below the bound (`api-paging.ts:95-103`).
+        ("limit=".to_owned(), LIMIT_MESSAGE),
+        // A value `Number()` cannot coerce to a safe integer is the same refusal.
+        ("limit=1e400".to_owned(), LIMIT_MESSAGE),
+        ("limit=1_000".to_owned(), LIMIT_MESSAGE),
         (
             "cursor=%21%21%21".to_owned(),
             "Query parameter \"cursor\" is not a cursor this server issued.",
@@ -2668,18 +2817,32 @@ async fn the_paging_parameters_are_strict_and_the_limit_echoes_the_page() {
         assert_eq!(reply.message(), message, "`{query}` names the rule");
     }
 
-    // `?limit=` is ABSENT, not zero: `paramOf` trims and maps an empty value to `undefined` before
-    // `resolveLimit` sees it (`api.ts:482-488`, `api-paging.ts:95`).
-    let empty_limit = Reply::send(client().get(server.url("/v1/harness/harnesses?limit="))).await;
+    // T7b: every spelling `Number()` can coerce into the bounds is ACCEPTED (`api-paging.ts:101`),
+    // which is the part the earlier digit parser refused: a sign, a trailing dot, an exponent, a
+    // radix, and surrounding whitespace.
+    for query in [
+        "limit=+5",
+        "limit=5.0",
+        "limit=5.",
+        "limit=0x5",
+        "limit=0b101",
+        "limit=0o5",
+        "limit=1e1",
+        "limit=5e0",
+        "limit=%205%20",
+    ] {
+        let reply =
+            Reply::send(client().get(server.url(&format!("/v1/harness/harnesses?{query}")))).await;
 
-    assert_eq!(empty_limit.status, StatusCode::OK);
-    assert_eq!(
-        empty_limit.body["limit"], 5,
-        "the contract default of 25 covers all five rows"
-    );
+        assert_eq!(reply.status, StatusCode::OK, "`{query}` resolves");
+        assert_eq!(
+            reply.body["limit"], 5,
+            "`{query}` is a page of five, the whole collection"
+        );
+    }
 
-    // The page walk: `limit` echoes the EFFECTIVE size, and a known total ENDS an exactly-full
-    // final page instead of pointing at an empty one (`api-paging.ts:124-139`).
+    // The default page walk: `limit` echoes the EFFECTIVE size, and a known total ENDS an
+    // exactly-full final page instead of pointing at an empty one (`api-paging.ts:124-139`).
     let first = Reply::send(client().get(server.url("/v1/harness/harnesses?limit=2"))).await;
 
     assert_eq!(first.body["limit"], 2);

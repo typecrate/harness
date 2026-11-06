@@ -182,6 +182,10 @@ pub struct HarnessPresetRecord {
     pub agent_models: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_instructions: Option<BTreeMap<String, String>>,
+    /// R2's third map (`persistence.ts:131`): agent id -> CSS hex color, written only when the
+    /// entry carries one, and read back with the same absent-means-empty rule (`registry.ts:793`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_colors: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub builtin: bool,
     #[serde(default)]
@@ -303,6 +307,11 @@ pub struct HarnessDescriptorRecord {
     pub agent_models: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_instructions: Option<BTreeMap<String, String>>,
+    /// R2's third map (`persistence.ts:538-540`, `protocol.ts:301`): agent id -> CSS hex color.
+    /// Stored only when the card carries one, so a session frozen before colors existed restores
+    /// with no key at all (`descriptor.ts:117-119`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_colors: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub builtin: bool,
     #[serde(default)]

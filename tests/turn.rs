@@ -258,6 +258,11 @@ impl ToolRuntime for ScriptedRuntime {
         vec![]
     }
 
+    /// The scripted runtime has no catalogue rows at all, listed or otherwise.
+    fn catalogue_summaries(&self) -> Vec<ToolSummary> {
+        vec![]
+    }
+
     fn detail(&self, _name: &str) -> Option<ToolDetail> {
         None
     }
@@ -359,6 +364,9 @@ fn input(
             api_key: Some("secret-key".to_owned()),
             model: "model-of-the-hour".to_owned(),
             headers: BTreeMap::new(),
+            // The scripted provider states no sampling, so the request body is the plain
+            // `{model, stream, messages, tools?}` document.
+            sampling: None,
         },
         attachments: vec![],
         signal,
@@ -544,6 +552,7 @@ async fn a_text_answer_streams_then_done_with_no_commit_boundary() {
                 },
             ],
             stop_reason: Some("stop".to_owned()),
+            unused_steering: Vec::new(),
         },
         "the transcript the store keeps is the conversation, never the instruction"
     );
@@ -862,6 +871,9 @@ async fn a_cancelled_run_reports_no_error_and_keeps_the_original_transcript() {
             cancelled: true,
             messages: case.transcript.clone(),
             stop_reason: None,
+            // Nothing was drained, so nothing is owed back; a run that DID drain steering before an
+            // abort reports it here and the store discards it (a stop drops the guidance).
+            unused_steering: Vec::new(),
         },
         "cancellation is a control outcome: the conversation stays exactly as it was"
     );

@@ -105,9 +105,11 @@ impl Store {
     #[must_use]
     pub fn tools_for(&self, state: &SessionState) -> Vec<String> {
         let definition = self.definition_of(state);
+        // The FULL catalogue, not the listed page: this is the live-registry join TS reads
+        // (`api-reads.ts:831-836`), and that registry holds the `listed: false` capability rows.
         let registry: Vec<String> = self
             .runtime
-            .summaries()
+            .catalogue_summaries()
             .into_iter()
             .map(|summary| summary.name.clone())
             .collect();
@@ -181,8 +183,9 @@ impl Store {
 
         let mut rows: Vec<SessionToolSummary> = Vec::new();
 
-        // Catalogue rows, in catalogue order (`api-reads.ts:830-860`).
-        for summary in self.runtime.summaries() {
+        // Catalogue rows, in catalogue order (`api-reads.ts:830-860`). Every row, including the
+        // four the GLOBAL page withholds - a session's live registry holds them.
+        for summary in self.runtime.catalogue_summaries() {
             let is_declared =
                 declared_names.contains(&summary.name) || core_names.contains(&summary.name);
             let is_enabled = enabled.contains(&summary.name);
@@ -342,10 +345,15 @@ impl Store {
         validate_tool_name(state, store, name)?;
         let description = input.description.trim();
         if description.is_empty() {
-            return Err(ApiError::bad_request("A tool needs a description."));
+            // The kernel's sentence for a blank description (`creation.ts:128-130`): the route
+            // owns the ABSENT case with its own wording, and a present-but-blank one reaches here.
+            return Err(ApiError::bad_request(format!(
+                "Tool \"{name}\" requires a description."
+            )));
         }
         // Tags are REQUIRED because an untagged tool could never be discovered
-        // (`harness-api.ts:1082`).
+        // (`harness-api.ts:1082`); a blank/whitespace-only list is the kernel's refusal
+        // (`creation.ts:138-140`).
         let tags: Vec<String> = input
             .tags
             .iter()
@@ -353,18 +361,19 @@ impl Store {
             .filter(|tag| !tag.is_empty())
             .collect();
         if tags.is_empty() {
-            return Err(ApiError::bad_request(
-                "A created tool needs at least one tag.",
-            ));
+            return Err(ApiError::bad_request(format!(
+                "Tool \"{name}\" requires at least one tag, so toolRequest can find it."
+            )));
         }
 
         let existing = state.created_tools.get(name);
+        // A name this session already holds is a REPLACEMENT, not a collision (`api.ts:3064-3095`,
+        // `harness.ts:1189-1191`: "names are not reserved, 'already registered' is not an error,
+        // and replacing an implementation does not consume the new-tool budget"). TypeScript's
+        // create path therefore answers 201 with `created: false, replaced: true` plus the previous
+        // revision, and `replace` never reaches it as a flag - the POST route refuses that spelling
+        // as a capability (`api.ts:3163-3168`), which is what the handler does before calling here.
         let replacing = existing.is_some();
-        if replacing && !input.replace.unwrap_or(false) {
-            return Err(ApiError::conflict(format!(
-                "Tool \"{name}\" is already installed in this session. Send \"replace: true\" to replace it."
-            )));
-        }
         if !replacing && state.created_tools.len() >= MAX_CREATED_TOOLS {
             return Err(ApiError::conflict(format!(
                 "This session can create at most {MAX_CREATED_TOOLS} tools. Remove one first."
@@ -412,14 +421,11 @@ impl Store {
             replaced: replacing,
             previous_revision,
             source_path,
-            // The checks a Rust build can honestly state: the name is free or replaceable, the
-            // description and tags are present, and the declaration compiles.
-            checks: Some(vec![
-                "name:free".into(),
-                "description:present".into(),
-                "tags:present".into(),
-                "declaration:ok".into(),
-            ]),
+            // No `checks` (`api.ts:3122`: the field is emitted only when the registration produced
+            // results). This port registers a declaration without compiling a body, so there is no
+            // kernel check to report - an empty list would print as absent anyway, and stating one
+            // would invent results this build never ran.
+            checks: None,
             budget: read::budget_of(state.created_tools.len()),
         })
     }
@@ -449,7 +455,10 @@ impl Store {
         if let Some(description) = input.description.as_deref() {
             let description = description.trim();
             if description.is_empty() {
-                return Err(ApiError::bad_request("A tool needs a description."));
+                // The kernel's sentence, same as the create path (`creation.ts:128-130`).
+                return Err(ApiError::bad_request(format!(
+                    "Tool \"{name}\" requires a description."
+                )));
             }
             next.description = description.to_owned();
             changed = true;
@@ -461,7 +470,9 @@ impl Store {
                 .filter(|tag| !tag.is_empty())
                 .collect();
             if tags.is_empty() {
-                return Err(ApiError::bad_request("A tool needs at least one tag."));
+                return Err(ApiError::bad_request(format!(
+                    "Tool \"{name}\" requires at least one tag, so toolRequest can find it."
+                )));
             }
             next.tags = tags;
             changed = true;
@@ -541,11 +552,9 @@ impl Store {
                 .created_tools
                 .get(name)
                 .and_then(|stored| stored.source_path.clone()),
-            checks: Some(vec![
-                "description:present".into(),
-                "tags:present".into(),
-                "declaration:ok".into(),
-            ]),
+            // Same rule as the create: no compiled revision, so no kernel check results
+            // (`api.ts:3122`).
+            checks: None,
             budget: read::budget_of(state.created_tools.len()),
         })
     }
@@ -670,10 +679,11 @@ fn validate_tool_name(state: &SessionState, store: &Store, name: &str) -> Harnes
         )));
     }
     // The catalogue is the authority on "already a tool": a created name must not shadow a catalogue
-    // entry, because the toolbox rows would then state one name twice.
+    // entry, because the toolbox rows would then state one name twice. The FULL table, listed or
+    // not - an unlisted capability row is still a name the toolbox already owns.
     if store
         .runtime()
-        .summaries()
+        .catalogue_summaries()
         .iter()
         .any(|summary| summary.name == name)
     {

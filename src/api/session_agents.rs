@@ -48,7 +48,7 @@ const INSTRUCTION_FIELDS: [&str; 1] = ["instruction"];
 /// `json(200, response)` with no revision header: the list body carries `revision` itself
 /// (`:2464`), so a header would be a second copy of one number.
 pub async fn get_session_agents(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
 
@@ -62,7 +62,7 @@ pub async fn get_session_agents(ctx: &mut Ctx) -> ApiResult {
 /// The header quotes the BINDING's own figure (`binding.revision`, `:2481`), which is the
 /// `session_agents` counter of this session - one counter for the whole roster, by contract.
 pub async fn get_session_agent(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
     let agent_id = ctx.param("agent_id").to_owned();
@@ -105,12 +105,12 @@ pub async fn post_session_agent(ctx: &mut Ctx) -> ApiResult {
     }
 
     // The role vocabulary is closed (`:2617-2619`).
-    if let Some(role) = body.get("role").filter(|role| !role.is_null()) {
-        if !matches!(role.as_str(), Some("primary") | Some("subagent")) {
-            return Err(ApiError::bad_request(
-                "\"role\" must be \"primary\" or \"subagent\".",
-            ));
-        }
+    if let Some(role) = body.get("role").filter(|role| !role.is_null())
+        && !matches!(role.as_str(), Some("primary") | Some("subagent"))
+    {
+        return Err(ApiError::bad_request(
+            "\"role\" must be \"primary\" or \"subagent\".",
+        ));
     }
 
     let name = body
@@ -148,10 +148,7 @@ pub async fn post_session_agent(ctx: &mut Ctx) -> ApiResult {
 
     // The store decodes a `CreateSessionAgentRequest`, whose two identity members are the trimmed
     // ones this route just validated.
-    body.insert(
-        "name".to_owned(),
-        Value::String(name.clone()),
-    );
+    body.insert("name".to_owned(), Value::String(name.clone()));
     body.insert("profile".to_owned(), Value::String(profile));
 
     let created = store_of(ctx)
@@ -163,11 +160,7 @@ pub async fn post_session_agent(ctx: &mut Ctx) -> ApiResult {
     let agent = created.get("agent").cloned().unwrap_or(Value::Null);
     let revision = ctx.revision("session_agents", Some(&session_id));
 
-    Ok(api::with_revision(
-        201,
-        json!({ "agent": agent }),
-        revision,
-    ))
+    Ok(api::with_revision(201, json!({ "agent": agent }), revision))
 }
 
 /// `PATCH {root}/sessions/{session_id}/agents/{agent_id}` (`api.ts:2527-2599`).
@@ -190,7 +183,9 @@ pub async fn patch_session_agent(ctx: &mut Ctx) -> ApiResult {
     let stated = PATCH_FIELDS.iter().any(|field| body.contains_key(*field));
 
     if !stated {
-        return Err(ApiError::bad_request("A patch must change at least one field."));
+        return Err(ApiError::bad_request(
+            "A patch must change at least one field.",
+        ));
     }
 
     for field in PATCH_FIELDS {
@@ -256,7 +251,7 @@ pub async fn delete_session_agent(ctx: &mut Ctx) -> ApiResult {
 
 /// `GET {root}/sessions/{session_id}/agents/{agent_id}/instruction` (`api.ts:2770-2835`).
 pub async fn get_session_agent_instruction(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
     let agent_id = ctx.param("agent_id").to_owned();
@@ -280,13 +275,17 @@ pub async fn patch_session_agent_instruction(ctx: &mut Ctx) -> ApiResult {
     api::require_body_fields(&body, &INSTRUCTION_FIELDS)?;
 
     if !body.contains_key("instruction") {
-        return Err(ApiError::bad_request("A patch must supply \"instruction\"."));
+        return Err(ApiError::bad_request(
+            "A patch must supply \"instruction\".",
+        ));
     }
 
     let stated = &body["instruction"];
 
     if !stated.is_null() && !stated.is_string() {
-        return Err(ApiError::bad_request("\"instruction\" must be a string or null."));
+        return Err(ApiError::bad_request(
+            "\"instruction\" must be a string or null.",
+        ));
     }
 
     // `null` is the RESTORE instruction (`api.ts:2755`), and serde maps a JSON null on an
@@ -306,11 +305,7 @@ pub async fn patch_session_agent_instruction(ctx: &mut Ctx) -> ApiResult {
 
 /// The instruction read, with no body policy of its own, so the GET and the PATCH share one answer
 /// shape (`api.ts:2795-2806` / `:2825-2834` - both `json(200, response)`, with no revision header).
-async fn instruction_document(
-    ctx: &mut Ctx,
-    session_id: &str,
-    agent_id: &str,
-) -> ApiResult {
+async fn instruction_document(ctx: &mut Ctx, session_id: &str, agent_id: &str) -> ApiResult {
     let body = store_of(ctx)
         .session_agent_instruction(session_id, agent_id)
         .await?;
@@ -374,7 +369,7 @@ fn agent_row(ctx: &Ctx, session_id: &str, agent_id: &str) -> Option<SessionAgent
     let inner = store.lock();
     let state = inner.session(session_id)?;
 
-    session_agent_rows_of(state, store.hub(), store.agents())
+    session_agent_rows_of(state, store.hub(), inner.agents())
         .into_iter()
         .find(|row| row.agent_id == agent_id)
 }

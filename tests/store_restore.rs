@@ -189,6 +189,7 @@ impl TurnExecutor for Executor {
                     },
                 ],
                 stop_reason: Some("stop".to_owned()),
+                unused_steering: Vec::new(),
             }
         })
     }
@@ -220,6 +221,11 @@ impl ToolRuntime for Runtime {
             availability: None,
             session_bound: false,
         }]
+    }
+
+    /// The fixture has no listing rule: its one row is both listed and part of a session toolbox.
+    fn catalogue_summaries(&self) -> Vec<typecrate_harness::contract::ToolSummary> {
+        self.summaries()
     }
 
     fn detail(&self, _name: &str) -> Option<typecrate_harness::contract::ToolDetail> {
@@ -541,7 +547,7 @@ async fn a_restarted_store_restores_the_session_the_turn_and_the_transcript() {
 }
 
 #[tokio::test]
-async fn a_durable_backlog_survives_a_restart_as_unclaimed_rows() {
+async fn a_durable_backlog_survives_a_restart_and_runs_in_order() {
     let fixture = Fixture::new("backlog");
     let first = fixture.open(vec![Scripted::parked("holds the lane")], "");
 
@@ -612,7 +618,14 @@ async fn a_durable_backlog_survives_a_restart_as_unclaimed_rows() {
 
     // "Restart".
     drop(first);
-    let second = fixture.open(vec![Scripted::new("the next one", 1, 1)], "");
+    let second = fixture.open(
+        vec![
+            // The restored backlog runs FIRST, and the fresh submit runs behind it.
+            Scripted::new("the restored one", 1, 1),
+            Scripted::new("the next one", 1, 1),
+        ],
+        "",
+    );
 
     // Both rows come back with the session, still recorded as `queued`: the accept-time write is what
     // the disk holds, and a turn that never started keeps that status.
@@ -648,13 +661,14 @@ async fn a_durable_backlog_survives_a_restart_as_unclaimed_rows() {
         "a durable row keeps the clip it arrived with"
     );
 
-    // THE GAP, pinned rather than hidden: the durable queue is the LEGACY array
-    // (`mod.rs:1502 record.queue = self.queue.clone()`), while a lane's backlog lives in memory, and
-    // `restore_session` starts with no lanes at all (`mod.rs:2260`). So after a restart nothing
-    // re-claims these rows: the session reports no pending work, and the queue page is empty.
+    // The durable backlog is the WHOLE pending set (`mod.rs::write_core_into` unions the legacy array
+    // with every lane backlog, in turn-index order), and `restore_session` re-homes each restored turn
+    // into the lane of the conversation it names (`sessions.ts:3202-3228`, F1). So the row that was
+    // waiting behind the crashed run comes back as pending work - and NO pump starts on its own, which
+    // is why it is still `queued` here.
     assert_eq!(
-        restored.3, 0,
-        "a lane backlog is not part of the durable document"
+        restored.3, 1,
+        "the lane backlog the document holds is pending work again"
     );
     let page = serde_json::from_value::<typecrate_harness::contract::QueuedTaskPage>(
         second
@@ -663,10 +677,18 @@ async fn a_durable_backlog_survives_a_restart_as_unclaimed_rows() {
             .expect("the queue is readable"),
     )
     .expect("a queue answer is a page");
-    assert!(page.items.is_empty());
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|row| row.turn_id.clone())
+            .collect::<Vec<_>>(),
+        vec![queued.turn_id.clone()],
+        "the queue page names the restored turn, and nothing else"
+    );
+    assert_eq!(page.items[0].position, 0);
 
-    // The next submit starts its lane's pump and drains its OWN turn; the orphaned rows are still
-    // `queued` afterwards, which is what a client sees until a reset clears them.
+    // The next submit joins the SAME lane behind it, so the restored turn is claimed first: peek-never-
+    // shift FIFO (`sessions.ts:6593-6605`) is what keeps a restart from letting new work overtake old.
     let trigger = task(&second, &id, "the next submit", Some(&thread)).await;
     wait_done(&second, &id, &trigger.turn_id).await;
 
@@ -677,7 +699,7 @@ async fn a_durable_backlog_survives_a_restart_as_unclaimed_rows() {
         (
             state
                 .turn(&queued.turn_id)
-                .expect("the orphan")
+                .expect("the restored backlog row")
                 .record
                 .status
                 .clone(),
@@ -689,7 +711,10 @@ async fn a_durable_backlog_survives_a_restart_as_unclaimed_rows() {
                 .clone(),
         )
     };
-    assert_eq!(after.0, "queued", "the backlog was never re-claimed");
+    assert_eq!(
+        after.0, "done",
+        "the restored turn ran, in the order it was queued"
+    );
     assert_eq!(
         // The second submit's accept-time write persisted the whole document, and by then the pump had
         // already claimed the first turn as `running`. The restart therefore REPAIRS that row into an
@@ -700,14 +725,14 @@ async fn a_durable_backlog_survives_a_restart_as_unclaimed_rows() {
         "a turn the disk recorded as running is closed as an error on boot"
     );
 
-    // The restart never invents a run: the only turn THIS process executed is its own submit. The
-    // log is process-wide (the test binary shares one process), so the assertion slices to the runs
-    // started after the restart.
+    // The restart never invents a run: the only turns THIS process executed are the restored backlog
+    // and its own submit, in that order. The log is process-wide (the test binary shares one process),
+    // so the assertion slices to the runs started after the restart.
     let runs = RUNS.ids();
     assert_eq!(
-        runs.last().expect("a run started"),
-        &trigger.turn_id,
-        "a boot runs nothing on its own: the only turn this process executed is its own submit"
+        runs[runs.len() - 2..],
+        [queued.turn_id.clone(), trigger.turn_id.clone()],
+        "a boot runs nothing on its own, and the first run it does start is the turn that was queued first"
     );
 }
 
@@ -869,8 +894,39 @@ async fn the_provider_credential_is_never_persisted() {
         "a restart loses the credential the session was created with"
     );
 
-    // The deployment still offers its key, so a booted session can run against the same endpoint
-    // without a client re-supplying anything.
+    // The RESOURCE figure now states the SESSION's own endpoint view - `api-reads.ts:225` calls
+    // `providerDefaultsOf(record.settings)`, and the credential that made `has_api_key` true at create
+    // time is memory-only - so after a restart the base URL and model survive (they are in the
+    // document) while the key's presence honestly does not. This assertion used to read `true`, which
+    // was the deployment-defaults bug this fix removes: it proved nothing about persistence, and now it
+    // proves the credential is gone.
+    let restored = second.get_session(&id).await.expect("the session booted");
+    assert_eq!(restored["session"]["endpoint"]["has_api_key"], json!(false));
+    assert_eq!(
+        restored["session"]["endpoint"]["base_url"],
+        json!("http://localhost:5500/providers/private/v1"),
+        "the session's own endpoint pair is durable even when its credential is not"
+    );
+    assert_eq!(
+        restored["session"]["endpoint"]["model"],
+        json!("merge/ds4-flash")
+    );
+    assert_eq!(restored["session"]["id"], json!(id));
+
+    // The DEPLOYMENT still offers its key, which is `/config`'s document and a different fact from
+    // the session's `endpoint` block.
+    let live_key = {
+        let inner = second.lock();
+
+        inner.settings().api_key
+    };
+    assert_eq!(
+        live_key, "server-key-that-must-not-hit-disk",
+        "the deployment pair is untouched by the session losing its credential"
+    );
+
+    // A deployment that boots WITHOUT a key restores the same session with no key available to the next
+    // provider call either (`config::merge_settings` has nothing to fall back to).
     let redeployed = fixture.open(Vec::new(), "");
     let keyless = {
         let inner = redeployed.lock();
@@ -885,15 +941,4 @@ async fn the_provider_credential_is_never_persisted() {
         keyless,
         "a deployment without a key restores a keyless session"
     );
-
-    // The RESOURCE figure, by contrast, is the deployment's own endpoint view - TS computes it from
-    // `context.settings` too (`api-reads.ts:221-230`) - so it is `true` in both processes and proves
-    // nothing about persistence on its own.
-    let restored = second.get_session(&id).await.expect("the session booted");
-    assert_eq!(restored["session"]["endpoint"]["has_api_key"], json!(true));
-    assert_eq!(
-        restored["session"]["endpoint"]["model"],
-        json!("merge/ds4-flash")
-    );
-    assert_eq!(restored["session"]["id"], json!(id));
 }

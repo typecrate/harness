@@ -13,7 +13,7 @@ use super::sessions::{number_of, require_session, session_of};
 
 /// `GET {root}/sessions/{session_id}/usage` (`api.ts:2153-2159`).
 pub async fn get_session_usage(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
 

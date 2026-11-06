@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use crate::agents::AgentCatalogue;
-use crate::config::{HarnessRuntimeSettings, ServerConfig, provider_defaults};
+use crate::config::{HarnessRuntimeSettings, ServerConfig};
 use crate::contract::{
     self, AgentResultStatus, AgentRole, BindingOrigin, CommandDescriptor, HarnessErrorInfo,
     HarnessEvent, HarnessMessage, HarnessUsage, InstructionSource, PendingAction, ProviderConfig,
@@ -93,26 +93,21 @@ pub fn flatten_for_display(text: &str) -> String {
 }
 
 /// `previewText` (`turn-projector.ts:150-156`): flatten, then bound with a single `…`.
+///
+/// Delegates to [`crate::projector::preview_text`], because that is the SAME TypeScript function
+/// `promptPreview` calls, and it bounds in UTF-16 code units - the unit every `DISPLAY_*` cap and
+/// every `chars` figure uses (`turn-display.ts:412-416`, invariant 5). A character count here would
+/// disagree with TS for any astral character in a prompt.
 #[must_use]
 pub fn preview_text(text: &str, limit: usize) -> String {
-    let flattened = flatten_for_display(text);
-    let chars: Vec<char> = flattened.chars().collect();
-
-    if chars.len() <= limit {
-        return flattened;
-    }
-
-    let keep = limit.saturating_sub(1);
-    let head: String = chars[..keep].iter().collect();
-
-    format!("{}\u{2026}", head.trim_end())
+    crate::projector::preview_text(text, limit)
 }
 
 /// `promptPreview` (`api-reads.ts:328-329`): the RAW length decides whether anything happens at
 /// all, so an already-short prompt is returned by identity - flattening only runs on a long one.
 #[must_use]
 pub fn prompt_preview(prompt: &str, limit: usize) -> String {
-    if prompt.chars().count() <= limit {
+    if crate::projector::display_chars(prompt) <= limit {
         return prompt.to_string();
     }
 
@@ -455,19 +450,41 @@ pub fn session_summary_of(state: &SessionState, hub: &EventHub) -> SessionSummar
     }
 }
 
+/// The key-free endpoint view of THIS session (`api-reads.ts:225`, which calls
+/// `providerDefaultsOf(record.settings)`).
+///
+/// The session's OWN settings, never the deployment's: `record.settings` is what
+/// `sessions.ts:1861-1870` wrote at create time (the merged trio) and `has_api_key` is the presence
+/// of the credential THAT session holds. The credential is memory-only (`sessions.ts:1618-1634`), so
+/// a restored session honestly reports `false` even while the deployment still has a key — the
+/// deployment's own view is `/config`'s `defaults` document, not this member.
+#[must_use]
+pub fn session_endpoint_of(state: &SessionState) -> contract::ProviderDefaults {
+    contract::ProviderDefaults {
+        base_url: state.record.settings.base_url.clone(),
+        model: state.record.settings.model.clone(),
+        has_api_key: state
+            .provider_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty()),
+    }
+}
+
 /// The identified session read (`sessionResourceOf`, `api-reads.ts:221-230`).
 #[must_use]
 pub fn session_resource_of(
     state: &SessionState,
     hub: &EventHub,
-    settings: &crate::config::HarnessRuntimeSettings,
     runtime: &ServerConfig,
 ) -> contract::SessionResource {
     contract::SessionResource {
         session: session_summary_of(state, hub),
         definition_revision: hub.revision("definition", Some(&state.record.id)),
         agent_models: state.agent_models_of(),
-        endpoint: provider_defaults(settings),
+        // `api-reads.ts:225` reads the SESSION's settings, not the deployment's.
+        endpoint: session_endpoint_of(state),
+        // `api-reads.ts:226` reads `context.runtime.threadExecution`, i.e. the live deployment
+        // configuration, not a built-in constant.
         runtime_execution: runtime.thread_execution.clone(),
         pending_action_count: u64::try_from(state.pending_actions.len()).unwrap_or(u64::MAX),
         created_tool_count: u64::try_from(state.created_tools.len()).unwrap_or(u64::MAX),
@@ -558,6 +575,12 @@ pub fn session_definition_of(
             core_tools: (!core_tools.is_empty()).then_some(core_tools),
             agent_models: (!definition.agent_models.is_empty())
                 .then(|| definition.agent_models.clone()),
+            // R2/R1: the frozen copy's per-agent display COLORS, under the exact non-empty rule
+            // `harnessDefinitionOf` and `describeHarness` use (`api-reads.ts:1318-1329`), so the
+            // swatch a saved-session UI reads here is byte-identical to the one the live
+            // conversation paints. A member the map omits has NO configured color.
+            agent_colors: (!definition.agent_colors.is_empty())
+                .then(|| definition.agent_colors.clone()),
             instruction_summary: summary,
         },
         session_id: state.record.id.clone(),
@@ -713,23 +736,12 @@ impl TurnState {
             return display;
         };
 
-        let renames: Vec<(String, String)> = sections
-            .iter()
-            .enumerate()
-            .filter_map(|(ordinal, section)| {
-                section
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(|id| (id.to_owned(), format!("{turn_id}:{ordinal}")))
-            })
-            .collect();
-
-        let lookup = |id: &str| -> String {
-            renames
-                .iter()
-                .find(|(from, _)| from == id)
-                .map_or_else(|| id.to_owned(), |(_, to)| to.clone())
-        };
+        // Old id -> wire id through the ONE rule the live `display.ops` frames use
+        // (`projector::section_wire_id` / `projector::stamp_display_ops`). The projector mints
+        // `s{ordinal}` in the same step that appends the section to this array (`projector.rs:418-434`),
+        // so the ordinal embedded in the key and the array position state the same fact, and a listener
+        // that applied the ops it streamed reads the SAME section ids this snapshot prints.
+        let lookup = |id: &str| -> String { crate::projector::section_wire_id(&turn_id, id) };
 
         for section in sections.iter_mut() {
             let Some(entry) = section.as_object_mut() else {
@@ -761,8 +773,10 @@ impl TurnState {
 
                     step.insert("turnId".to_owned(), Value::String(turn_id.clone()));
 
-                    if let Some(section_id) =
-                        step.get("sectionId").and_then(Value::as_str).map(str::to_owned)
+                    if let Some(section_id) = step
+                        .get("sectionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
                     {
                         step.insert("sectionId".to_owned(), Value::String(lookup(&section_id)));
                     }
@@ -796,7 +810,7 @@ pub fn steer_row(steer: &Value) -> Value {
     entry.insert(
         "promptChars".to_owned(),
         Value::Number(
-            u64::try_from(text.chars().count())
+            u64::try_from(crate::projector::display_chars(&text))
                 .unwrap_or(u64::MAX)
                 .into(),
         ),
@@ -854,7 +868,8 @@ pub fn turn_resource_of(state: &SessionState, turn: &TurnState, hub: &EventHub) 
                     id: steer.id.clone(),
                     at: steer.at,
                     prompt_preview: prompt_preview(&steer.prompt, QUEUE_PREVIEW_CHARS),
-                    prompt_chars: u64::try_from(steer.prompt.chars().count()).unwrap_or(u64::MAX),
+                    prompt_chars: u64::try_from(crate::projector::display_chars(&steer.prompt))
+                        .unwrap_or(u64::MAX),
                     // A steer delivered to the owning turn's own conversation is not restated
                     // (`:378-382`).
                     thread_id: steer
@@ -1239,7 +1254,7 @@ pub fn document_bytes(messages: &[HarnessMessage]) -> usize {
 pub fn entry_chars(messages: &[HarnessMessage]) -> usize {
     messages
         .iter()
-        .map(|entry| message_content(entry).chars().count())
+        .map(|entry| crate::projector::display_chars(message_content(entry)))
         .sum()
 }
 
@@ -1319,7 +1334,8 @@ pub fn queue_rows_of(state: &SessionState) -> Vec<QueuedTask> {
                 position: u64::try_from(position).unwrap_or(u64::MAX),
                 status: parse_turn_status(&record.status),
                 prompt_preview: prompt_preview(&record.prompt, QUEUE_PREVIEW_CHARS),
-                prompt_chars: u64::try_from(record.prompt.chars().count()).unwrap_or(u64::MAX),
+                prompt_chars: u64::try_from(crate::projector::display_chars(&record.prompt))
+                    .unwrap_or(u64::MAX),
                 thread_id: record.thread_id.clone(),
                 thread_label: record.thread_label.clone(),
                 reference_labels: record
@@ -1346,13 +1362,20 @@ pub fn queue_rows_of(state: &SessionState) -> Vec<QueuedTask> {
 /// about providers that report none.
 #[must_use]
 pub fn usage_fold_of(state: &SessionState, hub: &EventHub) -> contract::SessionUsageResponse {
+    // TS builds BOTH objects as `{ input: 0, output: 0, total: 0 }` and adds only those three
+    // members (`api-reads.ts:726`, `:742`): `cached` is provider metadata that belongs on the TURN
+    // row, and this fold never states it, so neither the totals nor a per-thread share carries the
+    // key.
     let mut totals = HarnessUsage {
         input: 0,
         output: 0,
         total: 0,
         cached: None,
     };
-    let mut by_thread: BTreeMap<String, HarnessUsage> = BTreeMap::new();
+    // A `Map` in TS (`:727`), so `by_thread` comes back in FIRST-APPEARANCE order, not sorted:
+    // `[...byThread.entries()]` (`:750`). A Vec with a linear key scan is the same thing here, and
+    // the per-thread set is bounded by the thread budget.
+    let mut by_thread: Vec<(String, HarnessUsage)> = Vec::new();
     let mut reported = 0u64;
 
     for turn in state.turns_in_order() {
@@ -1365,30 +1388,32 @@ pub fn usage_fold_of(state: &SessionState, hub: &EventHub) -> contract::SessionU
         totals.output += usage.output;
         totals.total += usage.total;
 
-        // `cached` is folded only when SOME turn reported it: an absent member means "not reported"
-        // rather than zero (`types/index.ts:227-230`).
-        if let Some(cached) = usage.cached {
-            totals.cached = Some(totals.cached.unwrap_or(0) + cached);
-        }
-
         let Some(thread_id) = turn.record.thread_id.clone() else {
             continue;
         };
 
-        let share = by_thread.entry(thread_id).or_insert(HarnessUsage {
-            input: 0,
-            output: 0,
-            total: 0,
-            cached: None,
-        });
+        let position = match by_thread.iter().position(|(id, _)| *id == thread_id) {
+            Some(position) => position,
+            None => {
+                by_thread.push((
+                    thread_id.clone(),
+                    HarnessUsage {
+                        input: 0,
+                        output: 0,
+                        total: 0,
+                        cached: None,
+                    },
+                ));
+
+                by_thread.len() - 1
+            }
+        };
+
+        let share = &mut by_thread[position].1;
 
         share.input += usage.input;
         share.output += usage.output;
         share.total += usage.total;
-
-        if let Some(cached) = usage.cached {
-            share.cached = Some(share.cached.unwrap_or(0) + cached);
-        }
     }
 
     let per_thread: Vec<UsageByThread> = by_thread
@@ -1510,7 +1535,8 @@ pub fn session_agent_rows_of(
                     .cloned()
                     .unwrap_or_else(|| state.record.settings.model.clone()),
                 instruction_source: source,
-                instruction_chars: u64::try_from(text.chars().count()).unwrap_or(u64::MAX),
+                instruction_chars: u64::try_from(crate::projector::display_chars(&text))
+                    .unwrap_or(u64::MAX),
                 has_instruction_override: matches!(
                     source,
                     SessionInstructionSource::Harness | SessionInstructionSource::Session
@@ -1746,6 +1772,15 @@ pub fn provider_host_of(base_url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_owned())
 }
 
+/// The sampling fields every provider request this server builds carries
+/// (`server/harnesses/toolbox.ts:242-246 providerOf`, which attaches `sampling: { temperature: 0.3 }`
+/// to the transport configuration of EVERY session agent). It is an application-layer choice, not a
+/// deployment knob: a client never supplies sampling, exactly as it never supplies the transport.
+#[must_use]
+pub fn default_sampling() -> Value {
+    serde_json::json!({ "temperature": 0.3 })
+}
+
 /// The provider trio the NEXT turn runs with (`api-reads.ts:1078-1093 providerSnapshot`).
 ///
 /// A session override replaces the base URL and the model. The CREDENTIAL follows the host rather than the
@@ -1763,6 +1798,7 @@ pub fn effective_provider(
         api_key: (!settings.api_key.is_empty()).then(|| settings.api_key.clone()),
         model: settings.model.clone(),
         headers: BTreeMap::new(),
+        sampling: Some(default_sampling()),
     };
 
     let Some(session) = session.filter(|session| !session.base_url.trim().is_empty()) else {
@@ -1786,5 +1822,11 @@ pub fn effective_provider(
         api_key,
         model,
         headers: session.headers.clone(),
+        // The sampling is the SERVER's, never the caller's: a session cannot retune the model's
+        // temperature over the wire (`toolbox.ts:245` is the only writer of this field).
+        sampling: session
+            .sampling
+            .clone()
+            .or_else(|| Some(default_sampling())),
     }
 }

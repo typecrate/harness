@@ -1202,6 +1202,12 @@ pub struct HarnessDefinition {
     pub core_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_models: Option<BTreeMap<String, String>>,
+    /// The per-agent display COLORS (`harness-api.ts:460`, `api-reads.ts:1104-1106`), emitted under
+    /// the same non-empty rule as `agent_models`, so an uncolored definition keeps its exact
+    /// pre-R2 shape. Position matters: TS spreads `agent_colors` between `agent_models` and
+    /// `instruction_summary`, and `preserve_order` makes the declared order the wire order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_colors: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction_summary: Option<Vec<HarnessInstructionSummaryEntry>>,
 }
@@ -1273,6 +1279,11 @@ pub struct CreateHarnessRequest {
     pub agent_models: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_instructions: Option<BTreeMap<String, String>>,
+    /// The third map of the same shape (`harness-api.ts:484`): agent id -> CSS hex color. A client
+    /// may record a swatch for each member it selects; the registry decides membership and the hex
+    /// shape (`registry.ts:604-629`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_colors: Option<BTreeMap<String, String>>,
 }
 
 /// Patch body (`harness-api.ts:488`): an omitted field keeps its current value and the name
@@ -1293,6 +1304,11 @@ pub struct UpdateHarnessRequest {
     pub agent_models: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_instructions: Option<BTreeMap<String, String>>,
+    /// REPLACE semantics like the two maps above (`harness-api.ts:507`): `{}` clears every color,
+    /// and a color for a member this patch removes is dropped rather than rejected
+    /// (`registry.ts:1377-1389`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_colors: Option<BTreeMap<String, String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2901,6 +2917,16 @@ pub struct TurnOutcome {
     pub cancelled: bool,
     pub messages: Vec<HarnessMessage>,
     pub stop_reason: Option<String>,
+    /// Guidance this run DRAINED from its steering channel and then lost, because the run failed or
+    /// was aborted and its transcript was rolled back (`harness.ts:6826-6837`: "R5 preservation:
+    /// steering this run drained is rolled back with the transcript, so hand it to the NEXT host turn
+    /// in its original order").
+    ///
+    /// Empty on a successful run, where every drained steer reached the model. The store re-queues
+    /// this list onto the conversation's lane unless the run was explicitly stopped
+    /// (`sessions.ts`/`harness.ts` discard it for a stopped thread), which is what keeps guidance a
+    /// user already paid for from vanishing on a provider hiccup.
+    pub unused_steering: Vec<String>,
 }
 
 /// The endpoint one provider call actually uses (`harnesses/types` `RunnerSettings` plus the
@@ -2908,13 +2934,21 @@ pub struct TurnOutcome {
 ///
 /// `api_key` is `Option<String>`: an ABSENT credential is "no key", never a placeholder
 /// string (the rule `config.ts:14-17` states as T28).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `sampling` is `HarnessSampling` (`types/index.ts:296-304`): the OpenAI field names the built-in
+/// transport forwards VERBATIM onto every request body (`transport/openai.ts:618-627 samplingBody`
+/// copies only the entries that are numbers, and `server/harnesses/toolbox.ts:245` is the only writer
+/// in the server, with `{ temperature: 0.3 }`). A JSON `Value` rather than five `Option`s because the
+/// TS type is an open record of numeric knobs and the transport must not decide which names exist.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
     /// Extra headers merged over the generated ones; ordered so a built request is stable.
     pub headers: BTreeMap<String, String>,
+    /// The sampling fields to merge into the request body; `None` sends none.
+    pub sampling: Option<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------

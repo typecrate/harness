@@ -28,7 +28,7 @@ use super::sessions::{require_session, session_of};
 /// `json(200, response)` with NO `X-Harness-Revision` header - TS stamps none on this read, because
 /// the response body already carries the figure (`:2387`).
 pub async fn get_session_actions(ctx: &mut Ctx) -> ApiResult {
-    ctx.require_empty_body().await?;
+    ctx.ignore_body().await;
 
     let session_id = session_of(ctx);
 
@@ -122,12 +122,9 @@ fn normalize_choice(value: &Value) -> Result<ActionChoiceInput, ApiError> {
         Some("custom") => {
             api::require_body_fields(object, &["kind", "text"])?;
 
-            let text = object
-                .get("text")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    ApiError::bad_request("A custom choice requires string \"text\".")
-                })?;
+            let text = object.get("text").and_then(Value::as_str).ok_or_else(|| {
+                ApiError::bad_request("A custom choice requires string \"text\".")
+            })?;
 
             Ok(ActionChoiceInput::Custom {
                 text: text.to_owned(),
@@ -140,5 +137,3 @@ fn normalize_choice(value: &Value) -> Result<ActionChoiceInput, ApiError> {
         )),
     }
 }
-
-

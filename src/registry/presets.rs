@@ -154,6 +154,9 @@ fn live_preset(name: &str, title: &str, description: &str) -> HarnessDescriptor 
             .collect(),
         agent_models: BTreeMap::new(),
         agent_instructions: BTreeMap::new(),
+        // A shipped template carries no colors: R2's map is an operator/client decision, and an
+        // empty map is what makes the persisted row keep its pre-R2 shape (`presets.ts:151-263`).
+        agent_colors: BTreeMap::new(),
         builtin: true,
         editable: true,
         template: Some("live".to_string()),
@@ -252,6 +255,24 @@ pub fn is_instruction_text(text: &str) -> bool {
         (glyph.is_ascii_control() && glyph != '\t' && glyph != '\n' && glyph != '\r')
             || glyph == '\u{7f}'
     })
+}
+
+/// `AGENT_COLOR_PATTERN` (`registry.ts:155-164`): an accepted per-agent identity color is a CSS hex
+/// color, 3/4/6/8 digits, either case. The SAME expression the library validates at agent
+/// construction (`core/agent.ts`) and the HTTP contract publishes (`harness.swagger.yaml`
+/// `agent_colors.pattern`), so a color the edge accepts is always one a UI can paint. Written as a
+/// predicate rather than a regex for the same reason as the two above: the rule is a character
+/// class plus a length set, and the duplication is only ever about the ERROR, not the rule.
+#[must_use]
+pub fn is_agent_color(text: &str) -> bool {
+    let Some(digits) = text.strip_prefix('#') else {
+        return false;
+    };
+
+    matches!(digits.len(), 3 | 4 | 6 | 8)
+        && digits
+            .bytes()
+            .all(|glyph| glyph.is_ascii_digit() || matches!(glyph, b'a'..=b'f' | b'A'..=b'F'))
 }
 
 /// Projects the core tool set for one card (`toolbox.ts:216-238` `coreToolNames`).

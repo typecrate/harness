@@ -233,7 +233,7 @@ pub fn inline_display_attachment(attachment: &HarnessAttachment) -> Value {
     // <= DISPLAY_ATTACHMENT_INLINE_CHARS` (`:2769-2773`) - measured in base64 CHARACTERS.
     let inlinable = attachment.kind == AttachmentKind::Image
         && !attachment.data.is_empty()
-        && attachment.data.chars().count() <= DISPLAY_ATTACHMENT_INLINE_CHARS;
+        && attachment.data.encode_utf16().count() <= DISPLAY_ATTACHMENT_INLINE_CHARS;
 
     let mut summary = serde_json::Map::new();
     summary.insert("id".to_owned(), Value::String(attachment.id.clone()));
@@ -285,7 +285,8 @@ fn read_attachment(
 
     // Marker: bound, grammar, safe-integer index, then label/kind agreement (`:420-443`). The
     // ORDER matters - an over-long marker is refused before any regex runs on it.
-    if attachment.marker.chars().count() > MAX_MARKER_LENGTH {
+    // The bound is TypeScript's `.length`, i.e. UTF-16 code units, not scalar characters.
+    if attachment.marker.encode_utf16().count() > MAX_MARKER_LENGTH {
         return Err(attachment_error(format!(
             "{label}.marker must be at most {MAX_MARKER_LENGTH} characters."
         )));
@@ -330,7 +331,8 @@ fn read_attachment(
     }
 
     // MIME: bound first, then the grammar, then the kind table (`:450-466`).
-    if attachment.mime.chars().count() > MAX_MIME_LENGTH {
+    // The bound is TypeScript's `.length`, i.e. UTF-16 code units, not scalar characters.
+    if attachment.mime.encode_utf16().count() > MAX_MIME_LENGTH {
         return Err(attachment_error(format!(
             "{label}.mime must be at most {MAX_MIME_LENGTH} characters."
         )));

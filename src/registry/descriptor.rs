@@ -61,6 +61,11 @@ pub struct HarnessDescriptor {
     /// the identity sentence - a member's trusted guidelines still apply - and it never rewrites
     /// the shipped profile (`protocol.ts:284-291`).
     pub agent_instructions: BTreeMap<String, String>,
+    /// Per-agent display COLOR overrides: agent id -> CSS hex color (`protocol.ts:292-301`,
+    /// `registry.ts:604-629`). Display-only, but still EXECUTABLE state: the map reaches the frozen
+    /// descriptor, the definition read and the swatches a saved session paints
+    /// (`api-reads.ts:1318-1329`).
+    pub agent_colors: BTreeMap<String, String>,
     /// Shipped with the application vs created through `POST /harnesses`.
     pub builtin: bool,
     /// Compatibility wire field, always `true` (`protocol.ts:296-300`): the registry never gates a
@@ -137,6 +142,12 @@ impl HarnessDescriptor {
             } else {
                 Some(self.agent_instructions.clone())
             },
+            // The third map follows the identical non-empty rule (`descriptor.ts:117-119`).
+            agent_colors: if self.agent_colors.is_empty() {
+                None
+            } else {
+                Some(self.agent_colors.clone())
+            },
             builtin: self.builtin,
             editable: self.editable,
             template: self.template.clone(),
@@ -165,6 +176,9 @@ impl HarnessDescriptor {
             environment_tools: record.environment_tools.clone().unwrap_or_default(),
             agent_models: record.agent_models.clone().unwrap_or_default(),
             agent_instructions: record.agent_instructions.clone().unwrap_or_default(),
+            // An absent map is "no configured color", which is what TS's `presetFromRecord`
+            // normalizes it to (`registry.ts:793-795`).
+            agent_colors: record.agent_colors.clone().unwrap_or_default(),
             builtin: record.builtin,
             editable: true,
             template: record.template.clone(),

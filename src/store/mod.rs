@@ -62,7 +62,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::agents::AgentCatalogue;
-use crate::config::HarnessRuntimeSettings;
+use crate::config::{HarnessRuntimeSettings, ServerConfig};
 use crate::contract::{
     AgentResultReference, BindingOrigin, HarnessActionAnswer, HarnessActionRequest, HarnessEvent,
     HarnessUsage, PageMeta, ProviderConfig, SessionStatus, SessionToolOrigin, SessionTurnStatus,
@@ -426,10 +426,11 @@ impl TurnState {
         parse_turn_status(&self.record.status)
     }
 
-    /// The recorded prompt length in characters: the exact figure beside every bounded preview.
+    /// The recorded prompt length in UTF-16 code units: the exact figure beside every bounded
+    /// preview (`turn-display.ts:412-416`, invariant 5 - TS states `.length`, which counts units).
     #[must_use]
     pub fn prompt_chars(&self) -> u64 {
-        self.record.prompt.chars().count() as u64
+        u64::try_from(crate::projector::display_chars(&self.record.prompt)).unwrap_or(u64::MAX)
     }
 
     /// `sessions.ts:6704 recordTurnEvent`: one event, recorded and projected in the order the recorder
@@ -447,7 +448,16 @@ impl TurnState {
         }
         // `apply` gets the event's ordinal WITHIN the turn, because a display step's id IS that ordinal
         // as a decimal string (`harness-api.ts:1792`).
-        let ops = self.projector.apply(event, at, self.folded as u64);
+        //
+        // The ops are stamped HERE, at the one place they are minted: the fold has no turn record, so it
+        // mints `turnId: ""` and `s{ordinal}` (`projector.rs:418-434`), and the wire identity is
+        // `${turnId}:${ordinal}`. `TurnState::display` stamps the snapshot with the same rule
+        // (`projector::section_wire_id`), which is what makes a streamed section id equal the id a
+        // display read reports.
+        let ops = crate::projector::stamp_display_ops(
+            &self.record.id,
+            self.projector.apply(event, at, self.folded as u64),
+        );
         self.folded += 1;
         self.record.updated_at = at;
         ops
@@ -620,7 +630,18 @@ pub struct ExpiredSession {
 }
 
 /// The store's mutable half.
-#[derive(Debug, Default)]
+///
+/// THE HOST VIEW (`Store.registry` / `Store.agents` / `Store.settings` in TS, where the store object
+/// literally holds the live registry and the live `globalSettings`): the CURRENT registry, agent
+/// catalogue and deployment settings live HERE, behind the same mutex as the sessions, and the host
+/// routes push a fresh copy through [`Store::set_host_view`] after every committed host write. They
+/// are NOT boot-time snapshots: `POST /harnesses`, `PATCH /harnesses`, `PATCH /agents` and
+/// `PATCH /config` must be visible to the NEXT `POST /sessions` without a restart
+/// (`sessions.ts:1827` reads `this.registry` and `api.ts:1974` reads `store.globalSettings` on every
+/// create). Keeping them under the store lock — rather than in a second lock the store reaches into —
+/// is what makes "read the host view and create the record" one atomic step and keeps the documented
+/// lock order (host locks -> store lock) inversion-free.
+#[derive(Debug)]
 pub struct StoreInner {
     /// Sessions by id. A `BTreeMap` because every route addresses one session by id and the crate has no
     /// insertion-ordered map dependency.
@@ -643,9 +664,47 @@ pub struct StoreInner {
     pub journal_problems: Vec<String>,
     /// `sessions.ts:8638 shuttingDown`: once set, no pump claims another queued turn.
     pub shutting_down: bool,
+    /// The CURRENT harness registry, as the host routes committed it (`sessions.ts:1827` reads the
+    /// live registry on every create). An `Arc` so a session's frozen copy and a route's snapshot
+    /// stay cheap; replaced whole, never mutated in place, so a reader under the lock cannot see a
+    /// half-applied `PATCH`.
+    pub host_registry: Arc<HarnessRegistry>,
+    /// The CURRENT agent catalogue plus the operator's global overlay (`harnesses/agent-state.ts`,
+    /// reached through `api.ts:1707`). The instruction ladder's `global` layer and every roster row
+    /// read this, so a `PATCH /agents` is visible to the next session and the next turn.
+    pub host_agents: Arc<AgentCatalogue>,
+    /// The CURRENT deployment configuration (`api.ts:1368-1446 globalSettings` + the runtime knobs).
+    /// `settings()` is the provider trio `POST /sessions` merges over; `runtime_config()` is where
+    /// `runtime_execution` (`api-reads.ts:226 context.runtime.threadExecution`) comes from.
+    pub host_config: ServerConfig,
 }
 
 impl StoreInner {
+    /// The host view of the harness registry (`sessions.ts:1827`).
+    #[must_use]
+    pub fn registry(&self) -> &HarnessRegistry {
+        &self.host_registry
+    }
+
+    /// The host view of the agent catalogue (`api.ts:1707`).
+    #[must_use]
+    pub fn agents(&self) -> &AgentCatalogue {
+        &self.host_agents
+    }
+
+    /// The provider trio the NEXT session merges over (`api.ts:1974-1989` reads
+    /// `store.globalSettings` at create time, never a boot snapshot).
+    #[must_use]
+    pub fn settings(&self) -> HarnessRuntimeSettings {
+        self.host_config.settings()
+    }
+
+    /// The deployment runtime block, live (`api-reads.ts:226 context.runtime.threadExecution`).
+    #[must_use]
+    pub fn runtime_config(&self) -> &ServerConfig {
+        &self.host_config
+    }
+
     #[must_use]
     pub fn find(&self, session_id: &str) -> Option<&SessionState> {
         self.sessions.get(session_id)
@@ -710,6 +769,46 @@ impl StoreInner {
 
     pub fn all_mut(&mut self) -> impl Iterator<Item = &mut SessionState> {
         self.sessions.values_mut()
+    }
+
+    /// Every collection empty, the host view NOT included: the three host fields have no sane
+    /// default of their own (a registry needs the deployment settings), so [`Store::open`] supplies
+    /// them and this fills the rest. It replaces the `Default` derive the T3 port used while the
+    /// struct held only collections.
+    #[must_use]
+    pub fn default_state() -> Self {
+        Self {
+            sessions: BTreeMap::new(),
+            session_order: Vec::new(),
+            expired: Vec::new(),
+            journals: BTreeMap::new(),
+            diagnostics: Vec::new(),
+            journal_problems: Vec::new(),
+            shutting_down: false,
+            host_registry: Arc::new(HarnessRegistry::shipped(
+                &ServerConfig::default().settings(),
+                Vec::new(),
+            )),
+            host_agents: Arc::new(AgentCatalogue::builtin()),
+            host_config: ServerConfig::default(),
+        }
+    }
+}
+
+/// The deployment configuration a bare [`StoreConfig`] implies: the settings trio the caller handed
+/// in, plus every runtime knob at its built-in default (`config.rs`'s `DEFAULT_*` constants).
+///
+/// A store opened directly (a test, an embedder that supplies its own trio) therefore reports the
+/// same `runtime_execution` TS's server reports when `HARNESS_THREAD_EXECUTION` is unset. The real
+/// deployment values arrive through [`Store::set_host_view`], which `runtime::build_runtime` calls
+/// immediately after `open` with the loaded `ServerConfig`.
+#[must_use]
+pub fn runtime_config_from(settings: &HarnessRuntimeSettings) -> ServerConfig {
+    ServerConfig {
+        base_url: settings.base_url.clone(),
+        api_key: settings.api_key.clone(),
+        model: settings.model.clone(),
+        ..ServerConfig::default()
     }
 }
 
@@ -842,12 +941,9 @@ pub struct Store {
     inner: Arc<Mutex<StoreInner>>,
     hub: Arc<EventHub>,
     config: Arc<StoreConfig>,
-    settings: Arc<HarnessRuntimeSettings>,
-    agents: Arc<AgentCatalogue>,
     runtime: Arc<dyn ToolRuntime>,
     executor: Arc<dyn TurnExecutor>,
     projector: Arc<dyn ProjectorFactory>,
-    registry: Arc<HarnessRegistry>,
     /// `task_host` (`harnessService.ts:306`). `None` removes `task` from every tool policy, the same
     /// condition that leaves `task` unregistered in TS.
     task_host: Option<Arc<StoreTaskHost>>,
@@ -872,20 +968,91 @@ impl Store {
         hub: Arc<EventHub>,
         task_host: Option<Arc<StoreTaskHost>>,
     ) -> Self {
+        let host_config = runtime_config_from(&settings);
+
+        let inner = StoreInner {
+            host_registry: registry,
+            host_agents: agents,
+            host_config,
+            ..StoreInner::default_state()
+        };
+
         let store = Self {
-            inner: Arc::new(Mutex::new(StoreInner::default())),
+            inner: Arc::new(Mutex::new(inner)),
             hub,
             config: Arc::new(config),
-            settings: Arc::new(settings),
-            agents,
             runtime,
             executor,
             projector,
-            registry,
             task_host,
         };
         store.restore_all();
         store
+    }
+
+    // ------------------------------------------------------------------
+    // The host view (registry / agents / settings)
+    // ------------------------------------------------------------------
+
+    /// Replaces the store's view of the registry, the catalogue and the deployment settings.
+    ///
+    /// This is the write half of the host view: a host route that commits a registry row, an agent
+    /// overlay or a config patch hands the WHOLE new value over, so the next `POST /sessions`
+    /// resolves the new harness, the new instruction override and the new model defaults exactly as
+    /// TS's store does when it reads `this.registry` / `this.agents` / `this.globalSettings` at
+    /// create time (`sessions.ts:1827`, `api.ts:1974-1989`).
+    ///
+    /// The caller must NOT hold the store lock (this takes it), and must have already released every
+    /// registry / catalogue / settings lock it held — the documented order is host lock -> store
+    /// lock, and holding the store lock while taking a host lock is the inversion that deadlocks.
+    pub fn set_host_view(
+        &self,
+        registry: Arc<HarnessRegistry>,
+        agents: Arc<AgentCatalogue>,
+        config: ServerConfig,
+    ) {
+        let mut inner = self.lock();
+
+        inner.host_registry = registry;
+        inner.host_agents = agents;
+        inner.host_config = config;
+    }
+
+    /// The store's own view of the registry, for a caller that holds no lock (`sessions.ts:1827`).
+    #[must_use]
+    pub fn registry(&self) -> Arc<HarnessRegistry> {
+        Arc::clone(&self.lock().host_registry)
+    }
+
+    /// The store's own view of the catalogue, for a caller that holds no lock.
+    #[must_use]
+    pub fn agents(&self) -> Arc<AgentCatalogue> {
+        Arc::clone(&self.lock().host_agents)
+    }
+
+    /// The provider trio currently in force, for a caller that holds no lock.
+    ///
+    /// NEVER call this while holding the store guard: the guard is not reentrant, and these three
+    /// accessors take it again. The locked paths read the view through `StoreInner::registry`,
+    /// `StoreInner::agents` and `StoreInner::settings` instead.
+    #[must_use]
+    pub fn settings(&self) -> HarnessRuntimeSettings {
+        self.lock().settings()
+    }
+
+    /// `sessions.ts:8638 dispose()`: stop claiming new work, so a graceful shutdown drains.
+    ///
+    /// The flag is what makes [`SessionStore::spawn_pump`] and the pump's own claim loop answer
+    /// "nothing more"; live runs keep their cancellation tokens, and the durable document is written
+    /// by `server::flush` on the way out.
+    pub fn begin_shutdown(&self) {
+        self.lock().shutting_down = true;
+    }
+
+    /// Whether the store has been told to stop claiming work.
+    #[must_use]
+    pub fn is_shutting_down(&self) -> bool {
+        self.lock().shutting_down
     }
 
     // ------------------------------------------------------------------
@@ -921,18 +1088,8 @@ impl Store {
     }
 
     #[must_use]
-    pub fn agents(&self) -> &Arc<AgentCatalogue> {
-        &self.agents
-    }
-
-    #[must_use]
     pub fn runtime(&self) -> &Arc<dyn ToolRuntime> {
         &self.runtime
-    }
-
-    #[must_use]
-    pub fn registry(&self) -> &Arc<HarnessRegistry> {
-        &self.registry
     }
 
     #[must_use]
@@ -945,16 +1102,14 @@ impl Store {
         self.task_host.as_ref()
     }
 
-    #[must_use]
-    pub fn settings(&self) -> &HarnessRuntimeSettings {
-        &self.settings
-    }
-
     /// The provider trio the NEXT turn runs with, session override first
     /// (`api-reads.ts:1078-1093 providerSnapshot`).
+    ///
+    /// Takes the guard: the deployment trio is part of the host view, and the recorder reaches this
+    /// while it already holds the store lock.
     #[must_use]
-    pub fn provider_of(&self, state: &SessionState) -> ProviderConfig {
-        read::effective_provider(&self.settings, state.settings_provider().as_ref())
+    pub fn provider_of(&self, inner: &StoreInner, state: &SessionState) -> ProviderConfig {
+        read::effective_provider(&inner.settings(), state.settings_provider().as_ref())
     }
 
     /// `shared/runtime.ts:109 configuredProviderHost`: the `host[:port]` the process credential is
@@ -962,7 +1117,7 @@ impl Store {
     /// sending it somewhere else.
     #[must_use]
     pub fn provider_host(&self) -> Option<String> {
-        read::provider_host_of(&self.settings.base_url)
+        read::provider_host_of(&self.settings().base_url)
     }
 
     /// The working directory a tool body runs in.
@@ -1414,6 +1569,10 @@ impl SessionState {
             api_key: self.provider_key.clone(),
             model: self.record.settings.model.clone(),
             headers: BTreeMap::new(),
+            // The record has no sampling column (`persistence.ts:134-137` is a base URL and a model),
+            // so the session states no override and the deployment default applies
+            // (`read::default_sampling`).
+            sampling: None,
         })
     }
 
@@ -1499,7 +1658,29 @@ impl SessionState {
             .filter_map(|id| self.turns.get(id))
             .map(|turn| turn.record.clone())
             .collect();
-        record.queue = self.queue.clone();
+        // The durable backlog is the WHOLE pending set, not just the legacy array. TS keeps ONE
+        // `session.queue` array and lets each lane reference entries of it
+        // (`sessions.ts:5947-5953`), which is why its restore can re-home a queued turn into its lane
+        // (`:3202-3228`, F1). Writing only `self.queue` here made a lane's backlog memory-only, so a
+        // restart dropped the ordering guarantee and a fresh submit overtook work the user queued first.
+        //
+        // The union is stamped in TURN INDEX order: `index` is minted at enqueue (`turns.rs:197`), so the
+        // document states the backlog in the order the pump claims it, and `restore_session`'s per-lane
+        // split preserves it. A lane's ACTIVE turn is already out of its queue (`claim_next_turn`), so no
+        // id appears twice.
+        let mut backlog: Vec<String> = self.queue.clone();
+
+        for lane in self.lanes.values() {
+            backlog.extend(lane.queue.iter().cloned());
+        }
+
+        backlog.sort_by_key(|turn_id| {
+            self.turns
+                .get(turn_id)
+                .map(|turn| turn.record.index)
+                .unwrap_or(u64::MAX)
+        });
+        record.queue = backlog;
         record.thread_sequence = Some(self.turn_seq);
         record.thread_labels = (!self.thread_labels.is_empty()).then(|| self.thread_labels.clone());
         record.thread_label_high_water =
@@ -2220,11 +2401,55 @@ impl Store {
             })
             .unwrap_or_default();
 
-        let queue = record.queue.clone();
         let thread_seq = core
             .get("threadSequence")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+
+        // The durable backlog exactly as the document states it, before the lane split below.
+        let queue = record.queue.clone();
+
+        // F1 distribution (`sessions.ts:3202-3228`): every restored queued turn belongs to the LANE of
+        // the conversation it names, now that the roster has been rebuilt — or to the legacy queue when
+        // the harness/conversation predates the lane API. Keeping everything in the legacy array instead
+        // lets a fresh submit on another lane be claimed BEFORE a turn the user queued first, because
+        // `queued_turn_ids` is the only thing that would order them.
+        //
+        // Order is preserved by APPEND: `record.queue` is arrival order, and a turn's `index` is minted
+        // at enqueue time (`turns.rs:197`), so array order and index order are the same order. NO pump is
+        // started here — TS's restore starts none, and the backlog stays paused until an explicit submit
+        // names that lane.
+        let (queue, lanes) = if core.get("threads").is_none() {
+            (queue, HashMap::new())
+        } else {
+            let mut legacy: Vec<String> = Vec::new();
+            let mut lanes: HashMap<String, ThreadLane> = HashMap::new();
+
+            for turn_id in &queue {
+                let owner = turns
+                    .get(turn_id)
+                    .and_then(|turn| turn.record.thread_id.clone())
+                    .filter(|thread_id| threads_by_id.contains_key(thread_id));
+
+                match owner {
+                    Some(thread_id) => {
+                        lanes
+                            .entry(thread_id.clone())
+                            .or_insert_with(|| ThreadLane {
+                                thread_id: thread_id.clone(),
+                                ..ThreadLane::default()
+                            })
+                            .queue
+                            .push(turn_id.clone());
+                    }
+                    // A turn that names no conversation, or one this restore could not rebuild, stays
+                    // where a legacy document keeps it: the session's serialized backlog.
+                    None => legacy.push(turn_id.clone()),
+                }
+            }
+
+            (legacy, lanes)
+        };
 
         // Everything the record owns is read into a local BEFORE the record itself moves into the state,
         // because a struct literal moves its fields in written order.
@@ -2258,9 +2483,10 @@ impl Store {
             labels: crate::labels::LabelAllocator::with_seed(&label_high_water),
             invalid_threads: invalid_threads.into_iter().collect(),
             queue,
-            // Lanes are created on demand by the pump (`turns.rs:lane_of`), so a restored session starts
-            // with none and a queued backlog still drains.
-            lanes: HashMap::new(),
+            // The lanes the F1 distribution above rebuilt, so a restored backlog keeps its per-
+            // conversation ordering. A conversation with no queued turn has no lane entry: the pump
+            // still creates one on demand (`turns.rs:lane_of`).
+            lanes,
             active: Vec::new(),
             active_thread: restore_active_thread(&core),
             steer_mailbox: restore_steer_mailbox(&core),
