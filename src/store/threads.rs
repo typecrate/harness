@@ -260,6 +260,13 @@ impl SessionStore {
             .get("origin")
             .and_then(Value::as_str)
             .is_some_and(|origin| origin == "host");
+        // The contract's REST spelling is snake_case `owner_thread_id` (`contract::CreateSessionThreadRequest`);
+        // the camelCase half is accepted too, because the TS route reads a camelCase body and an old
+        // client must keep working.
+        let owner_thread_id = body
+            .get("owner_thread_id")
+            .or_else(|| body.get("ownerThreadId"))
+            .and_then(Value::as_str);
         let record = state.create_thread(
             &agent,
             if host {
@@ -267,7 +274,7 @@ impl SessionStore {
             } else {
                 ThreadOrigin::Agent
             },
-            body.get("ownerThreadId").and_then(Value::as_str),
+            owner_thread_id,
             label.as_deref(),
         );
         let thread_id = record.id.clone();
@@ -378,7 +385,23 @@ impl SessionStore {
 
         let at = crate::events::now_millis();
         let before = state.durable_record();
-        let dropped = state.detach_thread(thread_id);
+
+        // A conversation's DESCENDANTS go with it: their owner chain reaches this row, and a child
+        // whose parent is gone is unreachable plumbing (`api.ts:2522-2560`, and the contract's
+        // `removed_descendants` figure at `harness-api.ts:1447` exists for exactly this cascade).
+        let removed: Vec<String> = {
+            let mut names = vec![thread_id.to_owned()];
+            names.extend(descendant_threads(state, thread_id));
+
+            names
+        };
+        let mut dropped: Vec<String> = Vec::new();
+        for name in &removed {
+            dropped.extend(state.detach_thread(name));
+        }
+        dropped.sort();
+        dropped.dedup();
+
         let dropped_queued = u64::try_from(dropped.len()).unwrap_or(u64::MAX);
 
         for turn_id in &dropped {

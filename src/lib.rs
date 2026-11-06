@@ -24,10 +24,33 @@
 //! | `registry`    | `src/server/harnesses/{registry,presets,descriptor}.ts` (definitions only, no factories) |
 //! | `agents`      | `src/agents/**` (the trusted catalogue) + `src/server/harnesses/agent-state.ts` (the global overlay) |
 //! | `read`        | the host half of `src/server/api-reads.ts` + `api.ts:1329-1334` (`configDocument`) |
+//! | `store`        | the half of `src/server/sessions.ts` behind `src/store/*.rs`:  |
+//! |                | records, the turn recorder, the command registry, the          |
+//! |                | toolbox, the conversations, the actions and the restore path   |
+//! | `tools`        | `src/tools/**` (the generated catalogue, the descriptors and   |
+//! |                | the executable tools) + `harnesses/{core,toolbox}.ts` (the     |
+//! |                | session-bound rows the API lists)                              |
+//! | `transport`    | `src/providers/openAICompatible.ts` + `src/transport/**`       |
+//! |                | (the provider call, the stream fold, the wire transcript)      |
+//! | `turn`         | `src/core/agent.ts` (`runAgentCore`) + `src/harness.ts` (the   |
+//! |                | run loop, the retries, the steering drain, the tool loop)      |
+//! | `projector`    | `src/server/turn-projector.ts` + `src/shared/turn-display.ts`  |
+//! | `attachments`  | `src/shared/attachments.ts` (the brand grammar, the            |
+//! |                | attachment budget)                                             |
+//! | `runtime`      | `src/server/runtime.ts` (the per-database-root runtime and     |
+//! |                | its cache) + the composition `api.ts:740-940` builds for one   |
+//! |                | request                                                        |
+//! | `api`          | `src/server/api.ts` (the route table, the dispatch order and   |
+//! |                | every REST handler) + `src/server/{handler,service}.ts` - the  |
+//! |                | two adapters, one transport here                               |
+//! | `server`       | `src/server/{handler,service,start}.ts` (the router, the       |
+//! |                | graceful shutdown, the final durable document on the way out)  |
 //!
-//! The later stages of the port (the domain store, the agent runtime, the tool catalogue, the HTTP
-//! layer, and the `*-route.rs` discovery wiring) build on exactly these primitives, which is why
-//! the public signatures below are contractual, not incidental.
+//! STILL TO PORT: the WebSocket upgrade BODY (`src/server/stream/**`; this crate answers the mount
+//! with TypeScript's own 400 sentence), the session-domain route BODIES (`api.ts:1958-2820`, whose
+//! handlers are reachable stubs that consume the documented body and then refuse), and the
+//! `*-route.rs` discovery wiring. The public signatures below are contractual, not incidental,
+//! because every one of those stages reads them.
 
 /// Crate name, for banners and diagnostics (matches `[package] name` with `-` -> `_`).
 pub const CRATE_NAME: &str = "typecrate_harness";
@@ -43,6 +66,7 @@ pub fn version() -> &'static str {
 }
 
 pub mod agents;
+pub mod api;
 pub mod attachments;
 pub mod config;
 pub mod contract;
@@ -57,9 +81,15 @@ pub mod package_root;
 pub mod paging;
 pub mod persistence;
 pub mod ports;
+pub mod projector;
 pub mod read;
 pub mod registry;
+pub mod runtime;
+pub mod server;
 pub mod store;
+pub mod tools;
+pub mod transport;
+pub mod turn;
 
 #[cfg(test)]
 mod tests {

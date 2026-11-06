@@ -773,9 +773,12 @@ pub fn instruction_summary_of(
             let override_text = definition.agent_instructions.get(member);
             let profile = agents.effective(member);
 
+            // `chars` is a UTF-16 length, because TypeScript's `instruction.length` counts UTF-16 code
+            // units and the wire states the unit (`projector::display_chars`, the one helper for that
+            // count - `api.ts:2803` / `:2831` and `harness-api.ts`'s `chars` members).
             let chars = u64::try_from(override_text.map_or_else(
-                || profile.map_or(0, |profile| profile.instruction.chars().count()),
-                |text| text.chars().count(),
+                || profile.map_or(0, |profile| crate::projector::display_chars(&profile.instruction)),
+                |text| crate::projector::display_chars(text),
             ))
             .unwrap_or(u64::MAX);
 

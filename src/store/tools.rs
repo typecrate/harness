@@ -379,6 +379,10 @@ impl Store {
             .map(str::trim)
             .filter(|path| !path.is_empty())
             .map(|path| format!("tools/{name}/{path}"));
+        // ONE stamp for the installed revision: `revision_stamp` embeds a random suffix, so calling it
+        // twice minted two different revisions and the receipt stopped naming the revision the ledger
+        // and the source route report (`api.ts:920` returns this figure to the caller).
+        let source_revision = revision_stamp(state.created_tool_count, name);
         let tool = CreatedTool {
             name: name.to_owned(),
             description: description.to_owned(),
@@ -392,7 +396,7 @@ impl Store {
             // A newly created tool is ENABLED: the model asked for the capability, so it should see it
             // (`harness.ts toolCreate`).
             enabled: true,
-            source_revision: revision_stamp(state.created_tool_count, name),
+            source_revision: source_revision.clone(),
             created_at: now_ms(),
             created_by_turn: created_by_turn.map(str::to_owned),
             extra: Map::new(),
@@ -403,7 +407,7 @@ impl Store {
 
         Ok(SessionToolRegistrationResult {
             name: name.to_owned(),
-            source_revision: revision_stamp(state.created_tool_count, name),
+            source_revision,
             created: !replacing,
             replaced: replacing,
             previous_revision,
@@ -565,10 +569,10 @@ impl Store {
         }
 
         let removed_created = state.created_tools.remove(name).is_some();
-        // `disabled_tools` is a SET, so `remove` answers with the bool directly: an entry that was only an
-        // override is gone and the inherited catalogue binding is live again.
-        let restored_inherited = state.disabled_tools.remove(name);
-        if !removed_created && !restored_inherited {
+        // `disabled_tools` is a SET, so `remove` answers with the bool directly: a session-local
+        // disable that only overrode a catalogue binding goes away with the name.
+        let had_override = state.disabled_tools.remove(name);
+        if !removed_created && !had_override {
             return Err(unknown_tool(state, name));
         }
 
@@ -577,7 +581,12 @@ impl Store {
             tool_id: name.to_owned(),
             session_id: state.id().to_owned(),
             removed_created,
-            restored_inherited,
+            // Stated `false` unconditionally, exactly as TS does: restoring an INHERITED baseline
+            // needs a second copy of the definition this session overrode, and the registration
+            // kernel keeps only the INSTALLED source, so there is nothing to hand back
+            // (`api.ts:3296-3306`, the T27 disclosure). Reporting `true` would promise a restore
+            // that never happens.
+            restored_inherited: false,
         })
     }
 

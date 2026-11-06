@@ -154,12 +154,24 @@ impl Store {
         let start = usize::try_from(cursor).unwrap_or(usize::MAX);
         let take = usize::try_from(limit).unwrap_or(usize::MAX);
         let items: Vec<HarnessMessage> = filtered.into_iter().skip(start).take(take).collect();
-        let next = if (start + items.len()) < usize::try_from(total).unwrap_or(usize::MAX) {
-            Some(start as u64 + items.len() as u64)
+        let served = start + items.len();
+
+        // `next` is issued ONLY for an exactly-full page that has not reached the end of the document
+        // (`api.ts:3605`: `served < messages.length && rows.length === limit`). Minting a cursor after
+        // a SHORT page is what made a role filter loop forever: the filtered list is shorter than
+        // `total`, so the old test re-issued the same cursor with nothing left to serve.
+        let next = if items.len() == take && served < usize::try_from(total).unwrap_or(usize::MAX) {
+            Some(served as u64)
         } else {
             None
         };
-        let revision = self.revision_of(state.id());
+
+        // The paged read reports the `transcript_messages` counter of the conversation, which is the
+        // figure a client watching `transcript_messages` compares against (`api.ts:3605`).
+        let revision = self.hub.revision(
+            "transcript_messages",
+            Some(&crate::store::thread_key(state.id(), thread_id)),
+        );
 
         TranscriptMessagePage {
             meta: self.page_meta(revision, next, items.len()),
@@ -328,16 +340,20 @@ impl Store {
             error.is_some(),
         );
 
+        // The hub keys a conversation as `session:thread` (`api.ts` `threadKey`), and one transcript
+        // write moves BOTH of its counters: `transcript` (the figure the metadata read and the thread
+        // resource report) and `transcript_messages` (the figure the paged message read reports) -
+        // TS bumps both in the same publish (`api.ts:1176-1185`).
+        let key = crate::store::thread_key(session_id, thread_id);
+
         let outcome = CommitOutcome::touch(session_id)
             .event(
                 "transcript.updated",
                 &[
                     ("session", Some(session_id)),
-                    ("transcript", Some(thread_id)),
-                    (
-                        "thread",
-                        Some(&crate::store::thread_key(session_id, thread_id)),
-                    ),
+                    ("transcript", Some(key.as_str())),
+                    ("transcript_messages", Some(key.as_str())),
+                    ("thread", Some(key.as_str())),
                 ],
                 Some(thread_id),
                 None,

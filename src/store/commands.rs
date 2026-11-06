@@ -154,8 +154,14 @@ pub fn dispatch(state: &mut SessionState, store: &Store, prompt: &str) -> Comman
                 outcome.is_error = true;
                 return outcome;
             }
-            // A bare `/name` is the usage card (`command-builtins.ts:26-34`).
-            outcome.content = usage_card(&name);
+            // `/help` alone LISTS the registry (`command-builtins.ts:20-25`); a bare `/name` for any
+            // other command is that command's usage card (`:26-34`, and `helpText` is only ever
+            // reached with an argument).
+            outcome.content = if name == "help" {
+                help_text("")
+            } else {
+                usage_card(&name)
+            };
             outcome
         }
         ParsedCommand::Call { name, args } => {

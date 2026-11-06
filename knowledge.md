@@ -16,10 +16,20 @@ stage can re-check it instead of re-deriving it.
    `{scope, manual}` execution gate, `optionId`, a known page total, `subagents` on the card,
    report-only `publish` + the `ops` channel, the origin tables, `id: null`, the service name, and
    the base36 epoch suffix. See "T2.5" below for what a later stage must not re-break.
-3. Still to port - the domain store (`sessions.ts`, the `protocol.ts` session records, the turn
-   projector), the agent runtime (`harness.ts`, `core/**`), the tool catalogue (`tools/**`), the
-   transports (`transport/**`), the stream (`stream/**`), the HTTP layer (`api.ts`, `handler.ts`,
-   `service.ts`) and the `*-route.rs` discovery wiring.
+3. **T3 (done)** - the session store (`store/**`): the `sessions.ts` records, the turn recorder, the
+   command registry, the toolbox, conversations, actions and the restore path.
+4. **T4 (done)** - the runtime half: the tool catalogue and executable tools (`tools/**`), the
+   provider transport (`transport/openai.ts`), the turn engine (`core/agent.ts` + `harness.ts`
+   `runAgentCore`) and the display projector (`server/turn-projector.ts` +
+   `shared/turn-display.ts`).
+5. **T5a (done)** - the HTTP surface: the per-root runtime (`runtime.rs`), the `/v1/harness`
+   dispatcher and route table (`api/mod.rs`), the host handlers (`api/{root,config,harnesses,
+   agents,tools,models}.rs`), the router + graceful serve + shutdown flush (`server.rs`), the
+   standalone executable (`bin/server.rs`). The session-domain routes are reachable stubs; their
+   bodies land with T5b. See "T5a" below.
+6. Still to port - the WebSocket stream (`stream/**`, T5c), the session-domain route bodies
+   (`api.ts:1958-2820`, T5b), and the `*-route.rs` discovery wiring, plus the runtime-compiler
+   tools the catalogue lists but this build cannot execute (see "T4").
 
 ## Decisions
 
@@ -448,3 +458,459 @@ stream scope tables, the three-channel `ProviderCredential` model in `config.rs`
 handler stage decides), the journal line format, the registry name pattern, and the
 `agents.json` envelope.
 
+## T3 - the session store (`store/`: `mod`, `session`, `turns`, `commands`, `tools`, `transcript`, `threads`, `agents`, `actions`, `read`)
+
+### What landed
+
+`Store` (`pub type SessionStore = Store`) owns every session aggregate behind ONE
+`std::sync::Mutex<StoreInner>`, with `EventHub` as the single revision/publish source.
+`Store::open(config, settings, agents, runtime, executor, projector, registry, hub, task_host)`
+loads the durable document once (`restore_all`) and never blocks on it.
+
+The submit surface is `submit_task` (a slash line becomes a COMMAND turn, everything else the queue
+path), and the queue path keeps TS's order exactly: attachments, empty/200k bounds, references, the
+pending cap, steering, then the turn (`turns.rs:114-298`). `submit_command` settles a turn that is
+TERMINAL before its own receipt returns: no lane, no pump, no model request, and the synthesized
+`toolCall`/`tool` pair is what the record keeps (`turns.rs:305-565`).
+
+Lanes are per conversation with a single-flight pump; the flag is taken synchronously under the guard
+(`ThreadLane::pumping`, `spawn_pump`), the claim happens when a run starts (peek, never shift), and
+`settle_turn` releases the slot, folds usage from the RECORDED events (an outcome tally loses to the
+event fold when both exist), replaces the conversation's transcript from `TurnOutcome.messages`,
+expires that conversation's unanswered action requests, and checkpoints before it publishes
+(`turns.rs:688-1295`).
+
+### Rules this stage re-proved
+
+1. The mutex is never held across an `.await`; the only awaits are the executor, the action host and
+   the journal's own fences.
+2. Every mutation takes an undo point BEFORE it mutates (`durable_record()` / `snapshot_state()`) and
+   rolls back on a failed write, so a 500 leaves the previous state readable.
+3. Durability gates the receipt: a queued submit persists its backlog before the 202, and a command
+   persists the turn before the first event. A terminal save is a CHECKPOINT, not a gate.
+4. The credential never enters the document: `restore_session` sets `provider_key: None`, while
+   `settings_provider()` (and `session_resource_of`'s `endpoint`) synthesize the deployment pair.
+
+### Fixed while verifying (production, not test-only)
+
+* `commands::dispatch` answered a bare `/help` with the usage card, so the command LIST was
+  unreachable; `/help` now lists the registry and `/help <command>` still prints the card
+  (`command-builtins.ts:20-34`, which is also what the registry's own description states).
+* `transcript_page` minted `next_cursor` from the unfiltered total while serving filtered rows, so a
+  role-filtered client looped forever on an empty tail; a page now ends unless it is exactly full
+  (`api.ts:3605`).
+* A transcript write bumped `transcript` under the BARE thread id while every transcript read
+  addresses the composite `session:thread` key, and the paged read reported the SESSION counter. The
+  write now bumps `transcript` and `transcript_messages` on the composite key (the two kinds TS bumps
+  for one write, `api.ts:1176-1185`), and the page reports the `transcript_messages` figure.
+  `Store::transcript_revision_of` therefore gained a `session_id` parameter - the only public store
+  signature this stage changed.
+* `create_session_tool` stamped the installed revision twice (the stamp embeds a random tail), so the
+  receipt, the ledger row and the source route named three different revisions; one stamp is minted
+  and reused.
+* `create_thread` read only `ownerThreadId`; the contract's REST spelling is `owner_thread_id`
+  (`contract::CreateSessionThreadRequest`), so both are accepted now.
+* `delete_thread` removed only the named conversation, leaving its descendants pointing at a dead
+  owner; the cascade is transitive now (`harness-api.ts:1447`'s `removed_descendants`).
+* `delete_session_tool` reported `restored_inherited: true` whenever a session-local disable went
+  away. TS states `false` unconditionally, because restoring an inherited baseline needs a second
+  copy of the definition that the registration kernel does not keep (the T27 disclosure,
+  `api.ts:3296-3306`).
+
+### Deliberate simplifications (stated, not hidden)
+
+* A created tool is a DECLARATION: it registers and enables, but this build cannot compile a body, so
+  the source route is the only copy of the text and manual execution has nothing to run
+  (`tools.rs:72 CREATED_TOOL_NOT_COMPILED`).
+* `/websearch` and `/webfetch` answer with the tool-contract bridge note instead of running the
+  agent-loop tool (`commands.rs:178-182`); the integrated runtime replaces the text in T7.
+* `/task` addresses the STORE's task host, not a per-session board: the session argument is carried
+  (`_state`) for the day the board becomes session-scoped, and `?thread=` narrowing on the task list
+  is not implemented, so that filter answers empty.
+* `Store::runtime_snapshot()` states the BUILT-IN deployment runtime with the session's provider trio
+  substituted (no environment read inside a request), so `runtime_execution` is
+  `DEFAULT_THREAD_EXECUTION` (`inline`) unless the operator changes it.
+* Pump `JoinHandle`s are not retained: `shutting_down` plus each run's cancellation token are the
+  cooperative stop, and a pump exits by itself once its lane is empty.
+
+### Facts the transport (T4) must not rediscover
+
+* Two "transcript revision" figures are live on purpose: the THREAD RECORD's counter is what an
+  `if_revision` guard compares against (`transcript.rs:364-376`), the HUB's `transcript` counter is
+  what the metadata read and the thread resource report, and the paged read reports
+  `transcript_messages`. `put_transcript` moves all three except the record's own.
+* `session_summary_of.thread_count` counts HOST conversations only (`api-reads.ts:175-177`), while
+  `list_threads` pages the whole roster. An agent-origin row (a delegated child, or a `POST /threads`
+  without `"origin": "host"`) is therefore in the roster but not in the count.
+* A route that creates a conversation should pass `"origin": "host"`: the minted label continues the
+  reserved per-agent-code ordinal (`labels.rs:165-186`), so an explicit `RH9` makes the next mint
+  `RH10`.
+* `pending_action_count` is the ENTRY count (`api-reads.ts:227` `pendingActions.size`), so an answered
+  question keeps counting until it is pruned; the live list is `list_actions`'s `pending`.
+* The action host mints its own `requestId` and REPLACES a submitted one (`types/index.ts:865`); the
+  cap is four waiting questions per run, and the resolved promise payload is the recorded
+  `HarnessActionAnswer` verbatim.
+* `reset_session` refuses with its own sentence while a run or a backlog exists; the shared busy
+  sentence is used by exactly two verbs (`agents.rs:174`, `threads.rs:376`), and a declarative PATCH
+  lands during a run. `delete_thread` states the specific "still has live work" refusal first.
+* `initialize` does not start a lane pump. The durable queue is the LEGACY array
+  (`mod.rs:1502`), so a per-lane backlog comes back as unclaimed `queued` rows and drains only when
+  the next submit starts that lane (`tests/store_restore.rs`).
+
+### Tests
+
+`tests/store.rs` - 22 tests driving the public store surface over the real registry, catalogue and
+hub with scripted `TurnExecutor` / `ToolRuntime` / `ProjectorFactory` doubles: create/read/list with
+paging end-of-collection rules, every 404/400 refusal sentence, the full submit→receipt→pump→done
+fold (event list, `eventTimes` parallelism, usage fold, transcript replacement, journal lines and
+sequences), failure and banner clearing, lane FIFO with a durable clip backlog, per-conversation
+concurrency via a rendezvous, steering (including the `null` vs absent `threadId` deviation),
+cancel/reset/delete, the 100-task pending cap, the attachment matrix (415 table, 415 signature, 413
+bytes, 400 marker/count/duplicate), transcripts (paged, metadata, document, raw-accepted placeholder,
+`if_revision` 409 naming both figures), command turns and the command registry, the action
+lifecycle (park → list → refuse malformed → answer → conflict on re-answer → cap → expiry), the
+session toolbox, conversations with label reservation and descendant cascade, and the
+`StreamExists` truth table. `tests/store_restore.rs` - 4 tests over a second `Store::open` on the same
+root: full session/turn/transcript/label/journal restore, the durable-backlog gap above, the
+interrupted-run repair written into the document by hand, and the credential rule.
+Fixtures live under `Temp/typecrate-harness/{store,store-restore}/<pid>-<test>/` and are removed on
+`Drop`.
+
+## T4 - the runtime (`tools/`: `catalogue`, `result`, `files`, `command`, `syntax`, `text`, `web`, `mod`; `transport`, `turn`, `projector`)
+
+### What landed
+
+`src/tools/` is the catalogue AND the executable half of it: `catalogue.rs` (506 lines, generated),
+`result.rs` (725 - the model result budget, the `__toolUi`/`__toolMedia` unwrap, and the three
+outcome builders), `files.rs` (2 269 - `read`/`write`/`edit`/`fileList`/`glob`/`grep`), `command.rs`
+(335 - `shell`/`gitDiff` through the platform shell), `syntax.rs` (294), `text.rs` (439 - the five
+app tools), `web.rs` (818 - `fetch`/`search`/`download`), `mod.rs` (1 045 - `ToolRegistry`, the one
+dispatch path, and the two discovery tools). `src/transport.rs` (1 090) is the OpenAI-compatible
+client and the SSE fold; `src/turn.rs` (727) is `runAgentCore` plus `core/agent.ts`'s retry policy;
+`src/projector.rs` (2 048) is `server/turn-projector.ts`'s display fold. `Cargo.toml` gained exactly
+one build fact: tokio's `process` feature, because `shell`/`gitDiff` spawn the platform shell and a
+blocking `std::process` would park the turn's task while a build runs.
+
+### The catalogue is generated, not typed
+
+`catalogue.rs` is written by `Temp/typecrate-harness/t4/generate-catalogue.mjs` from
+`packages/underload/harness/src/core/tool-manifest.ts` (the AST scan of `src/tools/**/*.tool.ts`)
+plus the `metadata` literals of `src/server/tools/shared/*.tool.ts`. Regenerate instead of editing: a
+hand-copied description or schema drifts silently, and `/tools` is a document the model quotes back.
+35 rows in `GET /tools` order (core, presets, app tools, then `search`/`fetch`), never sorted by
+name. The deviations from the TS table are stated in the generated header, and the two that matter
+for a diff are: TS lists only the 14 core descriptors whose `listed !== false` (`toolCancel`,
+`threadSend`, `threadRead`, `threadList` are `listed: false` and therefore absent there), and the
+`search`/`fetch` rows follow the SERVER's "not session-bound" reading rather than the descriptor
+table's. `execution` is `{scope: session_required | global, manual: true}` per the stage contract;
+TS spells the session scope `session_only`, which is the same gate under the contract's enum.
+`testFlaky` (the example harness) is not part of the shared catalogue and is not listed.
+
+### Executable here, catalogued only
+
+21 of the 35 rows run: the six file tools, `shell`, `gitDiff`, `syntax`, `toolList`, `toolRequest`,
+`fetch`, `search`, `download`, `task` (through the session's task host), `actionRequest` (through
+the action host), and the five app tools. The other 14 are the runtime-compiler and thread family
+(`toolRegistry`, `toolManage`, `toolCreate`, `profileManage`, `chapterManage`, `locationManage`,
+`agentManage`, `agentResult`, `delegate`, `threadFork`, `toolCancel`, `threadSend`, `threadRead`,
+`threadList`): each one mutates or reads live per-session state that the `ToolRuntime` seam does not
+reach. They answer `Tool "{name}" failed: this server does not support {capability}, so "{name}"
+cannot run here. The capability is on the port list; use the tools that are executable to make
+progress.` - a well-formed FAILED outcome with a measured span, never a panic and never a fake
+success. `MISSING_CAPABILITY` (`mod.rs:77`) is the list and the capability text in one table.
+
+### Fixed while verifying (production, not test-only)
+
+The integration tests were written against the TS tool bodies (`src/tools/**/*.tool.ts`), not against
+the Rust output, and that found eight real divergences. All are fixed; the list is here because each
+one is a rule a later stage might otherwise re-break:
+
+* `turn.rs` seeded its request history from `Vec::new()`, so every turn answered as if it were the
+  first and the transcript it returned dropped the conversation the store had handed in. `TurnInput`
+  IS the conversation; the prompt is appended to it (`run_turn`, and `tests/turn.rs::a_recorded_transcript_continues_the_conversation`).
+* `projector.rs` and `turn.rs` each re-derived `add_usage` with a two-arm `cached` match, which
+  silently dropped a first frame's cached figure forever. Both now call the store's canonical
+  `store::turns::add_usage`, whose `(None, next)` arm keeps it.
+* `projector.rs` routed a conversation-root thread (and a threadless start) to a `subagent` row,
+  because only a `ROOT_KEY` section is the primary flow (`turn-display.ts:896`). A thread record with
+  no parent/call/kind/branch, and the first flow any fold sees, now mint the root row.
+* `transport.rs` appended custom headers instead of replacing the generated ones; TS composes
+  `{...generated, ...custom}`, so an `authorization` override was being sent twice. The merge now
+  runs through a map and writes each name once.
+* `fileList` echoed `limit` without slicing the page, ignored the `paths` property's rules, accepted
+  an explicit `[]` (which reads as "the directory is empty"), and prefixed entries with the raw root
+  so `./src` produced `./src/a.ts` and `src/` produced `src//a.ts`. TS `join()`s, which collapses
+  both. Unknown keys are now refused, because `{paths: [...], offest: 200}` would otherwise return
+  page 1 forever while the caller believed it was paging.
+* `write` accepted the same target twice in one batch - the second write silently winning - and
+  skipped the NUL rules (`write.tool.ts:136-168`).
+* `glob`/`grep` presented a FILE root as `long.txt/long.txt` and skipped the root-error sentences:
+  a typo'd root now answers `glob path "x" does not exist. Roots are resolved against the working
+  directory (...)` instead of reporting an empty listing, and an empty `paths`/`patterns` array is
+  refused rather than defaulted (`search.ts:532-568`). The flag vocabulary is JS's `dgimsuyv` with
+  TS's own sentence.
+* `edit` reported opencode's wordings instead of this package's, named the RAW path instead of the
+  resolved one, omitted the match line numbers from the ambiguity error, and had no line-ending
+  awareness at all: it now matches against the LF view (so the documented habit of writing
+  `oldString` with `\n` in a CRLF file works), re-joins the replacement with the matched region's
+  endings, applies the endings-only special case verbatim, and refuses a no-op replacement.
+* `toolRequest` ranked matches in catalogue order; TS ranks by each row's strongest criterion -
+  exact names in the CALLER's order, then a name regex, then tag-only - and a row the run already
+  has never consumes a slot in the page (`discovery.ts:373-378`).
+
+### Deliberate simplifications (stated, not hidden)
+
+* `edit` ports TS's FIRST matching tier only (the LF view). The typographic-quote tier and the
+  trailing-whitespace tier of `edit.tool.ts:20-33` are absent, so the optional `match` field never
+  appears and a near-miss is a refusal the model can re-copy. TS also aligns replacement lines to
+  region lines with a longest-common-subsequence pass (`alignLines`); this port joins every
+  replacement line with the region's dominant ending, which differs only inside a hunk that mixes
+  CRLF and LF.
+* `glob`/`grep` read no `.gitignore` (`files/gitignore.ts`) and dedupe displayed paths rather than
+  `realpath` file identity (`files/identity.ts`). The counters that would carry an ignore result are
+  reported as honest zeros with `ignoreFilesParsed: 0`.
+* `grep` compiles with the `regex` crate. JS-only constructs (lookaround, backreferences) REFUSE with
+  the regex crate's message rather than matching; Rust-only inline flags (`(?i)`) therefore MATCH
+  where JS reports "Invalid group"; and the invalid-pattern sentence is
+  `grep could not compile pattern "{src}": {regex crate message}` rather than V8's
+  `Invalid regular expression: /{src}/: Invalid group`.
+* `textSummarize` always takes the documented local condense fallback: there is no agent-runner seam
+  in the `ToolRuntime` contract yet, so the `Options` field that would carry one is present and
+  unused (`tools/mod.rs:201-207`).
+* Tool calls in one message run SEQUENTIALLY, in the order the model asked. TS launches a message's
+  calls through its scheduler concurrently; sequential execution keeps file side effects in the
+  requested order and keeps the event order deterministic for the projector.
+* `transport` emits at most one `usage` event per REQUEST (from the response the request settled
+  with), matching `harness.ts:6656`, because the store folds every event it sees. The per-chunk
+  `StreamEvent::Usage` exists for callers that want it and is deliberately not forwarded by `turn`.
+
+### The projector seam's limits (T5 must merge these)
+
+`ProjectorFactory::create()` receives NO turn record, so the fold states only what the events prove.
+Every op therefore carries `turnId: ""`, sections are `s{ordinal}` (never the store's section ids),
+`summary()` states `id: ""`, `index: 0` and `prompt: ""`, there are no `context:*` ops (`blocks: []`),
+no `pending:set` (this build has no background scheduler), and `settle()` MINTS no ops because the
+seam returns `()` - the store re-reads `summary()`/`display()` immediately after, which is how the
+same state becomes observable. `TurnInput` carries no agent name either, so a Rust turn reports the
+agent `primary` (`turn.rs:62` `PRIMARY_AGENT`) and the exhaustion sentence names it. T5's job at the
+read-model boundary is the merge the TS projector did with its record in hand: rename `prompt` to
+`promptPreview`/`promptChars`, stamp `id`/`index`/`sectionCount` from `SessionTurn`, and attach the
+labels the invocation join provides.
+
+### Facts the HTTP stage (T5) must not rediscover
+
+* The public surface is `tools::ToolRegistry::{new, with_options}`, `transport::OpenAiClient`,
+  `turn::AgentExecutor::new` and `projector::TurnProjectorFactory::new` - each returns the `Arc` the
+  store's `Store::open` expects, and each is `Send + Sync`.
+* A `ToolRegistry` resolves availability WHEN BUILT (`Options::default()` reads the environment), so
+  a host that loads `.env` later must build the registry afterwards, or it advertises the wrong state.
+  The credential VALUES never reach a wire field: `/tools` names environment variables only
+  (`tests/tools.rs::a_keyless_host_reports_search_unconfigured_and_never_leaks_a_credential`).
+* `ToolExecCtx::cwd` is the run's working directory, and the file tools are UNSANDBOXED: relative
+  paths resolve against it, absolute paths are used as given. Results are posix-styled; an absolute
+  path is echoed the way the platform spells it, exactly like `path.resolve()`.
+* The three outcome classes are distinguishable and the difference is the contract: a REJECTED call
+  (bad arguments, unknown tool) reports `duration_ms: 0` because it never executed, a FAILED call
+  reports the measured span and puts the same sentence in `content` and `error`, and a COMPLETED call
+  puts the budgeted result in `content` with `panels`/`media` peeled off their brands
+  (`result.rs:354-420`, `harness.ts:5031-5107`).
+* An over-budget tool result becomes the named envelope `{truncated, originalBytes, budgetBytes,
+  content}` - the FIRST geometric fit, byte-exact - and that envelope is what the model reads
+  (`result::bound_tool_result`; `tests/tools.rs::an_oversized_result_becomes_the_named_budget_envelope`).
+* `TurnInput::transcript` is the conversation and `system_instruction` is projected on EVERY request
+  and never stored; a transcript that already leads with a system entry is left alone
+  (`turn::Run::request_messages`). `max_iterations: 0` means "use the library default" (16), the
+  steering receiver must be drained to empty when the run settles, and a run that does not succeed
+  returns the ORIGINAL transcript because the store REPLACES the conversation with the result.
+* The projector must be folded exactly once per recorded event, in order, and settled once at the
+  terminal status; a restored turn rebuilds by folding every event, which is what makes
+  live == replay an assertion rather than a hope (`tests/projector.rs::live_folding_equals_a_cold_replay_of_the_same_events`).
+
+### Tests
+
+`tests/tools.rs` - 24 tests: the `/tools` document (row count, group order, visibility table, tags,
+the session hint, the identified read's schema and `{scope, manual}` gate, the credential-name-only
+availability rule), every executable tool's happy path and refusal sentences against real fixture
+files, the three outcome classes, the result budget end to end, `shell`/`gitDiff` against a nested
+`git init` fixture, the discovery pair including TS's ranking, the task/action pass-throughs, and the
+catalogued-only refusal for all 14. `tests/transport.rs` - 23 tests over a local axum listener: the
+request document and headers, the streamed fold (arrival order, tool-call merge by `index`, usage
+normalisation and clamping, `[DONE]`), every failure sentence (`HTTP {status}: {body}`, empty error
+body, `Malformed stream frame: {200 chars}`, a gateway error on a 200, `Truncated`, an aborted
+request, an unreachable host), and the wire transcript (part order around markers, the two
+cannot-represent-it sentences, the audio formats, tool-media provenance, the 4+1 grouping with
+`(part N of M)`, marker defanging, id re-suffixing). `tests/turn.rs` - 13 tests over the same local
+listener plus a scripted `ToolRuntime`: the exact frame sequence for a text answer, a tool round, a
+retry (`attempt`, `maxAttempts: 11`, `delayMs: 1_000`), an exhausted tool loop, a cancelled run, a
+steer queued before and during a run, a malformed argument string, a failing tool, request-identity
+across rounds, and the minted invocation uuid. `tests/projector.rs` - 15 tests: the state
+vocabularies, the markdown flattening and the head/tail preview rules (including the UTF-16 counting
+that keeps a surrogate pair whole), the queued-row baseline, the root flow's insert/append stream,
+the retry's discard, one step row per call, the abandoned-call rows `settle` writes, the usage
+two-line publish, the error notice that never takes the tail, and live == replay. Fixtures live under
+`Temp/typecrate-harness/t4/<pid>-<test>/` and are removed on `Drop`; no test in this stage touches a
+real provider or the network.
+
+## T5a - the HTTP surface (`runtime`, `api/**`, `server`, `bin/server`)
+
+### What landed
+
+* `src/runtime.rs` (565 lines) - `HarnessRuntime` and the per-root cache. The key is the
+  CANONICAL root (`std::fs::canonicalize`, lexical fallback) with the `\\?\\` prefix stripped by
+  `cache_key`, so `./x`, `x`, and `C:\\abs\\x` reach one runtime - the rule
+  `src/server/runtime.ts:299-308` states. The cache lock is held ACROSS the build, which is what
+  stops two concurrent first requests from constructing two registries for one root. A runtime
+  holds the AUTHORITATIVE `Arc<RwLock<..>>` registry / agents / settings copies; the store keeps
+  immutable boot snapshots (`StoreInner` holds `agents` / `registry` as bare `Arc`s with no writer-side
+    accessor, `store/mod.rs:846-850`), so
+  `save()` fills `registry` / `deleted` / `globalSettings` into `store.database_of(&inner)` and
+  hands the result to `persistence::write_harness_database` - TS's two-file unit
+  (`sessions.ts:2675-2691`: `state.json` first, then the `agents.json` overlay).
+* `src/api/mod.rs` - the one composition every handler shares: `Ctx` (runtime + method + pathname +
+  parsed query + captured params + headers + a `BodyReader`), `ApiResponse` / `ApiResult`,
+  `body_limit_for`, `requested_mount`, `mount_segments`, `match_route`, `ROUTES`, `Operation`,
+  `dispatch_operation`, `handle_request`, `handle_stream`, `write_response` / `write_error`.
+* `src/api/{root,config,harnesses,agents,tools,models}.rs` - every host route in
+  `api.ts:1292-1950`: the boot document, health, `GET/PATCH /config` with the credential channels,
+  the definition catalogue (list + `q`, card, instructions index and text), harness CRUD with the
+  name pattern and the primary-reference refusal, the agent catalogue with the global overlay,
+  the tool catalogue with both filters and the manual gate, and model discovery with the retry
+  policy and the scoped credential.
+* `src/server.rs` + `src/bin/server.rs` - `router(database_root)` (the mount, the stream path, the
+  `{*rest}` half, and a fallback that hands a non-mount path to the SAME dispatcher so the answer
+  is the contract's mount sentence), `serve` / `serve_on` with graceful shutdown, and `flush`
+  which writes the final durable document on the way out (`start.ts:328-340`'s dispose step). The
+  executable takes `--host` / `--port` / `--database-root` / `--help`, defaults to
+  `127.0.0.1:5181`, exits 2 on a usage error, and stops on SIGINT/SIGTERM.
+
+### The dispatcher order is the contract
+
+`api.ts:3980-4064` + `service.ts:553-556`, and each step exists on purpose: origin gate (before
+any runtime work) -> per-root runtime -> mount guard -> route match -> verb -> handler, where the
+body is read under the route's cap ONLY if the handler asks for it. A wrong verb and an unknown id
+therefore never parse a body (`api.ts:4009`, `:4022-4024`).
+
+The route table is `pub static ROUTES: [Route; 45]` - one id, the verbatim TS template, and the
+operations in TS declaration order - paired with an `Operation` enum and ONE match in
+`dispatch_operation`. It maps to operations rather than fn pointers because an async fn's future
+cannot live in a `static`; the table stays data and the dispatcher stays the only place a handler
+is named.
+
+### Deliberate deviations (stated, not hidden)
+
+1. **415 for a non-JSON media type.** TS's adapters never inspect the request `content-type` -
+   node hands the handler an already-parsed body and the gateway parses before dispatch - so there
+   is no TS sentence to copy. The contract documents 415 for a request body, and this port enforces
+   it in the same voice as its neighbours: `A request body must be application/json (content-type
+   "..." is not supported).` An EMPTY body is `{}` whatever the header says, which keeps TS's
+   empty-chunks arm (`handler.ts:120-123`) unchanged.
+2. **`X-Harness-Epoch` on every JSON response, errors included.** TS stamps the contract headers
+   in `json()` and returns a bare result from its catch arm, so an error leaves without one. The
+   value is the process epoch either way (`EventHub::new()` takes `events::process_epoch()`), so
+   stamping it cannot make a client believe anything a success would not.
+3. **The body drain grace.** `BODY_DRAIN_GRACE_BYTES = 32 MiB` (`api/mod.rs:289`). Hyper ends the
+   connection the moment a handler answers with the request body still arriving, and a client
+   mid-write reads `ConnectionReset` instead of the envelope. TypeScript cancels the reader and lets
+   node absorb it (`service.ts:378-381`, "stop the transfer rather than drain a body nobody will
+   read"). The equivalent here is to keep reading and throw the bytes away, bounded: every body the
+   contract ALLOWS fits inside the grace, so a compliant client always receives its 413 / 415 / 400
+   / 405, and only an unbounded upload is dropped - which is what TS's cancel does to it.
+4. **`chars` is a UTF-16 length in the files this stage owns.** `String.length` in TS counts UTF-16
+   code units; `projector.rs:98` already counts that way. `api/harnesses.rs:399` now matches.
+   FOLLOW-UP for the owners of the other two producers: `registry/mod.rs:776-778`
+   (`instruction_summary_of`) and `store/agents.rs:123` still use `chars().count()`. The two
+   spellings differ only for astral text, and the difference is invisible in every shipped
+   instruction, but one shared helper is the right end state.
+5. **The provider display URL is `URL.origin + URL.pathname`** (`transport/models.ts:97`), including
+   WHATWG's literal `"null"` origin for `file:` - so a `file:///tmp/provider` base URL answers
+   `"null/tmp/provider" must use http or https to list models.`, and the request-failure sentence
+   quotes the RESOLVED `{base}/models` endpoint (`:189`, `:211`), not the caller's base.
+   `origin::parse_url` is the origin gate's reader and it requires a host to compare, so
+   `api/models.rs::originless_url` recognises the empty-authority shape locally rather than widening
+   a T1 file.
+6. **A failed runtime creation is not cached.** `src/server/runtime.ts:300` keeps the rejected
+   promise, so TS replays one failure forever; this port retries. A transient open failure (a lock,
+   a half-written document) should not poison a root for the life of the process.
+7. **No `axum-test` dev-dependency.** 4.x needs `tokio ^1.44` and `hyper-util`, and this repo pins
+   both `tokio` and `hyper` to workspace mirrors. The suites bind a real `axum::serve` listener
+   instead, which is what makes `tests/http_host.rs` evidence about the executable's own accept
+   path.
+
+### Fixed while verifying (production, not test-only)
+
+* `api/tools.rs` - the availability filter compared with `is_none_or`, which let a row with NO
+  availability block match BOTH filters, so `?availability=unconfigured` returned rows that report
+  no state at all. TS's rule is `entry?.availability?.state ?? 'available'` (`api.ts:1826`): the
+  `??` half is what `availability_of_row` now implements, and such a row belongs on the `available`
+  page only.
+* `api/tools.rs` - the session refusal keyed on the projected `execution.scope` instead of the
+  entry flag TS reads (`api.ts:1871`, `entry.sessionBound === true`). They agree for all 35 rows
+  because `toolDetailOf` derives the scope from that flag (`api-reads.ts:1211`), but the flag is
+  the contract, so the gate reads the flag.
+* `api/agents.rs` - serde maps a JSON `null` and an ABSENT key to the same outer `None` on an
+  `Option<Option<T>>` (probed against this exact shape), which made TS's
+  `hasOwnProperty ? value ?? null : ...` restore arm unreachable: `{"instruction": null}` answered
+  `A patch must change at least one field.` Presence now comes from the body's own keys and
+  `restores()` re-attaches the `Some(None)` arm AFTER the decode, so the type validation and its
+  error wording are untouched.
+* `api/sessions.rs` and the eight sibling session stubs - a stub that answers without touching the
+  stream leaves the client's upload half-written, so the 500 arrived as a reset. Each stub now
+  consumes the body its verb documents (`require_empty_body` / `body_object` / `body_value`), which
+  keeps the cap and media-type rules live on those routes; `POST {root}/sessions/{id}/tasks` keeps
+  its 16 MiB boundary proof, and `api/mod.rs` drains on the 405 arm for the same transport reason.
+* `api/models.rs` - the resolved provider URL DROPPED the base URL's query. `modelsUrl` assigns the
+  pathname only (`transport/models.ts:129-131`), so the search survives into `url.href`; a base URL
+  addressed as `{base}/v1?tag=live` lost its selector here. `models_url` now appends `url.search`,
+  and the mock provider records each request target so the rule is asserted from the provider's side
+  (`tests/http_host.rs::model_discovery_reads_and_filters_the_provider_list`).
+* `store/mod.rs` (T2's file, touched deliberately and reported) - the shared vendor-registry open
+  budget was 24 attempts at 5-25 ms, roughly 0.6 s, and the new suites' parallel `Store::open` load
+  exceeded it: `Store open failed: the shared vendor registry is not yet available (transient)`.
+  The budget is now 40 attempts at 20-60 ms. The error contract is unchanged; the wait is longer.
+  If a later stage wants a principled fix, the registry should be opened once per process and
+  shared, rather than retried per test.
+
+### Facts the session-domain and stream stages must not rediscover
+
+* **Host-kind counters collapse.** `events.rs:42` `HOST_RESOURCE_KINDS = [harnesses, agents,
+  tools, config]` and `normalize_id` drops the id for them (`api-events.ts:99-105`), so
+  `bump(kind)` + `bump(kind, id)` in ONE write move a single counter by two, and the header quotes
+  the second value. The agent test therefore sees 2, then 4, then 6 - and TS's `api.ts:1763-1764`
+  produces the same three numbers for the same reason.
+* **Credential state is three channels, not one** (`api.ts:795-838`, `:1368-1374`, `:1424-1446`):
+  the boot pair, the live key + its claimed pair, and the provider the live key belongs to.
+  `advertised_has_api_key()` is `!api_key.is_empty() || (has_key && !declares_credential)`, and a
+  PATCH that nulls a field falls back to the BOOT arm, not the live one.
+  `api/models.rs::scoped_provider_settings` implements TS's third `credential` argument as two
+  `merge_settings` passes, because `config::merge_settings` takes only defaults + input.
+* **The route table is final data.** A new operation is one `Operation` variant plus one
+  `dispatch_operation` arm; nothing else in `api/mod.rs` changes. Session handlers swap by editing
+  their own module.
+* `runtime::evict_runtime(root)` is the per-root reset (the restart tests use it);
+  `clear_runtime_cache()` resets EVERY root and therefore every hub's counters, which is why a test
+  that needs a fresh instance for one root must not call it.
+* `handle_stream` currently answers the TS `api.ts:3911` sentence - `GET /stream expects a WebSocket
+  upgrade (Sec-WebSocket-Key/Version) for the harness.v1 subprotocol.` - which is what
+  `queue.test.ts:1090` and `view.test.ts:779` pin. T5c replaces the body of that function; the
+  origin gate (`check_stream_origin`, including `https://*.github.io`) is already the stream's.
+
+### Tests
+
+`tests/http_host.rs` - 17 tests over a real `axum::serve` listener on `127.0.0.1:0` with pooling
+disabled, one fresh database root per test under `Temp/typecrate-harness/http-host/<pid>-<test>/`:
+the boot document's full capability surface, health and the live session count, the legacy-prefix
+404 that names `/v1/harness`, the unknown-route 404 plus the stream's 400, the config document and
+PATCH (every writable field, the null-restores-boot rule, all 18 refusal arms, the credential
+channels, and a restart that proves the pair is durable), the definition catalogue (`q` matching
+lowercased `name title description`, the alias-resolved read, the instructions index and member
+text), harness CRUD (the name pattern, the duplicate refusal, the primary-reference 422, `harden`,
+and a restart that shows an in-memory-only session is gone while the registry rows are not), the
+agent surface (catalogue rows, the `referenced_by` field, patch/restore/retire with the collapsed
+counter sequence, and `agents.json` holding ONLY the operator's decisions), the tool catalogue
+(35 rows in catalogue order, both filters, the identified read's `{scope, manual}` gate, the manual
+execution pair including the `ToolCallResult` discriminant), model discovery against a local mock
+provider (parse and dedupe, the credential scoping rules, the ten-attempt retry budget, every
+failure class verbatim, and the body policy), the body policy itself (the 64 KiB cap, the 16 MiB
+submit boundary in both directions, the 415, the malformed-JSON 400, and the two laziness proofs),
+the origin gate's whole policy table, and strict paging (`limit` refusals, the four cursor
+refusals, and the exact `limit` echo of a short page).

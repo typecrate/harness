@@ -60,6 +60,8 @@ axum = { version = "0.8", features = ["json", "query", "ws"] }
 # Multi-thread runtime + macros for `#[tokio::main]`/`#[tokio::test]`, the listener,
 # timeouts (retry backoff, turn budgets), ctrl_c/SIGTERM for graceful shutdown,
 # `fs` for the snapshot/journal documents, `io-util` for the stream transport.
+# `process` is T4's addition: the `shell`/`gitDiff` tools spawn the platform shell, and
+# a blocking std::process spawn would stall the turn's task while a build runs.
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
@@ -69,6 +71,7 @@ tokio = { version = "1", features = [
     "signal",
     "fs",
     "io-util",
+    "process",
 ] }
 # Derives for the wire contract in src/contract.rs (snake_case REST resources,
 # camelCase display subtree - same split as src/shared/harness-api.ts).

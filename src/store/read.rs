@@ -582,6 +582,13 @@ impl TurnState {
     /// camelCase `TurnSummary` with `prompt` replaced by the bounded `promptPreview` + exact
     /// `promptChars` pair, and the same rename applied to every `steers[i]` entry (`steerRowOf`,
     /// `:315-325`).
+    ///
+    /// THE T5b MERGE (knowledge.md "The projector seam's limits"): `ProjectorFactory::create()` is
+    /// handed NO turn record, so the fold states only what the events prove - `id: ""`, `index: 0`,
+    /// `prompt: ""`, no `threadId`/`threadLabel`, no attachments, no references, no steers. In the
+    /// TypeScript original the projector HAS the record (`turn-projector.ts:2826-2870` `summaryOf`)
+    /// and prints those members itself. This is the one place the two halves meet: the record is
+    /// borrowed here, so the fold stays pure and the WIRE row is the contract's `TurnSummary`.
     #[must_use]
     pub fn row(&self) -> Value {
         let mut row = self.projector.summary();
@@ -590,11 +597,28 @@ impl TurnState {
             return row;
         };
 
-        let prompt = map
-            .get("prompt")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let record = &self.record;
+
+        // The record-only members, stamped in the projector's own key order (`turnId` stays absent:
+        // a ROW is addressed by its id, the display tree is the document that names its turn).
+        map.insert("id".to_owned(), Value::String(record.id.clone()));
+        map.insert("index".to_owned(), Value::from(record.index));
+
+        // `threadId`/`threadLabel`/`startedAt` are optional on the contract and TS omits them when
+        // the turn has none, so an absent record member must not print as `null`.
+        if let Some(thread_id) = record.thread_id.as_deref() {
+            map.insert("threadId".to_owned(), Value::String(thread_id.to_owned()));
+        }
+
+        if let Some(label) = record.thread_label.as_deref() {
+            map.insert("threadLabel".to_owned(), Value::String(label.to_owned()));
+        }
+
+        if let Some(started_at) = record.started_at {
+            map.insert("startedAt".to_owned(), Value::from(started_at));
+        }
+
+        let prompt = record.prompt.clone();
 
         map.remove("prompt");
         map.insert(
@@ -604,14 +628,53 @@ impl TurnState {
         map.insert(
             "promptChars".to_owned(),
             Value::Number(
-                u64::try_from(prompt.chars().count())
+                // UTF-16 units: `promptChars` is TS's `prompt.length` (`api-reads.ts:284`).
+                u64::try_from(crate::projector::display_chars(&prompt))
                     .unwrap_or(u64::MAX)
                     .into(),
             ),
         );
 
-        // The steer entries ride the same rename.
-        if let Some(steers) = map.get("steers").cloned().filter(Value::is_array) {
+        // The attachment chips (`turn-projector.ts:2767-2784`), byte-bounded and camelCase like the
+        // rest of the display subtree; only this turn's own attachments, and only when it has any.
+        let attachments = record.attachments.clone().unwrap_or_default();
+
+        if !attachments.is_empty() {
+            map.insert(
+                "attachments".to_owned(),
+                Value::Array(
+                    attachments
+                        .iter()
+                        .map(crate::attachments::inline_display_attachment)
+                        .collect(),
+                ),
+            );
+        }
+
+        // The `#LABEL` references of this submit (`:2862`), omitted when empty like every other
+        // optional display member.
+        let references = record.references.clone().unwrap_or_default();
+
+        if !references.is_empty() {
+            map.insert(
+                "references".to_owned(),
+                serde_json::to_value(references).unwrap_or(Value::Null),
+            );
+        }
+
+        // The steer entries: the record's own ring, projected by the fold (`syncSteerBlocks`), then
+        // the same `prompt` -> `promptPreview` + `promptChars` rename `steerRowOf` applies.
+        let steers = record.steers.clone().unwrap_or_default();
+
+        if !steers.is_empty() {
+            let renamed: Vec<Value> = steers
+                .iter()
+                .map(|steer| steer_row(&serde_json::to_value(steer).unwrap_or(Value::Null)))
+                .collect();
+
+            map.insert("steers".to_owned(), Value::Array(renamed));
+        } else if let Some(steers) = map.get("steers").cloned().filter(Value::is_array) {
+            // A fold that did mint steer rows keeps them, and they ride the same rename.
             let renamed: Vec<Value> = steers
                 .as_array()
                 .unwrap_or(&vec![])
@@ -625,10 +688,89 @@ impl TurnState {
         row
     }
 
-    /// The turn's display document (`projector.display()`), forwarded verbatim.
+    /// The turn's display document (`projector.display()`), with the record-only identity the seam
+    /// cannot see stamped in: `turnId`, and every section id rewritten to the store's mint
+    /// (`${turnId}:${ordinal}`, `turn-projector.ts:698`) along with the references to it.
+    ///
+    /// WHY HERE: the fold's internal keys are `s{ordinal}` (`projector.rs:434`) because it has no
+    /// turn id, and the wire identity is the minted one - so the id rename runs at the read boundary
+    /// where the record IS in hand, and the block ids (`{ordinal}-{kind}-{key}`, `:1287`) need no
+    /// rewrite at all because they never embed the turn id.
     #[must_use]
     pub fn display(&self) -> Value {
-        self.projector.display()
+        let mut display = self.projector.display();
+        let turn_id = self.record.id.clone();
+
+        let Some(map) = display.as_object_mut() else {
+            return display;
+        };
+
+        map.insert("turnId".to_owned(), Value::String(turn_id.clone()));
+
+        // Old id -> wire id, by MINT POSITION: `mint_section` allocates the ordinal and appends the
+        // section in the same step, so the array order IS the ordinal order.
+        let Some(sections) = map.get_mut("sections").and_then(Value::as_array_mut) else {
+            return display;
+        };
+
+        let renames: Vec<(String, String)> = sections
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, section)| {
+                section
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| (id.to_owned(), format!("{turn_id}:{ordinal}")))
+            })
+            .collect();
+
+        let lookup = |id: &str| -> String {
+            renames
+                .iter()
+                .find(|(from, _)| from == id)
+                .map_or_else(|| id.to_owned(), |(_, to)| to.clone())
+        };
+
+        for section in sections.iter_mut() {
+            let Some(entry) = section.as_object_mut() else {
+                continue;
+            };
+
+            if let Some(id) = entry.get("id").and_then(Value::as_str) {
+                let id = id.to_owned();
+                entry.insert("id".to_owned(), Value::String(lookup(&id)));
+            }
+
+            // The parent reference is rewritten in a SECOND pass per section, so a parent minted
+            // later than its child still resolves (`parentSectionId` is a mint-time id).
+            if let Some(parent) = entry
+                .get("parentSectionId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            {
+                entry.insert("parentSectionId".to_owned(), Value::String(lookup(&parent)));
+            }
+
+            // A step NODE is a full `DisplayStep` copy, and TS's copy names its turn and its
+            // section (`turn-projector.ts:1982-1990`); a prose/notice node names neither.
+            if let Some(nodes) = entry.get_mut("nodes").and_then(Value::as_array_mut) {
+                for node in nodes.iter_mut() {
+                    let Some(step) = node.as_object_mut() else {
+                        continue;
+                    };
+
+                    step.insert("turnId".to_owned(), Value::String(turn_id.clone()));
+
+                    if let Some(section_id) =
+                        step.get("sectionId").and_then(Value::as_str).map(str::to_owned)
+                    {
+                        step.insert("sectionId".to_owned(), Value::String(lookup(&section_id)));
+                    }
+                }
+            }
+        }
+
+        display
     }
 }
 

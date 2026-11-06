@@ -1022,10 +1022,13 @@ impl Store {
         self.hub.revision("session", Some(session_id))
     }
 
-    /// One conversation's transcript revision (`hub.revision('transcript', threadKey)`).
+    /// One conversation's transcript revision (`hub.revision('transcript', threadKey)`). The hub keys
+    /// a conversation as `session:thread` (`api.ts` `threadKey`), so the session id is part of the
+    /// address - a bare thread id is a DIFFERENT counter, which is why this takes both.
     #[must_use]
-    pub fn transcript_revision_of(&self, thread_id: &str) -> u64 {
-        self.hub.revision("transcript", Some(thread_id))
+    pub fn transcript_revision_of(&self, session_id: &str, thread_id: &str) -> u64 {
+        self.hub
+            .revision("transcript", Some(&thread_key(session_id, thread_id)))
     }
 
     /// `api-events.ts:299 publish`, AFTER the caller's bumps: report-only, fanned out synchronously.

@@ -120,7 +120,10 @@ impl Store {
             session_id: id.to_owned(),
             agent_id: agent_id.to_owned(),
             source,
-            chars: u64::try_from(instruction.chars().count()).unwrap_or(u64::MAX),
+            // `chars` counts UTF-16 code units, exactly like TypeScript's `instruction.length`
+            // (`api.ts:2803`, `:2831`); `projector::display_chars` is this crate's one helper for that
+            // unit, so the two spellings cannot drift apart (`knowledge.md` "T5a", deviation 4).
+            chars: u64::try_from(crate::projector::display_chars(&instruction)).unwrap_or(u64::MAX),
             instruction,
             guidelines,
         };
