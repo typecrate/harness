@@ -456,7 +456,10 @@ async fn the_boot_document_advertises_the_contract() {
             "pending_actions": 4,
             "steer_records": 64,
             "created_tools": 32,
-            "tool_result_bytes": 65_536,
+            // `harness-api.ts:216` / `harness.swagger.yaml:243`. The advertised budget is the
+            // CONTRACT's 256 KiB; this build still ENFORCES `MODEL_TOOL_RESULT_BUDGET_BYTES`
+            // (64 KiB) until the tool stage widens - `tests/foundation.rs` pins both figures.
+            "tool_result_bytes": 262_144,
             "page_limit_default": 25,
             "page_limit_max": 100,
         })
@@ -488,12 +491,15 @@ async fn the_boot_document_advertises_the_contract() {
             "harnesses": "/v1/harness/harnesses",
             "agents": "/v1/harness/agents",
             "tools": "/v1/harness/tools",
+            // T10: the plugin collection the front-end's Plugins pane reads. A missing link is a
+            // pane that never loads, which is exactly the failure this uplift is about.
+            "plugins": "/v1/harness/plugins",
             "models": "/v1/harness/models",
             "sessions": "/v1/harness/sessions",
             "stream": "/v1/harness/stream",
         })
     );
-    assert_eq!(reply.body["links"].as_object().expect("links").len(), 9);
+    assert_eq!(reply.body["links"].as_object().expect("links").len(), 10);
 
     // A verb the route does not declare is a 405 naming the allowed list (`api.ts:4010-4013`).
     let wrong = Reply::send(client().post(server.url("/v1/harness"))).await;

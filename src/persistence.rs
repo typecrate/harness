@@ -234,6 +234,26 @@ pub struct HarnessGlobalSettingsRecord {
     pub extra: Map<String, Value>,
 }
 
+/// The persisted shape of the operator's PLUGIN setting overrides (`HarnessPluginSettingsRecord`,
+/// `persistence.ts:296`): plugin name -> setting key -> value.
+///
+/// Modeled as `Map<String, Value>` because `serde_json::Map` only implements `Serialize` /
+/// `Deserialize` / `Clone` for the `Map<String, Value>` shape, so a nested
+/// `Map<String, Map<String, Value>>` would not compile. The INVARIANT is what the type alias cannot
+/// state: every member is itself an OBJECT whose values are the three JSON scalars a descriptor can
+/// declare. The loader enforces that shape before anything reads it
+/// ([`validate_document`]'s `pluginSettings` pass), and [`crate::plugins`] is the only other writer.
+///
+/// ONLY overrides, never defaults. Each built-in declares its own default in the catalogue
+/// (`src/plugins.rs`, the port of the generated `src/plugin/manifest.ts`), so a release that moves a
+/// default moves it for every deployment with no migration in this file, and a plugin with no entry
+/// means "nothing has ever been changed about it". `null` is NOT stored: a reset DROPS the key,
+/// which is the same fact in one fewer byte and keeps `values(plugin)` free of "explicitly nothing"
+/// states. `Map`, not `BTreeMap`, because the writer emits CATALOGUE order with each plugin's keys
+/// in DECLARED order (`plugins.ts snapshot`), and a documented key order is what makes a saved diff
+/// reviewable.
+pub type HarnessPluginSettingsRecord = Map<String, Value>;
+
 /// One trusted-catalogue agent profile as the GLOBAL override layer records it
 /// (`HarnessAgentRecord`, `persistence.ts:280-287`). A record stores ONLY what the operator
 /// changed plus the retirement flag - never a copy of the catalogue text - so a restart replays
@@ -505,6 +525,15 @@ pub struct HarnessDatabase {
     pub deleted: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_settings: Option<HarnessGlobalSettingsRecord>,
+    /// The operator's per-plugin setting OVERRIDES (`persistence.ts:352`, `sessions.ts:2758-2766`).
+    ///
+    /// ADDITIVE, and deliberately NOT a version bump: absent means "no plugin setting has ever
+    /// been changed" - which is every document written before the plugin uplift - and an absent
+    /// field stays absent on a round trip, so a deployment that never opened the Plugins pane keeps
+    /// its exact previous document. The declared defaults these values override are NOT stored;
+    /// they belong to the catalogue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_settings: Option<HarnessPluginSettingsRecord>,
     #[serde(default)]
     pub sessions: Vec<HarnessSessionRecord>,
     #[serde(flatten)]
@@ -686,6 +715,56 @@ pub fn validate_document(document: &Value) -> Result<(), String> {
                 "The harness database globalSettings must carry at least one of baseURL or model."
                     .to_string(),
             );
+        }
+    }
+
+    // T10 (R4) plugin settings (`persistence.ts:1302-1352`): STRICT about shape, LENIENT about
+    // identity.
+    //
+    //   - OPTIONAL in both directions: an absent field stays absent, so a document from a
+    //     deployment that never opened the Plugins pane keeps its exact previous shape;
+    //   - the map must be an object of objects, and every value must be one of the three JSON
+    //     scalars a descriptor can declare. A nested object or an array is corruption of the NAMED
+    //     slot and fails the load, exactly like every other field of this document;
+    //   - plugin NAMES and KEY NAMES are deliberately NOT checked against this build's catalogue -
+    //     the same rule `deleted` follows above. A saved override may name a plugin this build
+    //     stopped shipping or will ship again later, and `plugins::PluginSettingsStore::restore`
+    //     decides what is still meaningful;
+    //   - an empty map (or a map whose only entries are empty) normalizes to ABSENT in
+    //     `normalize_database`, because the writer never emits `{}`: gating here is what keeps a
+    //     load-save round trip byte-stable.
+    if let Some(settings) = root.get("pluginSettings") {
+        let Some(entries) = settings.as_object() else {
+            return Err("The harness database pluginSettings must be an object.".to_string());
+        };
+
+        for (plugin, raw) in entries {
+            let Some(inner) = raw.as_object() else {
+                return Err(format!(
+                    "The harness database pluginSettings.{plugin} must be an object."
+                ));
+            };
+
+            for (key, value) in inner {
+                let label = format!("The harness database pluginSettings.{plugin}.{key}");
+
+                // The three scalars a descriptor can declare. Anything else - an object, an array,
+                // or a `null` (which a RESET never persists, so it can only be a hand edit) - is
+                // corruption of the NAMED slot.
+                //
+                // TypeScript has one more refusal here, `must be a finite number`, for a JSON
+                // number that overflows to `Infinity`. `serde_json` maps such a literal to `Null`
+                // while PARSING (`Number::from_f64` refuses a non-finite value), so this port
+                // reports the same bad slot through the scalar sentence one step earlier. Every
+                // shape the reference suite pins - a nested object, an array, a `null` - produces
+                // the identical message in both builds.
+                if !matches!(value, Value::Number(_) | Value::Bool(_) | Value::String(_)) {
+                    return Err(format!(
+                        "{label} must be a number, a string, or a boolean; plugin settings hold \
+                         JSON scalars only."
+                    ));
+                }
+            }
         }
     }
 
@@ -1021,6 +1100,18 @@ fn normalize_database(database: &mut HarnessDatabase) {
             .take()
             .map(|value| value.trim().to_string());
         settings.model = settings.model.take().map(|value| value.trim().to_string());
+    }
+
+    // T10 plugin settings (`persistence.ts:1341-1349`): an EMPTY plugin map states nothing, so it
+    // is not carried forward, and a map whose every entry is empty normalizes to ABSENT. The writer
+    // never emits `{}`, so gating here is what makes load -> save byte-stable for a document a
+    // hand-edit left an empty slot in.
+    if let Some(entries) = &mut database.plugin_settings {
+        entries.retain(|_, value| value.as_object().is_some_and(|values| !values.is_empty()));
+
+        if entries.is_empty() {
+            database.plugin_settings = None;
+        }
     }
 
     for session in &mut database.sessions {

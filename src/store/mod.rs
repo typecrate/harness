@@ -677,6 +677,19 @@ pub struct StoreInner {
     /// `settings()` is the provider trio `POST /sessions` merges over; `runtime_config()` is where
     /// `runtime_execution` (`api-reads.ts:226 context.runtime.threadExecution`) comes from.
     pub host_config: ServerConfig,
+    /// The operator's built-in PLUGIN setting overrides, plus the counter every `/plugins` page
+    /// quotes (`sessions.ts:1510-1516 this.plugins = createPluginSettingsStore(...)`, and the
+    /// `pluginSettings` member of `databaseRecord` at `:2758-2766`).
+    ///
+    /// It lives HERE, inside the guarded state, for one reason: [`Store::database_of`] is the only
+    /// writer of `state.json`, so an override becomes durable in the SAME atomic commit as the
+    /// sessions around it. A second store with a second writer would let a session mutation and a
+    /// settings patch overwrite each other's document.
+    ///
+    /// The catalogued metadata is NOT stored here - it is the `static` table in
+    /// [`crate::plugins`], the Rust shape of the generated built-in manifest this build has no scan
+    /// to produce.
+    pub plugins: crate::plugins::PluginSettingsStore,
 }
 
 impl StoreInner {
@@ -791,6 +804,10 @@ impl StoreInner {
             )),
             host_agents: Arc::new(AgentCatalogue::builtin()),
             host_config: ServerConfig::default(),
+            // A fresh store has no override for any plugin, and a revision of 0 - "never changed",
+            // exactly like every other collection before its first write. The real deployment's
+            // saved values arrive through `Store::restore_all`.
+            plugins: crate::plugins::PluginSettingsStore::default(),
         }
     }
 }
@@ -1016,6 +1033,79 @@ impl Store {
         inner.host_registry = registry;
         inner.host_agents = agents;
         inner.host_config = config;
+    }
+
+    // ------------------------------------------------------------------
+    // Built-in plugin settings (`GET /plugins`, `PATCH /plugins/{plugin_id}`)
+    // ------------------------------------------------------------------
+
+    /// The collection revision every `/plugins` page and patch quotes (`sessions.ts
+    /// pluginSettings.revision()`).
+    ///
+    /// This is NOT a hub counter: `plugins` is not a `StreamResourceKind` in the contract, and
+    /// adding one would move the stream's bounded per-scope baseline for a pane that rereads on
+    /// open and on save (`api.ts getPlugins`'s note). The EPOCH is still the shared one, so a
+    /// client's staleness test holds across both transports.
+    #[must_use]
+    pub fn plugin_revision(&self) -> u64 {
+        self.lock().plugins.revision()
+    }
+
+    /// Every built-in this build ships, in catalogue order, with the values in force right now
+    /// (`api.ts pluginRowOf` over the manifest's stable order).
+    #[must_use]
+    pub fn plugin_rows(&self) -> Vec<crate::contract::PluginSummary> {
+        self.lock().plugins.rows()
+    }
+
+    /// One plugin row, `None` when this build does not ship it.
+    #[must_use]
+    pub fn plugin_row(&self, plugin: &str) -> Option<crate::contract::PluginSummary> {
+        self.lock().plugins.row_of(plugin)
+    }
+
+    /// The EFFECTIVE value map of one plugin, resolved through the same rules a row reports
+    /// (`plugins.ts values`). An unknown plugin answers an empty map.
+    #[must_use]
+    pub fn plugin_values(&self, plugin: &str) -> Map<String, Value> {
+        self.lock().plugins.values(plugin)
+    }
+
+    /// The durable projection of the operator's overrides - the `pluginSettings` member this store
+    /// writes into `state.json` (`plugins.ts snapshot`).
+    #[must_use]
+    pub fn plugin_snapshot(&self) -> crate::persistence::HarnessPluginSettingsRecord {
+        self.lock().plugins.snapshot()
+    }
+
+    /// Validate and apply one plugin's settings patch, in the shape `sessions.ts
+    /// updatePluginSettings` uses MINUS the commit, which this crate's host write owns.
+    ///
+    /// Validation is the store's decision and it refuses BEFORE anything mutates, so a rejected
+    /// patch is a no-op rather than a partial write. On success the in-memory value is applied and
+    /// the counter has moved; the caller makes it durable through
+    /// [`crate::runtime::HarnessRuntime::save`]. A FAILED write leaves the value applied on
+    /// purpose (`sessions.ts:1848-1851`): every running session was handed the new value the moment
+    /// it was applied, so rolling it back would tell the operator "the change failed" while the
+    /// process kept it anyway.
+    ///
+    /// Takes the store lock and releases it before returning, so the caller may take a host lock
+    /// afterwards - the documented order is host lock -> store lock, never the reverse.
+    ///
+    /// # Errors
+    ///
+    /// 404 for a plugin this build does not ship, and 400 for an empty patch, an unknown key, or an
+    /// out-of-bounds / mistyped value. Every sentence comes from [`crate::plugins`].
+    ///
+    /// [`ApiError::not_found`], [`ApiError::bad_request`].
+    pub fn update_plugin_settings(
+        &self,
+        plugin: &str,
+        patch: &Map<String, Value>,
+    ) -> Result<(), ApiError> {
+        let mut inner = self.lock();
+
+        inner.plugins.update(plugin, patch)
     }
 
     /// The store's own view of the registry, for a caller that holds no lock (`sessions.ts:1827`).
@@ -1336,6 +1426,14 @@ impl Store {
             registry,
             deleted: None,
             global_settings: None,
+            // Only what the operator changed, and only when they changed something: an empty
+            // snapshot stays ABSENT so a deployment that never opened the Plugins pane keeps its
+            // exact previous document (`sessions.ts:2758-2766`).
+            plugin_settings: {
+                let snapshot = inner.plugins.snapshot();
+
+                (!snapshot.is_empty()).then_some(snapshot)
+            },
             sessions: inner
                 .sessions
                 .values()
@@ -1361,6 +1459,13 @@ impl Store {
         };
 
         let mut inner = self.lock();
+
+        // The persisted document IS the seed: a restored process reads back exactly what the
+        // operator last saved BEFORE its first session is built (`sessions.ts:1510-1516` hands the
+        // loaded `database.pluginSettings` to `createPluginSettingsStore`). No revision bump - a
+        // boot is not a write.
+        inner.plugins.restore(database.plugin_settings.as_ref());
+
         for record in database.sessions {
             let session_id = record.id.clone();
             if inner.find(&session_id).is_some() {
@@ -1883,6 +1988,11 @@ pub fn lifecycle_str(lifecycle: ThreadLifecycle) -> &'static str {
     match lifecycle {
         ThreadLifecycle::Running => "running",
         ThreadLifecycle::Stopped => "stopped",
+        // R7: the fourth spelling `harness-api.ts:1481` added. This build never parks a
+        // conversation itself (no plugin runtime), but the word must round-trip rather than
+        // collapse into `idle`, so a `paused` record restored from a TypeScript-written document
+        // still reports the state it was saved in.
+        ThreadLifecycle::Paused => "paused",
         ThreadLifecycle::Idle => "idle",
     }
 }

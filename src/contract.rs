@@ -86,7 +86,21 @@ pub const MAX_STEER_RECORDS: usize = 64;
 /// Tools one session may create (`created_tools`).
 pub const MAX_CREATED_TOOLS: usize = 32;
 /// Model-facing tool-result text budget (`tool_result_bytes`, `core/result-budget.ts`).
+///
+/// THIS BUILD's enforced window, not the published one. The uplift moved the budget to
+/// 256 KiB (`core/result-budget.ts:54 MODEL_TOOL_RESULT_BUDGET_BYTES = 256 * 1024`), and
+/// `harness-api.ts:216` / `harness.swagger.yaml:243` publish the same `262144` in the boot
+/// document. The tool stage here still cuts one model-facing result at 64 KiB, because the
+/// tool implementations and their suite (`tests/tools.rs`) are written against that window and
+/// widening it is a behaviour change of THAT stage, not of this contract. The boot document
+/// therefore advertises [`PUBLISHED_TOOL_RESULT_BYTES`] while enforcement keeps this number;
+/// `knowledge.md` "T10 plugin uplift" records the split so the next agent sees the gap.
 pub const MODEL_TOOL_RESULT_BUDGET_BYTES: usize = 65_536;
+
+/// The `tool_result_bytes` figure the boot document publishes (`harness-api.ts:216`,
+/// `harness.swagger.yaml:243`). Named as a constant so the ONE place this build advertises a
+/// budget a different stage enforces more tightly is greppable rather than a bare literal.
+pub const PUBLISHED_TOOL_RESULT_BYTES: u64 = 262_144;
 
 /// The `service` identity the root document advertises. TS sends the literal
 /// `'noobscript-harness'` (`api.ts:1307`) and the published contract documents that value,
@@ -118,7 +132,9 @@ pub fn service_limits() -> ServiceLimits {
         pending_actions: MAX_PENDING_ACTIONS as u64,
         steer_records: MAX_STEER_RECORDS as u64,
         created_tools: MAX_CREATED_TOOLS as u64,
-        tool_result_bytes: MODEL_TOOL_RESULT_BUDGET_BYTES as u64,
+        // The CONTRACT figure (`harness-api.ts:216`), not this build's enforced window
+        // ([`MODEL_TOOL_RESULT_BUDGET_BYTES`]); see that constant for the documented split.
+        tool_result_bytes: PUBLISHED_TOOL_RESULT_BYTES,
         page_limit_default: PAGE_LIMIT_DEFAULT,
         page_limit_max: PAGE_LIMIT_MAX,
     }
@@ -220,14 +236,24 @@ pub enum TranscriptState {
     Unreadable,
 }
 
-/// Where an instruction TEXT comes from for a harness member (`harness-api.ts:444`); a
-/// session binding adds the `session` layer (`:938`).
+/// Where an instruction TEXT comes from for a harness member (`harness-api.ts:444`).
+///
+/// R7: `harness-api.ts:451` states FOUR spellings for `HarnessInstructionSummaryEntry.source`,
+/// because a member THIS session defined (`POST .../agents`, or a session-saved definition from a
+/// TypeScript host that runs created agents) has no profile to describe it - `session` is the only
+/// honest answer, and it is reachable from a restored `state.json` even in a build that creates no
+/// agents itself. The two narrower members of the same contract (`HarnessInstructionTextResponse.source`
+/// at `:547`, `AgentProfile.instruction_source` at `:594`) are 3- and 2-valued unions in TypeScript;
+/// this port models provenance as ONE enum, so those fields accept the extra spelling on the way in
+/// and never emit it (each producer below can only name catalogue / global / harness). That is an
+/// accepted superset - a refusal of a value the contract names elsewhere would be the worse error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InstructionSource {
     Catalogue,
     Global,
     Harness,
+    Session,
 }
 
 /// The four-layer provenance of a SESSION agent's instruction (`harness-api.ts:938`).
@@ -315,12 +341,20 @@ pub enum ThreadOrigin {
     Host,
 }
 
-/// Conversation run state (`types/index.ts:1785`); `stopped` = halted by the host.
+/// Conversation run state (`types/index.ts:1785`); `stopped` = halted by the host, `paused` =
+/// parked by a runtime layer (the shipped `context-compaction` plugin parks a conversation while
+/// it compacts, so a roster read can report it).
+///
+/// R7: `harness-api.ts:1481` widened the union to FOUR spellings. This build never TRANSITIONS a
+/// conversation into `paused` (no plugin runtime), but it must not silently turn a `paused` record
+/// or filter value into `idle`, because the UI colours a parked conversation differently and a
+/// roster read that lied about the state would strand that affordance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThreadLifecycle {
     Idle,
     Running,
+    Paused,
     Stopped,
 }
 
@@ -1526,6 +1560,107 @@ impl ToolCallResult {
             Self::Failure(failure) => failure.duration_ms,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in plugin catalogue (`GET {root}/plugins`, `PATCH {root}/plugins/{plugin_id}`)
+// ---------------------------------------------------------------------------
+
+/// The declared type of one plugin setting (`harness-api.ts:650 PluginSetting.type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginSettingType {
+    Number,
+    String,
+    Boolean,
+}
+
+/// One DECLARED setting of a plugin, copied verbatim from the plugin's own metadata
+/// (`harness-api.ts:649`). `default` is the value the plugin falls back to when nothing is
+/// stored AND the target a `null` patch entry restores. `min`/`max` bound what the server
+/// accepts; `step` bounds only what a client offers and is deliberately NOT enforced
+/// (`server/plugins.ts` header, "VALIDATION AT THE WRITE EDGE").
+///
+/// The numeric members are `Value`, not `f64`, because the wire spells an integral bound as an
+/// INTEGER (`min: 1000`, never `1000.0`): serde_json prints an `f64` with its fraction, and the
+/// contract's rows are asserted byte-exact. `crate::plugins` owns the one conversion that keeps
+/// that promise.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginSetting {
+    pub key: String,
+    pub label: String,
+    /// `type` is a Rust keyword, so the field is named `kind` in code and renamed on the wire.
+    #[serde(rename = "type")]
+    pub kind: PluginSettingType,
+    pub default: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// One built-in plugin as an operator sees it (`harness-api.ts:663`): identity, the lifecycle
+/// hooks it declares, its settings descriptors, and the values in force RIGHT NOW.
+///
+/// `builtin` is always `true` on this route - the catalogue is the set this build ships - and it
+/// stays explicit on the wire so a client renders one row shape for a plugin a future release
+/// makes configurable. The optional members are ABSENT, never `null`: a plugin that declares no
+/// description, version, tags or hooks omits those keys (`api.ts pluginRowOf`'s presence filters).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginSummary {
+    pub name: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<Vec<String>>,
+    pub builtin: bool,
+    pub settings: Vec<PluginSetting>,
+    /// The EFFECTIVE map (`declared default` unless the operator stored an override), in the
+    /// plugin's own DECLARED key order (`api.ts:1963 plugins.values(metadata.name)`).
+    pub values: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Page of built-in plugin rows (`harness-api.ts:681`). Modeled as a flat struct that FLATTENS
+/// `PageMeta` exactly like `HarnessCardPage`, so the five page members keep their contract names.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginSummaryPage {
+    #[serde(flatten)]
+    pub meta: PageMeta,
+    pub items: Vec<PluginSummary>,
+}
+
+/// Envelope of one plugin row, read or patched (`harness-api.ts:693`). A patch returns the WHOLE
+/// row rather than a receipt, because the values it reports ARE the result of the write and an
+/// editor needs the reset targets beside them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginDetailResponse {
+    pub plugin: PluginSummary,
+}
+
+/// Settings patch for one plugin (`harness-api.ts:706`). A value REPLACES that key's override, an
+/// explicit `null` clears it (the declared default applies again), and an omitted key is no
+/// change. Unknown keys are refused rather than ignored, and there is no enable/disable field:
+/// plugin loading is auto-scanned, so no HTTP affordance exists for it.
+///
+/// The map is a raw `Map`, not a typed union: a submitted value is validated by the plugin's OWN
+/// descriptor (`crate::plugins`), which is the only place that knows each key's declared type and
+/// bounds. A malformed value therefore answers the descriptor's sentence, not a serde one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginSettingsUpdate {
+    pub settings: serde_json::Map<String, serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2960,10 +3095,11 @@ pub struct ProviderConfig {
 /// The message is the contract's, byte for byte:
 /// `Unknown field "<key>". Allowed fields: <comma list>.`
 ///
-/// Key order here is serde_json's DEFAULT (`BTreeMap`, i.e. alphabetical) because the crate
-/// does not enable serde_json's `preserve_order` feature; TS reports the document's own
-/// insertion order via `Object.keys`. The two agree whenever a body has exactly one unknown
-/// field, which is every case the contract pins a message for - see knowledge.md "Decisions".
+/// Key order here is the DOCUMENT's own, because this crate enables serde_json's `preserve_order`
+/// feature (`Cargo.toml`), so `fields.keys()` walks the client's insertion order exactly like TS's
+/// `Object.keys` - and when a body carries several offenders, the first one the CLIENT wrote is the
+/// one named. `tests/plugins.rs` ("several bad fields") pins that pairing for the plugin patch, whose
+/// unknown-SETTING refusal follows the same rule from `serde_json::Map` (`src/plugins.rs::update`).
 ///
 /// # Errors
 ///

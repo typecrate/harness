@@ -11,9 +11,10 @@
 //!
 //! WHAT THIS FILE IS THE SINGLE OWNER OF
 //! -------------------------------------
-//! 1. **The route table.** `HARNESS_PATH_TEMPLATES` (`shared/harness-api.ts:54-100`, 45 entries)
-//!    crossed with the 64 operations `api.ts:3925-3974` declares. `api.ts:623-625` states why the
-//!    table is compiled from the GENERATED template strings rather than typed out by hand: "a
+//! 1. **The route table.** `HARNESS_PATH_TEMPLATES` (`shared/harness-api.ts:54-102`, 47 entries)
+//!    crossed with the 66 operations `api.ts` declares (the `plugins` pair arrived with the Harness
+//!    Plugin System). `api.ts:623-625` states why the table is compiled from the GENERATED template
+//!    strings rather than typed out by hand: "a
 //!    route cannot drift from the contract by being typed out by hand here". The same reason holds
 //!    here, so `ROUTES` below carries each template verbatim next to its operations.
 //! 2. **`Ctx`.** Every handler - this stage's host handlers and T5b's session handlers - has the
@@ -51,6 +52,7 @@ pub mod agents;
 pub mod config;
 pub mod harnesses;
 pub mod models;
+pub mod plugins;
 pub mod queue;
 pub mod root;
 pub mod session_agents;
@@ -554,9 +556,9 @@ pub struct Route {
     pub operations: &'static [(&'static str, Operation)],
 }
 
-/// The 64 operations of `api.ts:3925-3974`, one variant each.
+/// The 66 operations of `api.ts:3925-3974`, one variant each.
 ///
-/// An enum rather than 64 function pointers so the table stays `static` (an `async fn`'s future
+/// An enum rather than 66 function pointers so the table stays `static` (an `async fn`'s future
 /// type cannot be named) while the call site stays one exhaustive `match` that cannot silently miss
 /// an operation when a variant is added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -583,6 +585,9 @@ pub enum Operation {
     GetTools,
     GetTool,
     PostToolExecution,
+    // ---- host: built-in plugin catalogue --------------------------------------
+    GetPlugins,
+    PatchPlugin,
     // ---- host: model discovery -----------------------------------------------
     PostModels,
     // ---- sessions -------------------------------------------------------------
@@ -648,12 +653,12 @@ const fn operations(
     items
 }
 
-/// The route table: all 45 generated templates and all 64 declared operations.
+/// The route table: all 47 generated templates and all 66 declared operations.
 ///
 /// ORDER IS LOAD-BEARING: `matchRoute` (`api.ts:657-687`) returns the FIRST pattern whose segment
 /// count and literal segments fit, in template-table order, so an ambiguous pair resolves the way
 /// the generated table lists it. The table below is in that exact order.
-pub static ROUTES: [Route; 45] = [
+pub static ROUTES: [Route; 47] = [
     Route {
         id: "root",
         template: contract::HARNESS_API_ROOT,
@@ -727,6 +732,19 @@ pub static ROUTES: [Route; 45] = [
         id: "toolsByToolIdExecutions",
         template: "/v1/harness/tools/{tool_id}/executions",
         operations: operations(&[("POST", Operation::PostToolExecution)]),
+    },
+    // T10 (R1): the two plugin routes, in contract order - `HARNESS_PATH_TEMPLATES` lists
+    // `plugins` and `pluginsByPluginId` between `toolsByToolIdExecutions` and `models`
+    // (`shared/harness-api.ts:66-69`), and table order is `matchRoute`'s tie-break.
+    Route {
+        id: "plugins",
+        template: "/v1/harness/plugins",
+        operations: operations(&[("GET", Operation::GetPlugins)]),
+    },
+    Route {
+        id: "pluginsByPluginId",
+        template: "/v1/harness/plugins/{plugin_id}",
+        operations: operations(&[("PATCH", Operation::PatchPlugin)]),
     },
     Route {
         id: "models",
@@ -1398,6 +1416,9 @@ async fn dispatch_operation(operation: Operation, ctx: &mut Ctx) -> ApiResult {
         Operation::GetTools => self::tools::get_tools(ctx).await,
         Operation::GetTool => self::tools::get_tool(ctx).await,
         Operation::PostToolExecution => self::tools::post_tool_execution(ctx).await,
+
+        Operation::GetPlugins => self::plugins::get_plugins(ctx).await,
+        Operation::PatchPlugin => self::plugins::patch_plugin(ctx).await,
 
         Operation::PostModels => self::models::post_models(ctx).await,
 

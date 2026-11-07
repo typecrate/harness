@@ -52,10 +52,18 @@ stage can re-check it instead of re-deriving it.
     instead of silently running it inline (`runtime::validate_supported_execution`, the standalone
     startup abort, the gateway's 400), the route-table pin (`tests/routes.rs`), and the documentation
     corrections the independent verification asked for. See "T9" below.
-12. Still to port - the module host that turns a session-created tool's installed source into a callable
+12. **T10 (done)** - the plugin-system uplift: the built-in catalogue and its operator settings
+    (`src/plugins.rs`, `api/plugins.rs`), the two `/v1/harness/plugins` routes and their DTOs, the
+    additive `state.json` `pluginSettings` member (no version bump), the boot document's `plugins`
+    link, the `local/basalt` provider default, and the three cheap contract corrections (the published
+    `tool_result_bytes`, the `paused` thread status, the `session` instruction source). NO plugin hook
+    executes - see "T10" below for what is ported and what is not.
+13. Still to port - the module host that turns a session-created tool's installed source into a callable
     registration, and the runtime-compiler tools the catalogue lists but this build cannot execute (see
     "T4"). A worker backend for the two `*_EXECUTION=worker` knobs is the other unported half: today the
-    knobs validate and REPORT, and the runtime refuses to start on them (see "T9").
+    knobs validate and REPORT, and the runtime refuses to start on them (see "T9"). The plugin HOST is
+    the third unported half: T10 shipped the catalogue, the settings contract and the durability, and no
+    hook executes (`README.md` Deviations item 16).
 
 ## Decisions
 
@@ -1668,3 +1676,143 @@ build never runs a "worker" deployment inline silently.        (exit code 1, ban
 
 ---
 
+
+## T10 - the plugin uplift (`plugins`, `api/plugins`, `store`, `persistence`, `contract`, `config`)
+
+The server contract moved under this port: `@underload/harness` gained the Harness Plugin System
+(the `plugins` / `plugins/{plugin_id}` pair of `shared/harness-api.ts:67-68`, between
+`toolsByToolIdExecutions` at `:66` and `models` at `:69`, plus `server/plugins.ts`; and a new provider
+default model at `server/config.ts:111`). The reference
+package is UNTRACKED in this repository, so the uplift cites files and lines, never commit ids -
+those are the only stable cross-references available for `packages/underload/**`. The Rust harness is the
+server the underload front-end talks to, so the front-end's Plugins pane was dead against this
+endpoint: two routes, five DTOs, the boot link, and the durable overrides were missing. T10 closes the
+gap and fixes three cheap contract drifts the same uplift carries.
+
+### What the uplift is, in one paragraph
+
+`GET /v1/harness/plugins` answers the built-in catalogue - each row carrying the plugin's OWN declared
+metadata beside the values currently in force - and `PATCH /v1/harness/plugins/{plugin_id}` edits those
+values, answers the whole row again, and is durable before the answer. There is no enable/disable
+verb, no stream update kind, and no per-plugin subresource beyond the row: plugin loading is
+auto-scanned in TypeScript, so the only thing an operator can change is a setting.
+
+### The decisions a later stage must not re-break
+
+* **The catalogue is a `static`, not a scan.** `src/plugins.rs::BUILTIN_PLUGINS` is the Rust shape of
+  the GENERATED `src/plugin/manifest.ts`: the same two rows, in scan order (`async-ping` before
+  `context-compaction`, path ascending), with the metadata each `*.plugin.ts` declares copied verbatim.
+  Order is contract-visible - the page renders in it and the 404 sentence joins those names - so a
+  reordering is a wire change, not a refactor. It is `static` rather than `LazyLock` because `Value` is
+  not const-constructible and the descriptor defaults are `DeclaredDefault`; the price is one enum, the
+  gain is that no request can ever see a different catalogue than the next.
+* **No hook executes here.** There is no plugin host in this crate, so `hooks` is server-visible
+  metadata and the two built-ins do not ping or compact. `README.md` Deviations item 16 states it, and
+  the port deliberately does NOT grow an execution engine to make the row "true": the contract the UI
+  consumes is metadata + values + validation + durability.
+* **The plugin store lives inside `StoreInner`.** `state.json` has exactly one writer
+  (`Store::database_of` → `persistence::write_harness_database`), so owning the overrides inside the
+  guarded store is what makes a settings patch durable in the SAME atomic commit as the sessions
+  around it - and it means a session mutation can never silently drop the operator's overrides. A
+  second store with a second writer would let the two documents race.
+* **The revision is the store's counter, not a hub counter.** `plugins` is not a `StreamResourceKind`
+  in the contract, so `GET /plugins` quotes `Store::plugin_revision()` (one bump per accepted patch,
+  starting at 0, never persisted: `plugins-api.test.ts` proves a restart keeps the VALUE and resets the
+  counter). No publish, no stream frame: the pane rereads on open and on save.
+* **The list route stamps NO `X-Harness-Revision`.** `api.ts getPlugins` calls `json(200, pageMeta(...))`
+  with TWO arguments - the figure rides the page body only - exactly like `GET /harnesses`
+  (`api.ts:1503-1509`), which this port already pinned at T7b. `patchPlugin` DOES pass the third
+  argument (`:2020-2022`), because there the figure is the result of the write. The brief left this
+  open ("whether the plugin list stamps the header"); the TypeScript source and its test
+  (`expect(page.headers).toEqual({ [EPOCH]: epoch })`) settle it.
+* **`null` means reset, and a reset is a write.** An explicit `null` drops the key's override so the
+  DECLARED default applies again, and it bumps the counter like any other accepted patch. A plugin
+  whose overrides are all gone keeps no entry, so `state.json` carries neither `{}` nor `null` - and
+  with no overrides left at all, the `pluginSettings` member is omitted entirely.
+* **Validation lives at the write edge; the read edge stays permissive.** `min`/`max` are enforced
+  because they are the bounds the plugin published; `step` NEVER is, because refusing `1500` on
+  `step: 1000` would make the API stricter than the runtime that has to live with the value. A numeric
+  STRING is accepted and normalized to a NUMBER (a query parameter or a form legitimately carries one,
+  and TypeScript's read path accepts it too); a string setting accepts a string only; a boolean setting
+  accepts a boolean or the two words, trimmed and lower-cased.
+* **A patch is all-or-nothing, and the store refuses before it mutates.** One bad key refuses the
+  whole document, moves no counter, and writes nothing - the same rule `PATCH /config` follows. A
+  plugin lookup comes FIRST: an unknown id is a 404 even when the body is also wrong.
+* **A failed durable write leaves the value applied and answers 500.** `sessions.ts:1848-1851` states
+  why: every running session was handed the value the instant it was applied, so rolling it back would
+  report a failure the process does not have. `tests/plugins.rs` pins it by turning the rename target
+  into a directory.
+* **`pluginSettings` is additive and does NOT bump `HARNESS_DATABASE_VERSION`.** Still `1`. The loader
+  is STRICT about shape - a nested object or an array names the exact slot and aborts the boot, which
+  is the persistence rule for every other member of this document - and LENIENT about identity: a
+  plugin or a key this build no longer declares is dropped by the restore, as is a stored value that
+  now violates its bounds. Empty maps normalize to absent on load, because the writer never emits `{}`.
+* **Settings PATCH durability goes through `runtime.save()`, not `store.save()`.** The store's own
+  commit serializes the session half (`global_settings: None`, `deleted: None`); the host write adds
+  the registry, the tombstones and the operator's provider pair. A settings patch must not drop those,
+  so it uses the same whole-document path `PATCH /config` and `PATCH /harnesses/{name}` use, under the
+  documented lock order (the store call releases its guard, then the host write takes its own).
+
+### The three cheap contract corrections (R7)
+
+| Drift | Contract | This build after T10 |
+| --- | --- | --- |
+| `limits.tool_result_bytes` | `262144` (`harness-api.ts:216`, `harness.swagger.yaml:243`) | the boot document publishes `contract::PUBLISHED_TOOL_RESULT_BYTES = 262_144`; the ENFORCED budget stays `MODEL_TOOL_RESULT_BUDGET_BYTES = 65_536` until the tool stage widens (Deviations item 17), and both figures are asserted so the gap cannot drift |
+| `ThreadSummary.status` | `"idle" \| "running" \| "paused" \| "stopped"` (`harness-api.ts:1481`) | `ThreadLifecycle::Paused` exists, `store::lifecycle_str` / `store::read::parse_lifecycle` carry the word, and a `paused` record no longer collapses into `Idle`. The `?status=` FILTER vocabulary stays the contract's three (`api.ts:3497`), so `?status=paused` is still a 400 there |
+| `HarnessInstructionSummaryEntry.source` | `"catalogue" \| "global" \| "harness" \| "session"` (`harness-api.ts:451`) | `InstructionSource::Session` exists, so a session-defined member's provenance parses instead of failing the read. This port models provenance as ONE enum, so the two narrower TypeScript members (`:547`, `:594`) accept the extra spelling on the way in and never emit it - an accepted superset, stated on the enum |
+| default model | `local/basalt` (`config.ts:105-111`) | `config::DEFAULT_MODEL`, the boot reset target of `PATCH /config {"model": null}`, and `apply_config_patch`'s reset all moved with it; the base URL is unchanged |
+
+### Test inventory
+
+* `tests/plugins.rs` - 15 real-HTTP tests over the library router: the exact catalogue rows (all nine
+  members, both descriptors, the effective values), paging + `q` (including the hooks are NOT in the
+  haystack, and a foreign cursor is the 400), the two 405 sentences with a percent-decoded path, the
+  write with its header revision and its `state.json` delta, numeric-string normalization and integer
+  spelling, the `null` reset, every refusal sentence (unknown plugin / key / value / empty patch /
+  unknown body field / non-object body, with "a refusal wrote nothing"), the non-object `settings`
+  spread shapes, three boots of durability, the lenient restore (retired plugin, retired key, foreign
+  key, out-of-bounds value), the strict shape (both slot-naming messages), the 500-with-value-applied
+  write failure, and the store projection the routes are built on.
+* `src/plugins.rs` `mod tests` - 10 unit tests for the rules the SHIPPED catalogue cannot reach over
+  HTTP: the integer-spelling helpers, `Number()` coercion (including `0x10` / `0o17` / `0b101` / a
+  blank text), the `string` and `boolean` branches (neither shipped plugin declares one, so an HTTP test
+  would be fiction), `max` enforced with `step` NOT enforced and both bounds inclusive,
+  all-or-nothing, the `null` reset dropping an empty plugin map, catalogue-ordered snapshots, and
+  restore leniency.
+* `tests/routes.rs` - 6 tests, now pinned at 47 templates / 66 operations with the new verb split, and
+  the two plugin templates at their contract positions between `toolsByToolIdExecutions` and `models`.
+* `tests/foundation.rs` - the published-vs-enforced budget pair, `local/basalt` as the loader default
+  and the advertised `defaults.model`, and `the_uplifted_vocabularies_are_accepted_not_folded` for the
+  four thread statuses and the four instruction sources (parse AND print, and the store's two
+  lifecycle directions round-trip them).
+* `tests/http_host.rs` - the boot document's `limits` and its ten `links`, with `plugins` among them.
+
+### Follow-ups this stage deliberately left open
+
+1. A plugin HOST (a module loader plus the hook bus) would make `async-ping` and
+   `context-compaction` actually run, and would then need the live provider that
+   `sessions.ts buildHarness` hands every harness. Nothing in the HTTP contract changes when that
+   lands, which is the point of porting the surface first.
+2. Widening `MODEL_TOOL_RESULT_BUDGET_BYTES` to the contract's 256 KiB belongs to the tool stage: it
+   changes what a model is shown, and `tests/tools.rs`'s budget envelope moves with it.
+3. A session-defined created agent would make `InstructionSource::Session` a value this build EMITS,
+   not merely accepts - the same hole "still to port" already records for the created-tool module host.
+
+### Verification (T10's last run)
+
+From `packages/typecrate/harness`: `cargo fmt -- --check`, `cargo check --all-targets`,
+`cargo clippy --all-targets -- -D warnings` and `cargo test --no-fail-fast` are all clean - **309
+passed, 0 failed** across 17 targets (66 lib - 56 before, +10 for `src/plugins.rs`'s write-edge units;
+8 `bin/server`, 15 `data_plane`, 24 `foundation`, 17 `http_host`, 17 `http_sessions`, **15 `plugins`**
+(new), 15 `projector`, 6 `routes`, 12 `runtime_execution`, 27 `store`, 4 `store_restore`, 21 `stream`,
+24 `tools`, 24 `transport`, 13 `turn`, 1 `worker_execution_http`). The T9 baseline was **283 passed,
+0 failed**, so every one of those 283 still passes with the default model, the published budget and the
+route table moved underneath it.
+
+`packages/typecrate/services` was NOT touched by this stage and needs no change: its
+`endpoint/harness/harness-route.rs` bridge mounts `ANY /v1/harness/{*rest}`, so the two new routes are
+reachable through the gateway as soon as the harness crate builds - `cargo check --lib` in that package
+compiles the uplifted harness cleanly. Its own `cargo test` currently fails to BUILD for a reason
+unrelated to T10: the working tree's uncommitted `src/bin/server.rs` has a `match`-arm type error in the
+SIGTERM handler (`Option<()>` vs `()` at `src/bin/server.rs:633-639`). That file is outside this
+stage's ownership, so the failure is reported rather than fixed.

@@ -34,8 +34,15 @@ use crate::origin::{ParsedUrl, parse_url};
 /// Safe default, kept deliberately (`config.ts:105-106`): today's behaviour, so no existing host
 /// changes shape by upgrading.
 pub const DEFAULT_BASE_URL: &str = "http://localhost:5500/providers/private/v1";
-/// The default model (`config.ts:106`).
-pub const DEFAULT_MODEL: &str = "merge/ds4-flash";
+/// The default model (`config.ts:105-111`).
+///
+/// The LOCAL basalt model, which is the id the private provider at [`DEFAULT_BASE_URL`] actually
+/// serves for it: that provider's `/models` catalogue lists `local/basalt`, a hosted
+/// `merge/ds4-flash` request costs money, and a `localhost/basalt` request 404s. Every live preset
+/// agent with no per-agent override resolves to this id, so the UI's agent deck shows it on every
+/// tile. It is also the target a `PATCH /config` with `"model": null` restores, in both the
+/// standalone route and [`apply_config_patch`].
+pub const DEFAULT_MODEL: &str = "local/basalt";
 
 /// How a session's logical threads get CPU (`config.ts:42`, `:113`). `worker` is a promise, not
 /// a hint: a session whose harness cannot be rebuilt from durable data is REJECTED rather than

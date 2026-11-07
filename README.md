@@ -23,9 +23,10 @@ Native only. `Cargo.toml` is a standalone workspace (its own `[workspace]` bound
 | Contract | `src/contract.rs`, `src/error.rs` | The wire types (`HarnessEvent`, `ToolSummary`, `TurnDisplay`, the error envelope), every cap, the header names. |
 | Foundation | `src/{config,environment,origin,ids,labels,paging,attachments,package_root}.rs` | Env parsing with the TS defaults and sentences, the origin gate, session/turn ids, display labels, cursor paging, the attachment budget, the package-root probe. |
 | Durability | `src/{persistence,journal,read,registry,agents}.rs` | `state.json` + `agents.json` checkpoints, the append-only `events.jsonl` journal, the read models, the harness registry (presets + the three colour maps). |
+| Plugins | `src/plugins.rs` | The built-in plugin CATALOGUE (the two shipped built-ins, as a `static` table - there is no plugin host to scan), their settings descriptors, the operator's overrides, and every validation sentence the patch route answers. **Settings only: no hook executes here.** |
 | Store | `src/store/{mod,session,turns,commands,tools,transcript,threads,agents,actions,read}.rs` | One session's in-memory state behind a `parking_lot` lock: the turn lifecycle, the tool surface, the transcript, threads, the task list, actions, the counters the stream publishes. |
 | Runtime | `src/{transport,turn,projector}.rs`, `src/tools/{mod,catalogue,result,files,command,syntax,text,web}.rs` | The provider transport (streaming, retry, tool loop), the turn engine, the display projector, and the 19 catalogue tools this build executes (21 executable arms in total once the store's own `task` and `actionRequest` are counted - see [Parity](#parity-with-the-typescript-harness)). |
-| HTTP | `src/runtime.rs`, `src/server.rs`, `src/api/**`, `src/bin/server.rs` | The runtime root cache, the standalone listener, and the 45 route templates. |
+| HTTP | `src/runtime.rs`, `src/server.rs`, `src/api/**`, `src/bin/server.rs` | The runtime root cache, the standalone listener, and the 47 route templates (45 + the two `/plugins` routes). |
 | Stream | `src/stream/{mod,protocol,broker,connection}.rs` | The `harness.v1` WebSocket, the bounded replay broker, the event hub fan-out. |
 | Bridge | `endpoint/harness/harness-route.rs` | The `ANY` route file `typecrate-services` discovers at build time. |
 
@@ -78,11 +79,17 @@ the credential lives in the process (or in the browser session that posted it).
 
 ## The surface
 
-* 45 path templates (`shared/harness-api.ts:54-100`) crossed with the 64 operations
-  `api.ts:3925-3974` declares; the table is `src/api/mod.rs`, and `tests/routes.rs` pins it against
-  the TypeScript list - the 45 `(id, template)` pairs in table order, the 64 operations with their
-  per-verb split (GET 37, POST 13, PATCH 7, DELETE 6, PUT 1), and the rule that every operation is
+* 47 path templates (`shared/harness-api.ts:54-102`) crossed with the 66 operations the TypeScript
+  route table declares; the table is `src/api/mod.rs`, and `tests/routes.rs` pins it against the
+  TypeScript list - the 47 `(id, template)` pairs in table order, the 66 operations with their
+  per-verb split (GET 38, POST 13, PATCH 8, DELETE 6, PUT 1), and the rule that every operation is
   reachable exactly once.
+* The plugin surface is `GET /v1/harness/plugins` (the built-in catalogue, paged and `q`-filtered,
+  each row carrying its declared settings AND the values in force) and
+  `PATCH /v1/harness/plugins/{plugin_id}` (settings-only; the answer is the whole row, the write is
+  durable before the answer, and the collection revision is the plugin store's own counter). Both are
+  in the boot document's `links`, which is what the front-end's Plugins pane boots from. The list
+  route stamps NO `X-Harness-Revision`, like `GET /harnesses`.
 * The response envelope is the contract's: `{harness, session, turn, ...}` blocks plus the error
   envelope `{error: {message}}`. `X-Harness-Epoch` and `X-Harness-Revision` are stamped by
   `api::with_revision`; a cursor carries the epoch, so a cursor from a previous process is a refusal
@@ -110,7 +117,15 @@ the credential lives in the process (or in the browser session that posted it).
 ```
 
 * `state.json` is replaced atomically: `state.json.<owner>.<seq>.tmp` → fsync → rename in the same
-  directory. Durability gates the receipt: a write that could not be made is not acknowledged.
+  directory. Durability gates the receipt: a write that could not be made is not acknowledged (the
+  plugin `PATCH` is the documented exception the other writes share: the in-memory value stays
+  applied, because every running session already has it).
+* `state.json` carries `pluginSettings` - `plugin -> key -> number|string|boolean` - the operator's
+  OVERRIDES only, never a declared default. The member is ADDITIVE and did not bump
+  `HARNESS_DATABASE_VERSION` (still `1`): it is absent on every document written before the plugin
+  uplift and stays absent while nothing has been changed. The loader is STRICT about its shape (a
+  nested object or array names the slot and aborts the boot) and LENIENT about its identity (a plugin
+  or key this build no longer declares is dropped by the restore).
 * The journal is one line per event. Header line, verbatim TS:
   `{"type":"header","v":1,"sessionId":"<id>","createdAt":<ms>}`. Event line, this crate's envelope
   (a per-file monotonic sequence, which is what `read(from_sequence, limit)` replays from):
@@ -124,7 +139,9 @@ the credential lives in the process (or in the browser session that posted it).
 
 | Capability | TypeScript | This build |
 | --- | --- | --- |
-| Route surface | 45 templates × 64 ops | same, pinned by `tests/routes.rs`: the 45 `(id, template)` pairs in table order, the 64 operations, the verb split (GET 37, POST 13, PATCH 7, DELETE 6, PUT 1), and one reachable mount per operation |
+| Route surface | 47 templates × 66 ops | same, pinned by `tests/routes.rs`: the 47 `(id, template)` pairs in table order, the 66 operations, the verb split (GET 38, POST 13, PATCH 8, DELETE 6, PUT 1), and one reachable mount per operation |
+| Plugin system | a scanned plugin HOST: `harness()` loads `src/plugins/**/*.plugin.ts`, the generated `src/plugin/manifest.ts` wires them, each `setup(api)` registers lifecycle hooks, and the server exposes the catalogue + operator settings (`src/server/plugins.ts`) | the SETTINGS CONTRACT in full - `GET /plugins`, `PATCH /plugins/{id}`, the two built-ins' exact metadata, the descriptors, effective values, validation sentences, the durable `pluginSettings` delta - and **no hook execution**: `static BUILTIN_PLUGINS` in `src/plugins.rs` is the manifest, because this build has no runtime compiler to load a plugin module. A row is therefore metadata + values, and `async-ping` / `context-compaction` do not ping or compact here. See [Deviations](#deviations-the-full-list) item 16 |
+| Default model | `local/basalt` (`config.ts:105-111`), the id the private provider at the default base URL serves | `local/basalt` (`config::DEFAULT_MODEL`), including the `PATCH /config` `"model": null` reset target |
 | Tool catalogue | the manifest's runtime rows - 35 in the registry, of which `/tools` lists **31**, because `tool-manifest.ts:1002, 1046, 1692, 1811` mark four `listed: false` | 35 generated rows (`src/tools/catalogue.rs`): `GET /tools` lists **31** (35 rows minus the four `catalogue::UNLISTED` names), `summaries()` → **31** for the global surface, `catalogue_summaries()` → **35** for a session toolbox (TS's toolbox reads the live registry, `api-reads.ts:831-836`) |
 | Executable here | every row, once the runtime compiler is loaded | **21 executable arms = 19 catalogue tools + `task` + `actionRequest`**. The 19 catalogue rows with bodies are `src/tools/mod.rs:486-527`: `read`, `write`, `edit`, `fileList`, `glob`, `grep`, `shell`, `gitDiff`, `syntax`, `timeNow`, `textCount`, `diceRoll`, `noteSearch`, `textSummarize`, `toolList`, `toolRequest`, `fetch`, `search`, `download`; `task` + `actionRequest` are answered by the STORE (they are declarations, not catalogue rows) |
 | Catalogued-only rows | same 14, executable through the runtime compiler | **14** names in `MISSING_CAPABILITY` (`toolRegistry`, `toolManage`, `toolCreate`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, `agentResult`, `delegate`, `threadFork`, `toolCancel`, `threadSend`, `threadRead`, `threadList`) exist for discovery and answer `Err("Tool \"<name>\" requires the agent runtime.")`, and `is_declared()` is false for every one - so a model is never offered a tool this build cannot run |
@@ -204,25 +221,52 @@ the longer reasoning.
     here. Pinned by `tests/runtime_execution.rs` (gate + runtime + the standalone process) and
     `tests/worker_execution_http.rs` (the mounted request).
 
+16. **The plugin SYSTEM is ported as a settings surface, not as a running host.** TypeScript scans
+    `src/plugins/**/*.plugin.ts`, the generated `src/plugin/manifest.ts` wires what the scan found, and
+    each plugin's `setup(api)` registers lifecycle hooks that change a run; the server then exposes
+    that catalogue and the operator's overrides (`src/server/plugins.ts`, fed to every harness through
+    `sessions.ts`'s live provider). This build has no plugin host and no runtime compiler, so
+    `src/plugins.rs` ships the catalogue as a `static` table and the whole HTTP contract around it -
+    both rows with their exact metadata, the descriptors, the effective values, every validation
+    sentence, the `null` reset, the revision counter and the durable `pluginSettings` delta - while
+    **no hook executes**: `async-ping` does not ping and `context-compaction` does not compact. The
+    visible consequence is that a row is metadata plus values rather than a live registration, and the
+    unported `pluginSettings`-consumes-it-on-the-next-turn behaviour TypeScript proves
+    (`plugins-api.test.ts`, "the live settings provider reaches an existing session") has no consumer
+    here. What IS ported is the immediacy the routes promise: an accepted patch mutates the one map
+    every later read of every key goes through, in the same process, before the answer.
+17. **The published `tool_result_bytes` is the contract's 256 KiB; the ENFORCED tool-result budget is
+    still this build's 64 KiB.** `harness-api.ts:216` and `harness.swagger.yaml:243` publish `262144`,
+    and TypeScript's `core/result-budget.ts:54` sets `MODEL_TOOL_RESULT_BUDGET_BYTES = 256 * 1024`, so
+    the two agree there. Here the boot document advertises
+    `contract::PUBLISHED_TOOL_RESULT_BYTES` (`262_144`) while the tool stage still cuts one
+    model-facing result at `contract::MODEL_TOOL_RESULT_BUDGET_BYTES` (`65_536`), because the tool
+    implementations and `tests/tools.rs` are written against that window and widening it changes what a
+    MODEL receives - a behaviour change of the tool stage, not a contract correction. The split is
+    pinned in `tests/foundation.rs` and `tests/http_host.rs` so neither figure can drift silently; the
+    direction of the gap is safe (a result is truncated earlier than advertised, never later), and
+    widening the enforced budget together with those tests closes it.
+
 ## Verification
 
-Latest full run, from `packages/typecrate/harness`:
+Latest full run, from `packages/typecrate/harness` (T10, the plugin-system uplift):
 
 ```bash
 cargo fmt -- --check                                 # clean
 cargo check --all-targets                            # clean
 cargo clippy --all-targets -- -D warnings            # clean
-cargo test --no-fail-fast                            # 283 passed, 0 failed, exit 0
+cargo test --no-fail-fast                            # 309 passed, 0 failed, exit 0
 ```
 
 | Target | Tests |
 | --- | --- |
-| lib unit tests | 56 |
+| lib unit tests | 66 |
 | `bin/server` unit tests | 8 |
 | `data_plane` | 15 |
-| `foundation` | 23 |
+| `foundation` | 24 |
 | `http_host` | 17 |
 | `http_sessions` | 17 |
+| `plugins` | 15 |
 | `projector` | 15 |
 | `routes` | 6 |
 | `runtime_execution` | 12 |
@@ -233,6 +277,14 @@ cargo test --no-fail-fast                            # 283 passed, 0 failed, exi
 | `transport` | 24 |
 | `turn` | 13 |
 | `worker_execution_http` | 1 |
+
+> As of T10 the services package builds its LIB clean against this harness (`cargo check --lib`), which
+> is the half that matters for the gateway bridge - `ANY /v1/harness/{*rest}` mounts the two new
+> `/plugins` routes with no route-file change. Its `cargo test` currently fails to BUILD for a reason
+> unrelated to this package: the working tree's uncommitted
+> `packages/typecrate/services/src/bin/server.rs` has a `match`-arm type error in the SIGTERM handler
+> (`Option<()>` vs `()`, `:633-639`). The 96-passed figure below is the state of that package's LAST
+> clean run, recorded before that edit, and `knowledge.md` "T10" repeats it as such.
 
 Beside it, from `packages/typecrate/services`: `cargo fmt -- --check`,
 `cargo test --locked --no-fail-fast`, `cargo clippy --all-targets --locked -- -D warnings` and

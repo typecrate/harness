@@ -23,8 +23,13 @@ use crate::events;
 pub async fn get_root(ctx: &mut Ctx) -> ApiResult {
     let mount = contract::HARNESS_API_ROOT;
 
-    // One entry per navigable route (`api.ts:1293-1303`). `HARNESS_ROUTES`
+    // One entry per navigable route (`api.ts:1293-1305`). `HARNESS_ROUTES`
     // (`harness-api.ts:103-194`) is the client-side mirror of the same list.
+    //
+    // `plugins` sits between `tools` and `models` because that is the contract's order
+    // (`api.ts:1302-1304`); this map is a `BTreeMap`, so the WIRE order is alphabetical and only the
+    // source order records the contract's. The key set is what the front-end's route bridge reads,
+    // and a missing key is a pane that never loads.
     let mut links = BTreeMap::new();
     for name in [
         "self",
@@ -33,6 +38,7 @@ pub async fn get_root(ctx: &mut Ctx) -> ApiResult {
         "harnesses",
         "agents",
         "tools",
+        "plugins",
         "models",
         "sessions",
         "stream",

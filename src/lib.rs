@@ -18,6 +18,7 @@
 //! | `origin`      | `src/shared/origin.ts`, `src/server/service.ts`, `src/server/stream/mount.ts` |
 //! | `ids`         | `src/core/thread.ts` (`THREAD_HOST_PREFIX`), `src/shared/agent-results.ts` (label codes) |
 //! | `persistence` | `src/server/persistence.ts` (the on-disk schema, the atomic commit, the interrupted-run repair) |
+//! | `plugins`     | `src/server/plugins.ts` (the settings store and every validation sentence), `src/plugin/manifest.ts` (the GENERATED catalogue this crate's `static BUILTIN_PLUGINS` replaces), and the `metadata` export of each `src/plugins/*.plugin.ts` |
 //! | `journal`     | `src/server/journal.ts` (the per-session `events.jsonl` append log)                |
 //! | `labels`      | `src/shared/agent-results.ts:126-262` (the label grammar and the per-code allocator) |
 //! | `ports`       | the seams `src/harness.ts` + `src/core/{action,task}.ts` + `src/server/stream/mount.ts` imply |
@@ -92,6 +93,7 @@ pub mod origin;
 pub mod package_root;
 pub mod paging;
 pub mod persistence;
+pub mod plugins;
 pub mod ports;
 pub mod projector;
 pub mod read;

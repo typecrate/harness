@@ -90,7 +90,10 @@ fn service_info_serializes_with_the_contract_shape() {
             "pending_actions": 4_u64,
             "steer_records": 64_u64,
             "created_tools": 32_u64,
-            "tool_result_bytes": 65_536_u64,
+            // `harness-api.ts:216` / `harness.swagger.yaml:243`. This build advertises the CONTRACT
+            // figure and enforces the narrower `contract::MODEL_TOOL_RESULT_BUDGET_BYTES` (64 KiB)
+            // until the tool stage widens; the assertion below is what keeps that gap honest.
+            "tool_result_bytes": 262_144_u64,
             "page_limit_default": 25_u64,
             "page_limit_max": 100_u64,
         })
@@ -112,6 +115,12 @@ fn service_info_serializes_with_the_contract_shape() {
         })
     );
 
+    // The published figure is the CONTRACT's 256 KiB; the enforced one is still this build's
+    // 64 KiB until the tool stage widens. Both are pinned so the gap cannot silently widen, and the
+    // boot document must keep publishing the contract's number.
+    assert_eq!(contract::PUBLISHED_TOOL_RESULT_BYTES, 262_144);
+    assert_eq!(contract::MODEL_TOOL_RESULT_BUDGET_BYTES, 65_536);
+
     assert_eq!(body["api_root"], "/v1/harness");
     // The root document's `service` is the published name, NOT this crate's own
     // (`api.ts:1307` sends `'noobscript-harness'`).
@@ -132,13 +141,75 @@ fn service_info_serializes_with_the_contract_shape() {
     );
     assert_eq!(limits.page_limit_default, contract::PAGE_LIMIT_DEFAULT);
     assert_eq!(limits.page_limit_max, contract::PAGE_LIMIT_MAX);
+    // The advertised budget, NOT the enforced one: `service_limits()` publishes
+    // `contract::PUBLISHED_TOOL_RESULT_BYTES` (the contract figure) while the tool stage still cuts
+    // a model-facing result at `MODEL_TOOL_RESULT_BUDGET_BYTES`. See the constants' notes.
     assert_eq!(
         limits.tool_result_bytes,
-        contract::MODEL_TOOL_RESULT_BUDGET_BYTES as u64
+        contract::PUBLISHED_TOOL_RESULT_BYTES
     );
     assert_eq!(contract::HARNESS_WS_SUBPROTOCOL, "harness.v1");
     assert_eq!(contract::HARNESS_EPOCH_HEADER, "X-Harness-Epoch");
     assert_eq!(contract::HARNESS_REVISION_HEADER, "X-Harness-Revision");
+}
+
+/// 2a2. The two vocabulary UPLIFTS the plugin-system contract carries (R7).
+///
+/// Both are widenings of an existing union, and both must be ACCEPTED rather than folded into the
+/// neighbouring value: a roster row that reports `paused` as `idle` tells the operator a parked
+/// conversation is free, and a definition read that refuses `session` fails to load a document a
+/// TypeScript host wrote for an agent the session itself defined.
+#[test]
+fn the_uplifted_vocabularies_are_accepted_not_folded() {
+    // `ThreadSummary.status` / `ThreadLifecycle` (`harness-api.ts:1481`).
+    for (spelling, lifecycle) in [
+        ("idle", contract::ThreadLifecycle::Idle),
+        ("running", contract::ThreadLifecycle::Running),
+        ("paused", contract::ThreadLifecycle::Paused),
+        ("stopped", contract::ThreadLifecycle::Stopped),
+    ] {
+        let parsed: contract::ThreadLifecycle =
+            serde_json::from_value(json!(spelling)).expect("the contract spelling parses");
+
+        assert_eq!(
+            parsed, lifecycle,
+            "`{spelling}` must keep its own variant, not collapse into a neighbour"
+        );
+        assert_eq!(serde_json::to_value(parsed).unwrap(), json!(spelling));
+
+        // The store's own two directions round-trip the same word, so a persisted record and the
+        // roster row it produces cannot disagree.
+        assert_eq!(store::lifecycle_str(parsed), spelling);
+        assert_eq!(store::read::parse_lifecycle(spelling), lifecycle);
+    }
+
+    // This build never parks a conversation itself (no plugin runtime), so `paused` is reachable
+    // only from data - which is exactly why the PARSE direction is the one that matters.
+    assert_ne!(
+        store::read::parse_lifecycle("paused"),
+        contract::ThreadLifecycle::Idle
+    );
+
+    // `HarnessInstructionSummaryEntry.source` (`harness-api.ts:451`): four spellings.
+    for (spelling, source) in [
+        ("catalogue", contract::InstructionSource::Catalogue),
+        ("global", contract::InstructionSource::Global),
+        ("harness", contract::InstructionSource::Harness),
+        ("session", contract::InstructionSource::Session),
+    ] {
+        let parsed: contract::InstructionSource =
+            serde_json::from_value(json!(spelling)).expect("the contract spelling parses");
+
+        assert_eq!(parsed, source, "`{spelling}` is one of the four");
+        assert_eq!(serde_json::to_value(parsed).unwrap(), json!(spelling));
+    }
+
+    // A session-scoped provenance enum already had all four, so the two stay interchangeable on
+    // reads that name an agent this session defined.
+    let session_source: contract::SessionInstructionSource =
+        serde_json::from_value(json!("session")).expect("the session spelling parses");
+
+    assert_eq!(session_source, contract::SessionInstructionSource::Session);
 }
 
 /// 2b. The camelCase/snake_case split the contract pins (`harness-api.ts:5-10`).
@@ -747,7 +818,11 @@ fn config_defaults_match_the_typescript_loader() {
         loaded.base_url,
         "http://localhost:5500/providers/private/v1"
     );
-    assert_eq!(loaded.model, "merge/ds4-flash");
+    // The LOCAL basalt model, which is the id the private provider at the default base URL actually
+    // serves (`config.ts:105-111`). A hosted `merge/ds4-flash` costs money and `localhost/basalt`
+    // 404s, so the UI's agent deck shows `local/basalt` on every tile.
+    assert_eq!(loaded.model, "local/basalt");
+    assert_eq!(config::DEFAULT_MODEL, "local/basalt");
     assert_eq!(loaded.api_key, "");
     assert_eq!(loaded.max_retries, 10);
     assert_eq!(loaded.retry_delay_ms, 1_000);
@@ -766,7 +841,7 @@ fn config_defaults_match_the_typescript_loader() {
         defaults,
         contract::ProviderDefaults {
             base_url: "http://localhost:5500/providers/private/v1".to_string(),
-            model: "merge/ds4-flash".to_string(),
+            model: "local/basalt".to_string(),
             has_api_key: false,
         }
     );

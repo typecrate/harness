@@ -1299,11 +1299,19 @@ pub fn parse_origin(value: &str) -> ThreadOrigin {
 }
 
 /// `ThreadLifecycle` from the record's string spelling.
+///
+/// R7: `paused` is one of the four spellings `harness-api.ts:1481` publishes, and it is a REAL state
+/// a record can carry: the shipped `context-compaction` plugin parks a conversation while it compacts
+/// (a TypeScript host writes that word into `state.json`). This build never transitions a conversation
+/// into it - no plugin hook executes here - but it must round-trip rather than fold into `Idle`,
+/// because the UI colours a parked conversation differently and a lying roster read would strand
+/// that affordance.
 #[must_use]
 pub fn parse_lifecycle(value: &str) -> ThreadLifecycle {
     match value {
         "running" => ThreadLifecycle::Running,
         "stopped" => ThreadLifecycle::Stopped,
+        "paused" => ThreadLifecycle::Paused,
         _ => ThreadLifecycle::Idle,
     }
 }
