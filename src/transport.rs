@@ -605,6 +605,36 @@ pub fn usage_of(usage: &Value) -> Option<HarnessUsage> {
 // The wire transcript
 // ---------------------------------------------------------------------------
 
+/// `wireArguments` (`openai.ts:250-283`): the provider's contract for
+/// `function.arguments` is "a JSON string holding an OBJECT".
+///
+/// Measured against the local gateway, anything else fails the WHOLE request with
+/// `500 {"error":"Internal Server Error"}`: `{a:1}`, `{}`, `null`, `""` are 200, while
+/// `[1,2]`, `42`, `true`, `"str"`, an unterminated string like `{"a":"x` or a truncated
+/// `{"command":"ec` are 500. The truncated case is the dangerous one, because a
+/// generation cut at its output-token ceiling stops in the middle of a tool call's
+/// arguments and `core/agent.ts` commits EXACTLY what arrived: the transcript keeps that
+/// raw text on purpose ("a replayable fact", `core/snapshot.ts`), so without this guard
+/// every LATER request replays the broken string and the thread is stuck failing on a
+/// message it can no longer change. Repair at the wire boundary, where the provider's
+/// requirement lives, instead of rewriting the recorded history.
+///
+/// An empty/blank string is tolerated by the gateway but is not an object, so it is
+/// normalized too: one rule, one shape, no provider-specific exception. A plain object
+/// and NOTHING else — `null` and arrays are objects to `typeof` in TS, and the gateway
+/// rejects the array anyway.
+#[must_use]
+fn wire_arguments(raw: &str) -> String {
+    match serde_json::from_str::<Value>(raw) {
+        // Only a JSON object passes; the raw text is kept byte-for-byte when it does, so a
+        // repaired request never re-serializes the model's own formatting.
+        Ok(Value::Object(_)) => raw.to_owned(),
+        // Valid non-object JSON (including `null`, an array, a number, a bool, a string) and
+        // anything unparseable (including `""`) both become the placeholder.
+        _ => "{}".to_owned(),
+    }
+}
+
 /// One tool declaration as the provider sees it (`openai.ts:503-510`).
 #[must_use]
 pub fn wire_tool(decl: &ToolDecl) -> Value {
@@ -1018,6 +1048,7 @@ pub fn wire_messages(
                 tool_call_id,
                 name,
                 attachments,
+                ..
             } => {
                 // The attachment key never reaches a wire field; the bytes are flushed
                 // after the block.
@@ -1038,12 +1069,13 @@ pub fn wire_messages(
             other => {
                 flush(&mut pending, &mut wire)?;
                 wire.push(match other {
-                    HarnessMessage::System { content } => {
+                    HarnessMessage::System { content, .. } => {
                         json!({ "role": "system", "content": content })
                     }
                     HarnessMessage::User {
                         content,
                         attachments,
+                        ..
                     } => json!({
                         "role": "user",
                         "content": wire_user_content(content, attachments, upload)?,
@@ -1051,6 +1083,7 @@ pub fn wire_messages(
                     HarnessMessage::Assistant {
                         content,
                         tool_calls,
+                        reasoning,
                         ..
                     } => {
                         let mut entry = Map::new();
@@ -1058,6 +1091,43 @@ pub fn wire_messages(
                         entry.insert("role".to_owned(), json!("assistant"));
                         entry.insert("content".to_owned(), json!(content));
 
+                        // THE THINKING ECHO (`wireMessage`, `openai.ts:295-338`, trimmer uplift T8).
+                        // The POLICY is not here: the projection already ran it. An entry whose
+                        // thinking was withheld has NO `reasoning` key in the copy the transport
+                        // is handed (`core/agent.ts` `withoutWithheldReasoning`, run by
+                        // `harness.ts` `projectTranscript`), and no request object carries the
+                        // `reasoningIncluded` flag — so the whole transport rule is "echo what is
+                        // present": a projected entry with a NON-EMPTY `reasoning` string is, by
+                        // construction, thinking the policy left eligible (the open turn under
+                        // the default `turn` tier, everything under `off`, nothing under `all`,
+                        // which reproduces the pre-T8 wire byte-for-byte).
+                        //
+                        // `reasoning_content` is the DeepSeek-compatible spelling, and the ONLY
+                        // spelling emitted — deliberately not a dual `reasoning` field
+                        // (`openai.ts:318-330`): every strict provider that demands the echo back
+                        // (DeepSeek thinking mode, Kimi/Moonshot, GLM/Z.ai, Qwen
+                        // `preserve_thinking`) speaks this dialect, there is no per-model
+                        // capability flag to pick one with, and dual-emitting a second
+                        // non-standard field is the unknown-field rejection the old "drop
+                        // reasoning entirely" posture existed to avoid.
+                        //
+                        // OMITTED, never `""` (`openai.ts:332-336`): a strict provider reads an
+                        // empty string as a thinking block whose content is missing (the DeepSeek
+                        // 400 and the Kimi "reasoning_content is missing in assistant tool call
+                        // message" are both about PRESENCE), and `core/agent.ts` commits a
+                        // non-empty `reasoning` anyway — so `Some("")` here can only be a
+                        // hand-built/host-seeded transcript, and it must not echo.
+                        if let Some(reasoning) =
+                            reasoning.as_deref().filter(|text| !text.is_empty())
+                        {
+                            entry.insert("reasoning_content".to_owned(), json!(reasoning));
+                        }
+
+                        // Key ORDER is part of the byte-identity contract (`openai.ts:337-341`):
+                        // the echo is written BEFORE `tool_calls` so an echoed entry reads in the
+                        // order the model produced it (thinking, then the call), and an entry with
+                        // nothing to echo allocates exactly `role`, `content`, optional
+                        // `tool_calls` — the shape this field had before T8.
                         if !tool_calls.is_empty() {
                             entry.insert(
                                 "tool_calls".to_owned(),
@@ -1070,7 +1140,9 @@ pub fn wire_messages(
                                                 "type": "function",
                                                 "function": {
                                                     "name": call.name,
-                                                    "arguments": call.arguments,
+                                                    // Repaired at the wire boundary, never in the
+                                                    // recorded history — see `wire_arguments`.
+                                                    "arguments": wire_arguments(&call.arguments),
                                                 },
                                             })
                                         })
@@ -1079,8 +1151,8 @@ pub fn wire_messages(
                             );
                         }
 
-                        // `reasoning` is intentionally dropped: it is local replay data and
-                        // several providers reject unknown message fields.
+                        // Everything else on the assistant variant stays local replay data and is
+                        // dropped (`openai.ts:360-364`); `reasoning_content` is the ONLY exception.
                         Value::Object(entry)
                     }
                     // The tool branch runs above, so its media is still pending.

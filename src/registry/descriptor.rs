@@ -121,6 +121,11 @@ impl HarnessDescriptor {
         HarnessPresetRecord {
             name: self.name.clone(),
             title: self.title.clone(),
+            // A harness DEFINITION never writes `customAgents` (`persistence.ts:148-153`): the
+            // registry's create/PATCH surface has no custom-agent input, so the map appears only
+            // inside a saved session's own `preset` copy. Stating it absent here is what keeps an
+            // untouched shipped row's key set exactly what TS writes.
+            custom_agents: None,
             description: self.description.clone(),
             requires_endpoint: self.requires_endpoint,
             primary: self.primary.clone(),

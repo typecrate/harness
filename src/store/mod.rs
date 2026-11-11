@@ -77,7 +77,7 @@ use crate::persistence::{
     HarnessPresetRecord, HarnessSessionRecord, HarnessSessionSettingsRecord, HarnessThreadRecord,
     SessionTurn, SteerRecord,
 };
-use crate::ports::{Projector, ProjectorFactory, Query, ToolRuntime, TurnExecutor};
+use crate::ports::{Projector, ProjectorFactory, ProjectorSeed, Query, ToolRuntime, TurnExecutor};
 use crate::registry::HarnessRegistry;
 use crate::store::actions::{StoreActionHost, StoreTaskHost, TaskRow};
 use crate::store::tools::CreatedTool;
@@ -335,6 +335,13 @@ pub struct TurnState {
     pub folded: usize,
     /// The turn's live display fold.
     pub projector: Box<dyn Projector>,
+    /// What the projector was opened with ([`ProjectorSeed`]).
+    ///
+    /// It lives on the runtime because [`TurnState::replay`] has to open a projector with the SAME
+    /// seed the live run used: the three non-event segments (system, prompt, steers) are not in the
+    /// event stream, so a replay that seeded less would rebuild a bar missing segments and break the
+    /// `live == replay` invariant the restore path depends on.
+    pub seed: ProjectorSeed,
     /// The system instructions this turn's agents actually ran with, per agent
     /// (`record.turnInstructionSources[turnId]`). Held on the runtime because the fold consumes them and
     /// T1 persists the map as opaque JSON.
@@ -360,12 +367,28 @@ impl std::fmt::Debug for TurnState {
 
 impl TurnState {
     /// A fresh fold for one opened turn (`sessions.ts:2855 appendTurn`).
+    ///
+    /// The seed is derived from the record alone ([`seed_from_turn_record`]); a caller that also has the
+    /// CONVERSATION's context — the section the block ids are prefixed with, the first user entry's id,
+    /// the recorded instruction sources — upgrades it with [`TurnState::set_seed`] before folding, which
+    /// is what `store::turns` does on the way in and what restore does on the way back.
     #[must_use]
     pub fn new(store: &Store, record: SessionTurn) -> Self {
+        let seed = seed_from_turn_record(&record);
+
+        Self::seeded(store, record, seed)
+    }
+
+    /// The same fold, opened with a seed the CALLER assembled — normally
+    /// [`SessionState::projector_seed`], which adds the conversation's section identity and the turn's
+    /// recorded instruction sources.
+    #[must_use]
+    pub fn seeded(store: &Store, record: SessionTurn, seed: ProjectorSeed) -> Self {
         Self {
+            projector: store.projector.create(&seed),
             record,
             folded: 0,
-            projector: store.projector.create(),
+            seed,
             instruction_sources: Vec::new(),
             extra: Map::new(),
         }
@@ -374,13 +397,30 @@ impl TurnState {
     /// A fold rebuilt from a durable record (`sessions.ts:3585-3600 restoreTurn`).
     #[must_use]
     pub fn from_record(store: &Store, record: &SessionTurn) -> Self {
+        let seed = seed_from_turn_record(record);
         Self {
+            projector: store.projector.create(&seed),
             record: record.clone(),
             folded: 0,
-            projector: store.projector.create(),
+            seed,
             instruction_sources: Vec::new(),
             extra: Map::new(),
         }
+    }
+
+    /// Reopens the fold with a fuller seed and re-folds what has already been recorded.
+    ///
+    /// The store opens a turn before it knows the conversation's section identity, and a projector
+    /// minted from the thin seed would keep the wrong block-id prefix for the whole run. Re-folding the
+    /// events already in `record` (rather than throwing the projector away at event 0) is what keeps the
+    /// `live == replay` invariant: the fold a restart rebuilds goes through this same path.
+    pub fn set_seed(&mut self, factory: &dyn ProjectorFactory, seed: ProjectorSeed) {
+        self.seed = seed;
+        self.projector = factory.create(&self.seed);
+        self.folded = 0;
+        // Cloned, because the fold writes through `&mut self` while it reads the seed.
+        let seed = self.seed.clone();
+        self.replay_onto(&seed, factory);
     }
 
     /// The agent this turn runs as.
@@ -438,8 +478,19 @@ impl TurnState {
     ///
     /// Returns the display ops this event produced, which is what a `display.ops` frame carries. The
     /// recorder is the ONLY place those ops are minted, so a live run and a replay cannot diverge.
-    pub fn record_event(&mut self, event: &HarnessEvent, at: u64) -> Vec<Value> {
-        self.record.events.push(event.clone());
+    ///
+    /// `lane` is the conversation's `contextLane` read LIVE by the caller, at this moment, and the
+    /// recorder stamps it on the event whenever it is non-zero (`sessions.ts:7925-7936`). Reading it per
+    /// event rather than caching it at turn start is the whole point: a compaction that happens
+    /// mid-run has to take effect on the very next event, which is what puts one turn's pre- and
+    /// post-compaction segments on two rows.
+    pub fn record_event(&mut self, event: &HarnessEvent, at: u64, lane: Option<u64>) -> Vec<Value> {
+        self.record
+            .events
+            .push(crate::persistence::SessionTurnEvent::with_lane(
+                event.clone(),
+                lane,
+            ));
         match self.record.event_times.as_mut() {
             // An older document has no `eventTimes` at all; opening one here keeps the two arrays
             // parallel, which is the invariant `persistence.ts:162-167` states.
@@ -454,9 +505,12 @@ impl TurnState {
         // `${turnId}:${ordinal}`. `TurnState::display` stamps the snapshot with the same rule
         // (`projector::section_wire_id`), which is what makes a streamed section id equal the id a
         // display read reports.
+        // The lane the fold sees is the lane just stamped, or `None` when the stamp was suppressed —
+        // one source, so the live fold and a replay of these same records cannot disagree.
+        let stamped = self.record.events.last().and_then(|entry| entry.lane);
         let ops = crate::projector::stamp_display_ops(
             &self.record.id,
-            self.projector.apply(event, at, self.folded as u64),
+            self.projector.apply(event, stamped, at, self.folded as u64),
         );
         self.folded += 1;
         self.record.updated_at = at;
@@ -473,12 +527,20 @@ impl TurnState {
     /// Folds every recorded event through a FRESH projector — `live == replay`, the invariant the restore
     /// path depends on: a restored turn's rows are identical to the rows its live run made.
     pub fn replay(&mut self, factory: &dyn ProjectorFactory) {
-        let mut projector = factory.create();
+        self.replay_onto(&self.seed.clone(), factory);
+    }
+
+    /// The fold body, split out so [`TurnState::set_seed`] can re-fold with a seed it was handed
+    /// without borrowing `self.seed` while the fold writes through `self`.
+    fn replay_onto(&mut self, seed: &ProjectorSeed, factory: &dyn ProjectorFactory) {
+        let mut projector = factory.create(seed);
         let events = std::mem::take(&mut self.record.events);
         let times = self.record.event_times.clone().unwrap_or_default();
-        for (index, event) in events.iter().enumerate() {
+        for (index, entry) in events.iter().enumerate() {
             let at = times.get(index).copied().unwrap_or(self.record.updated_at);
-            projector.apply(event, at, index as u64);
+            // Each event carries its own recorded stamp, so a restart replays the SAME lanes
+            // (`persistence::SessionTurnEvent`).
+            projector.apply(&entry.event, entry.lane, at, index as u64);
         }
         self.record.events = events;
         self.folded = self.record.events.len();
@@ -1600,6 +1662,109 @@ impl SessionState {
         self.threads.get(thread_id)
     }
 
+    /// The conversation's CURRENT context-lane counter (`sessions.ts:2745 contextLaneOf`).
+    ///
+    /// `None` means lane 0 — absence already says it, and [`crate::persistence::LaneStamp`] turns a 0
+    /// back into absence on the way out, so a session that never compacted writes no lane key anywhere.
+    ///
+    /// The recorder calls this LIVE, once per event (`sessions.ts:7925-7936`) and once again when a turn
+    /// is claimed (`:8871-8874`), never cached at turn start: a compaction that lands mid-run has to
+    /// take effect on the very next event, which is the only way one turn's context bar can show both
+    /// rows. The counter itself is durable (`persistence::HarnessThreadRecord::context_lane`, written
+    /// back into `core.threads[].contextLane`), which is what lets a restarted conversation keep its
+    /// rows stacked where the operator left them.
+    #[must_use]
+    pub fn context_lane_of(&self, thread_id: Option<&str>) -> Option<u64> {
+        thread_id
+            .and_then(|thread_id| self.threads.get(thread_id))
+            .and_then(|thread| thread.context_lane)
+            .filter(|lane| *lane != 0)
+    }
+
+    /// Everything the projector needs that is NOT in the event stream, for one turn
+    /// (`createTurnProjector`'s `DisplayProjectContext`, `sessions.ts:4160-4240`).
+    ///
+    /// The three non-event segments — the one `system` block, the `user` prompt block, and every
+    /// `steer` block — are minted from session state (`turn-projector.ts:1543 syncRecordBlocks`,
+    /// `:1609 syncSteerBlocks`), so a fold that started from the events alone would rebuild a context
+    /// bar missing them after a restart. The section identity comes from the snapshot the session
+    /// committed; the instruction sources from the per-turn map T1 persists.
+    #[must_use]
+    pub fn projector_seed(&self, record: &SessionTurn) -> ProjectorSeed {
+        let mut seed = seed_from_turn_record(record);
+        let core = self.record.core.as_object();
+
+        // The conversation's SECTION, which is what a block id is prefixed with
+        // (`blockIdOf(record.ordinal, ...)`, `turn-projector.ts:1407`). A conversation that has no
+        // section record yet takes the ordinal its section WOULD have, so the ids a live run mints and
+        // the ids a rebuild mints after the section appears still line up.
+        let sections = core
+            .and_then(|core| core.get("sections"))
+            .and_then(Value::as_array);
+
+        if let (Some(thread_id), Some(sections)) = (record.thread_id.as_deref(), sections) {
+            let section = sections
+                .iter()
+                .find(|section| section.get("threadId").and_then(Value::as_str) == Some(thread_id))
+                .or_else(|| {
+                    // A legacy snapshot keyed its section by the composite id rather than a threadId
+                    // (`{sessionId}-{threadId}`, the same spelling the store writes).
+                    let composite = format!("{}-{thread_id}", self.record.id);
+
+                    sections.iter().find(|section| {
+                        section.get("id").and_then(Value::as_str) == Some(composite.as_str())
+                    })
+                });
+
+            match section {
+                Some(section) => {
+                    seed.section_ordinal = section
+                        .get("ordinal")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_else(|| {
+                            sections
+                                .iter()
+                                .position(|entry| std::ptr::eq(entry, section))
+                                .map_or(0, |position| position as u64)
+                        });
+                    seed.section_id = section.get("id").and_then(Value::as_str).map(str::to_owned);
+                }
+                None => seed.section_ordinal = sections.len() as u64,
+            }
+
+            // The call id of the `user` segment is `transcript-${messageId}` of the conversation's
+            // FIRST user entry (`:1578`) — the entry the block detail route resolves to answer "what
+            // did the operator actually type here".
+            seed.user_message_id = self
+                .thread(thread_id)
+                .and_then(|thread| {
+                    thread.messages.iter().find(|message| {
+                        matches!(message, crate::contract::HarnessMessage::User { .. })
+                    })
+                })
+                .and_then(|message| match message {
+                    crate::contract::HarnessMessage::User { message_id, .. } => {
+                        message_id.clone().filter(|id| !id.is_empty())
+                    }
+                    _ => None,
+                });
+        }
+
+        // The system instructions THIS turn's agents ran with (`turnInstructionSources[turnId]`). An
+        // absent entry means "no recorded source", and the fold then mints no `system` segment at all
+        // rather than inventing one from the live registry, which may have changed since.
+        seed.instruction_sources = self
+            .record
+            .turn_instruction_sources
+            .as_ref()
+            .and_then(|sources| sources.get(&record.id))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        seed
+    }
+
     #[must_use]
     pub fn thread_mut(&mut self, thread_id: &str) -> Option<&mut HarnessThreadRecord> {
         self.threads.get_mut(thread_id)
@@ -2302,7 +2467,114 @@ fn core_of<T: serde::de::DeserializeOwned>(core: &Value, key: &str, fallback: T)
 /// `core.threads` — every conversation with its committed transcript and transcript revision.
 #[must_use]
 pub fn restore_threads(core: &Value) -> Vec<HarnessThreadRecord> {
-    core_of(core, "threads", Vec::new())
+    let mut threads: Vec<HarnessThreadRecord> = core_of(core, "threads", Vec::new());
+
+    for thread in &mut threads {
+        // A WRITTEN `contextLane: 0` is normalized away on read (`core/snapshot.ts:758-763` drops it,
+        // because `snapshot()` never emits the key for lane 0). Without this, a document a hand-edit
+        // left a 0 in would come back as lane 0 and this crate would RE-WRITE the key TS never wrote.
+        thread.context_lane = crate::persistence::LaneStamp::of(thread.context_lane);
+    }
+
+    threads
+}
+
+/// The projector seed the TURN RECORD alone can supply (`sessions.ts:4160-4240`).
+///
+/// The conversation-only half — section identity, the first user entry's id, the recorded instruction
+/// sources — is added by [`SessionState::projector_seed`], which is what the session-level callers use.
+/// This half exists so a store that has not loaded a conversation yet can still open a fold that mints
+/// the right turn id, prompt, steer list, and LANE.
+#[must_use]
+pub fn seed_from_turn_record(record: &SessionTurn) -> ProjectorSeed {
+    ProjectorSeed {
+        turn_id: record.id.clone(),
+        prompt: record.prompt.clone(),
+        // Already normalized: a stored 0 is absence, and the projector's lane for the non-event
+        // segments must be `None` in exactly the same cases the recorder wrote no key.
+        lane: crate::persistence::LaneStamp::of(record.lane),
+        started_at: record.started_at,
+        thread_id: record.thread_id.clone(),
+        thread_label: record.thread_label.clone(),
+        agent: record
+            .extra
+            .get(crate::store::EXTRA_AGENT)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        // 0 is the ordinal of a session's first section, which is also what a session with no
+        // sections at all starts from; `SessionState::projector_seed` corrects it from the snapshot.
+        section_ordinal: 0,
+        section_id: None,
+        user_message_id: None,
+        instruction_sources: Vec::new(),
+        steers: merged_steer_seeds(record),
+    }
+}
+
+/// The merged steer-submit list the fold mints its `steer` blocks from
+/// (`turn-projector.ts:1609-1660 syncSteerBlocks`, fed by `sessions.ts`'s `displayContext`).
+///
+/// Two durable lists hold the same submits for different reasons: `turn.steers` is the BOUNDED audit
+/// ring and `turn.steerTexts` is the UNBOUNDED text archive (`protocol.ts:174-206`). The archive wins
+/// for an id it holds — it is the copy that keeps the EXACT bytes — and the ring only supplies submits
+/// the archive never wrote (a document written before the archive existed). Ordering is by `at`, then
+/// by id, because a block id is `ordinal-user-{submitId}` and a fold that ordered the same submits
+/// differently would mint the same ids in a different sequence and renumber the bar.
+#[must_use]
+pub fn merged_steer_seeds(record: &SessionTurn) -> Vec<Value> {
+    let mut merged: Vec<Value> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+
+    // The archive first, then the ring, so the first-seen entry for an id is the archive's copy.
+    let mut entries: Vec<Value> = record.steer_texts.clone().unwrap_or_default();
+
+    entries.extend(
+        record
+            .steers
+            .iter()
+            .flatten()
+            .map(|steer| serde_json::to_value(steer).unwrap_or(Value::Null)),
+    );
+
+    for entry in &entries {
+        let Some(entry) = entry.as_object() else {
+            continue;
+        };
+
+        // A submit with no id has no block identity, so the fold skips it exactly as the fold's own
+        // derive-a-key rule would when the archive carries none (`persistence.ts:682-717` refuses a
+        // blank id in the archive; a hand-written ring entry may still have one).
+        let id = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        let Some(id) = id else { continue };
+
+        if seen.iter().any(|existing| existing == id) {
+            continue;
+        }
+
+        seen.push(id.to_owned());
+        merged.push(Value::Object(entry.clone()));
+    }
+
+    // The sort key is OWNED (`at`, then `id`) rather than borrowed: the fold's rule is a total order on
+    // those two fields, and an owned key keeps `sort_by`'s closure lifetime inference simple.
+    let key = |entry: &Value| {
+        (
+            entry.get("at").and_then(Value::as_u64).unwrap_or(0),
+            entry
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+        )
+    };
+
+    merged.sort_by_key(key);
+
+    merged
 }
 
 /// `core.createdTools` — the created-tool ledger, keyed by name.
@@ -2629,6 +2901,30 @@ impl Store {
             } else {
                 status_str(SessionStatus::Idle).to_owned()
             };
+        }
+
+        // DISPLAY LANE / projector seed: a restored fold has to be re-opened with the SESSION's seed
+        // (`sessions.ts:4160-4240 displayContext`). The pass that rebuilt the folds above could only
+        // seed them from the turn record, because the conversation roster and the committed snapshot are
+        // not assembled into a `SessionState` until here — and the three non-event segments (system,
+        // prompt, steers), the turn lane, and every block id's section prefix all come from that
+        // context. `TurnState::set_seed` re-folds what was already recorded, so a restarted
+        // conversation's context bar is byte-for-byte the bar its live run painted.
+        let seeds: Vec<(String, ProjectorSeed)> = state
+            .turn_order
+            .iter()
+            .filter_map(|turn_id| {
+                state
+                    .turns
+                    .get(turn_id)
+                    .map(|turn| (turn_id.clone(), state.projector_seed(&turn.record)))
+            })
+            .collect();
+
+        for (turn_id, seed) in seeds {
+            if let Some(turn) = state.turns.get_mut(&turn_id) {
+                turn.set_seed(&*self.projector, seed);
+            }
         }
 
         Ok(state)

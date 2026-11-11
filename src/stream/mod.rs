@@ -46,7 +46,6 @@ use serde_json::json;
 
 use crate::api;
 use crate::contract;
-use crate::events;
 use crate::origin;
 use crate::runtime;
 
@@ -141,14 +140,14 @@ pub async fn upgrade(root: PathBuf, request: Request) -> Response {
         header_text(&headers, "origin").as_deref(),
         header_text(&headers, "host").as_deref(),
     ) {
-        return json_error(error.status, &error.message, events::process_epoch(), None);
+        return json_error(error.status, &error.message, None);
     }
 
     // 2. The runtime for this root: its epoch is the 101's header, and its broker is the connection.
     let runtime_for_request = match runtime::runtime_for(&root) {
         Ok(active) => active,
         Err(error) => {
-            return json_error(error.status, &error.message, events::process_epoch(), None);
+            return json_error(error.status, &error.message, None);
         }
     };
 
@@ -162,18 +161,13 @@ pub async fn upgrade(root: PathBuf, request: Request) -> Response {
             "a live stream on this deployment",
         );
 
-        return json_error(error.status, &error.message, &epoch, None);
+        return json_error(error.status, &error.message, None);
     }
 
     // 4. `transport.ts:617`. Hyper has already parsed the verb, so this is the same test on the same
     // header set.
     if method != Method::GET {
-        return json_error(
-            StatusCode::METHOD_NOT_ALLOWED.as_u16(),
-            gate::METHOD,
-            &epoch,
-            None,
-        );
+        return json_error(StatusCode::METHOD_NOT_ALLOWED.as_u16(), gate::METHOD, None);
     }
 
     // 5. The upgrade tokens. A request that carries neither is the case `api.ts:3906-3912` answers,
@@ -199,7 +193,6 @@ pub async fn upgrade(root: PathBuf, request: Request) -> Response {
             } else {
                 STREAM_UPGRADE_SENTENCE
             },
-            &epoch,
             None,
         );
     }
@@ -212,12 +205,7 @@ pub async fn upgrade(root: PathBuf, request: Request) -> Response {
         .to_owned();
 
     if key.is_empty() {
-        return json_error(
-            StatusCode::BAD_REQUEST.as_u16(),
-            gate::MISSING_KEY,
-            &epoch,
-            None,
-        );
+        return json_error(StatusCode::BAD_REQUEST.as_u16(), gate::MISSING_KEY, None);
     }
 
     // 7. `transport.ts:634-640`: 426 plus the version header is the RFC's answer to a client
@@ -232,7 +220,6 @@ pub async fn upgrade(root: PathBuf, request: Request) -> Response {
         return json_error(
             StatusCode::UPGRADE_REQUIRED.as_u16(),
             gate::VERSION,
-            &epoch,
             Some(("Sec-WebSocket-Version", "13")),
         );
     }
@@ -244,7 +231,6 @@ pub async fn upgrade(root: PathBuf, request: Request) -> Response {
         return json_error(
             StatusCode::NOT_FOUND.as_u16(),
             &format!("No stream is mounted at {pathname}."),
-            &epoch,
             None,
         );
     }
@@ -261,7 +247,6 @@ pub async fn upgrade(root: PathBuf, request: Request) -> Response {
             return json_error(
                 StatusCode::BAD_REQUEST.as_u16(),
                 STREAM_UPGRADE_SENTENCE,
-                &epoch,
                 None,
             );
         }
@@ -294,11 +279,20 @@ const STREAM_UPGRADE_SENTENCE: &str = "GET /stream expects a WebSocket upgrade (
 /// One handshake refusal: the `{error:{message}}` envelope with the headers every JSON answer carries
 /// (`api.ts:4030-4064`), plus the one extra header the 426 arm needs.
 ///
+/// NO `X-Harness-Epoch`, deliberately: TypeScript's handshake refusals are written by
+/// `rejectUpgrade` (`stream/transport.ts:134-146`), which writes ONLY `Content-Type`,
+/// `Content-Length`, `Connection: close` and the caller's extra lines — the mount's epoch header
+/// rides the **101 lines** and nothing else (`transport.ts:655-666`, fed from `mount.ts:146`). A
+/// client refused at the handshake learns nothing about the server's identity, because the refusal
+/// is exactly the point at which it has not yet been told one. The dispatcher's own `sendError`
+/// agrees (`api.ts`: a 4xx/5xx body never reaches `stampContractHeaders`), which is why
+/// `tests/http_host.rs` asserts the absence through `assert_contract_headers`.
+///
 /// This mirrors `api::write_error`, which is private to the dispatcher; the stream cannot import it
 /// without making `api/mod.rs` wider than this stage owns, so the shape is restated here and pinned
 /// by `tests/stream.rs`.
 #[must_use]
-fn json_error(status: u16, message: &str, epoch: &str, extra: Option<(&str, &str)>) -> Response {
+fn json_error(status: u16, message: &str, extra: Option<(&str, &str)>) -> Response {
     let body = json!({ "error": { "message": message } });
     let text = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
 
@@ -309,7 +303,6 @@ fn json_error(status: u16, message: &str, epoch: &str, extra: Option<(&str, &str
             HeaderValue::from_static("application/json; charset=utf-8"),
         )
         .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))
-        .header(contract::HARNESS_EPOCH_HEADER, epoch)
         .header(header::CONTENT_LENGTH, text.len().to_string());
 
     if let Some((name, value)) = extra {

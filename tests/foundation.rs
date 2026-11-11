@@ -90,9 +90,10 @@ fn service_info_serializes_with_the_contract_shape() {
             "pending_actions": 4_u64,
             "steer_records": 64_u64,
             "created_tools": 32_u64,
-            // `harness-api.ts:216` / `harness.swagger.yaml:243`. This build advertises the CONTRACT
-            // figure and enforces the narrower `contract::MODEL_TOOL_RESULT_BUDGET_BYTES` (64 KiB)
-            // until the tool stage widens; the assertion below is what keeps that gap honest.
+            // `harness-api.ts:222` / `harness.swagger.yaml:243`. The published figure and the
+            // ENFORCED one are the same number in this build (`contract::MODEL_TOOL_RESULT_BUDGET_BYTES`
+            // is 256 KiB and `PUBLISHED_TOOL_RESULT_BYTES` is derived from it), so the boot document
+            // can no longer advertise a budget a different stage cuts earlier.
             "tool_result_bytes": 262_144_u64,
             "page_limit_default": 25_u64,
             "page_limit_max": 100_u64,
@@ -115,11 +116,29 @@ fn service_info_serializes_with_the_contract_shape() {
         })
     );
 
-    // The published figure is the CONTRACT's 256 KiB; the enforced one is still this build's
-    // 64 KiB until the tool stage widens. Both are pinned so the gap cannot silently widen, and the
-    // boot document must keep publishing the contract's number.
+    // WAVE 2-C: the split is CLOSED. The published figure and the enforced one are the same
+    // 256 KiB (`core/result-budget.ts:54`), so the deviation pin that used to hold the enforced
+    // budget at 64 KiB is replaced by the parity assertion. `PUBLISHED_TOOL_RESULT_BYTES` is now
+    // DERIVED from the enforced constant, and the third assertion is what keeps it that way.
     assert_eq!(contract::PUBLISHED_TOOL_RESULT_BYTES, 262_144);
-    assert_eq!(contract::MODEL_TOOL_RESULT_BUDGET_BYTES, 65_536);
+    assert_eq!(contract::MODEL_TOOL_RESULT_BUDGET_BYTES, 262_144);
+    assert_eq!(
+        usize::try_from(contract::PUBLISHED_TOOL_RESULT_BYTES).ok(),
+        Some(contract::MODEL_TOOL_RESULT_BUDGET_BYTES),
+        "the advertised budget and the enforced one are one constant, so neither can drift again"
+    );
+
+    // WAVE 2-C: the AGGREGATE sibling (`core/result-budget.ts:94`). Two times the per-result
+    // cap is the whole point — one full-budget `read` plus one more large result still commit
+    // UNCHANGED, which is the case the 256 KiB number was raised for — while a turn that fires
+    // eight big reads can no longer spend 2 MiB of context. Pinned here because the ledger that
+    // enforces it (`tools::result::ToolResultTurnBudget`) is applied by the turn layer, and a
+    // silent halving of this figure would show up as a spill the reference never produces.
+    assert_eq!(contract::MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES, 524_288);
+    assert_eq!(
+        contract::MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES,
+        contract::MODEL_TOOL_RESULT_BUDGET_BYTES * 2
+    );
 
     assert_eq!(body["api_root"], "/v1/harness");
     // The root document's `service` is the published name, NOT this crate's own
@@ -141,12 +160,17 @@ fn service_info_serializes_with_the_contract_shape() {
     );
     assert_eq!(limits.page_limit_default, contract::PAGE_LIMIT_DEFAULT);
     assert_eq!(limits.page_limit_max, contract::PAGE_LIMIT_MAX);
-    // The advertised budget, NOT the enforced one: `service_limits()` publishes
-    // `contract::PUBLISHED_TOOL_RESULT_BYTES` (the contract figure) while the tool stage still cuts
-    // a model-facing result at `MODEL_TOOL_RESULT_BUDGET_BYTES`. See the constants' notes.
+    // The advertised budget IS the enforced one: `service_limits()` publishes
+    // `contract::PUBLISHED_TOOL_RESULT_BYTES`, which is derived from
+    // `MODEL_TOOL_RESULT_BUDGET_BYTES`. Pinned so a future split of the two constants shows up
+    // here instead of as an advertised figure the tool stage quietly undercuts.
     assert_eq!(
         limits.tool_result_bytes,
         contract::PUBLISHED_TOOL_RESULT_BYTES
+    );
+    assert_eq!(
+        u64::try_from(contract::MODEL_TOOL_RESULT_BUDGET_BYTES).ok(),
+        Some(limits.tool_result_bytes)
     );
     assert_eq!(contract::HARNESS_WS_SUBPROTOCOL, "harness.v1");
     assert_eq!(contract::HARNESS_EPOCH_HEADER, "X-Harness-Epoch");
@@ -224,6 +248,10 @@ fn wire_spellings_match_the_typescript_contract() {
             arguments: "{\"agent\":\"loaded\"}".to_string(),
         }],
         reasoning: Some("thinking".to_string()),
+
+        included: None,
+        reasoning_included: None,
+        message_id: None,
     };
     assert_eq!(
         serde_json::to_value(&message).unwrap(),

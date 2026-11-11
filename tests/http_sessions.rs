@@ -1250,19 +1250,29 @@ async fn a_submitted_task_runs_and_every_turn_read_describes_it() {
     );
 
     // THE CONTEXT BAR segment. The fold mints a `tool` segment per call and an `assistant` segment
-    // for an answer that streamed no deltas, so an id the display published really does resolve;
-    // the record-only kinds TypeScript mints from the prompt (`0-user-prompt`) stay a 404, because
-    // the projector seam is created without the prompt (`ports.rs:239-241`).
+    // for an answer that streamed no deltas, and — because the seam is now SEEDED with the turn
+    // (`ports::ProjectorSeed`, `sessions.ts:4160-4240`) — the prompt segment TypeScript mints from the
+    // record (`0-user-prompt`, `turn-projector.ts:1578`) is part of the bar too, so it resolves.
     let block = get(
         &server,
         &format!("/v1/harness/sessions/{id}/turns/{turn_id}/blocks/0-user-prompt"),
     )
     .await;
 
-    assert_eq!(block.status, StatusCode::NOT_FOUND);
+    assert_eq!(block.status, StatusCode::OK);
+
+    // A kind this fold never mints is still a 404: the projector has no reasoning SEGMENT to offer,
+    // and inventing one for an id the fold never published would answer a question nobody asked.
+    let missing_block = get(
+        &server,
+        &format!("/v1/harness/sessions/{id}/turns/{turn_id}/blocks/0-reasoning-9"),
+    )
+    .await;
+
+    assert_eq!(missing_block.status, StatusCode::NOT_FOUND);
     assert_eq!(
-        block.message(),
-        format!("Unknown context block \"0-user-prompt\" in turn \"{turn_id}\".")
+        missing_block.message(),
+        format!("Unknown context block \"0-reasoning-9\" in turn \"{turn_id}\".")
     );
 
     let bar = get(
@@ -1275,30 +1285,53 @@ async fn a_submitted_task_runs_and_every_turn_read_describes_it() {
         .as_array()
         .expect("every section row carries its context bar");
 
+    // Two segments, in conversation order: the prompt block the SEEDED fold mints from the record
+    // (`turn-projector.ts:1578`, and the id is the section ordinal 0 because this conversation's
+    // section is ordinal 0 — `blockIdOf`, `:1407`), then the tool call's own segment. The answer
+    // streamed as deltas, so it opens no third one.
     assert_eq!(
-        segments.len(),
-        1,
-        "the call opens one segment, and the answer that streamed as deltas opens no second one"
+        segments
+            .iter()
+            .map(|segment| segment["kind"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["user", "tool"],
+        "the prompt segment comes first, then the call's segment"
     );
-    assert_eq!(segments[0]["kind"], json!("tool"));
     assert_eq!(
-        segments[0]["id"],
-        json!("1-tool-2"),
+        segments[0]["id"].as_str().expect("a minted id"),
+        "0-user-prompt"
+    );
+    assert_eq!(
+        segments[0]["name"].as_str().expect("a named segment"),
+        "prompt"
+    );
+    assert_eq!(segments[1]["kind"], json!("tool"));
+    assert_eq!(
+        segments[1]["id"],
+        // `{section ordinal}-{kind}-{key}` (`blockIdOf`, `turn-projector.ts:1407`): the ordinal is the
+        // CONVERSATION's section ordinal — 0 for this session's one conversation, exactly as the
+        // TypeScript fixture's `0-tool-80` states — and the key is the OPENING event's index, the same
+        // derivation as the step id.
+        json!("0-tool-2"),
         "the key is the OPENING event's index, the same derivation as the step id"
     );
     assert_eq!(
-        segments[0]["name"],
+        segments[1]["name"],
         json!("timeNow"),
         "the label is the recorded tool name, decided server-side"
     );
-    assert_eq!(segments[0]["state"], json!("ok"));
+    assert_eq!(segments[1]["state"], json!("ok"));
     assert!(
-        segments[0].get("text").is_none() && segments[0].get("preview").is_none(),
+        segments[1].get("text").is_none() && segments[1].get("preview").is_none(),
         "a segment is metadata: the bytes come from the record, on a click"
+    );
+    assert!(
+        segments[1].get("lane").is_none(),
+        "a conversation that never moved a lane writes no lane key at all          (`turn-projector.ts:1449 laneFieldsOf`)"
     );
 
     // The detail route answers from the durable record, over the segment's own event range.
-    let segment_id = segments[0]["id"]
+    let segment_id = segments[1]["id"]
         .as_str()
         .expect("a server-minted segment id")
         .to_owned();

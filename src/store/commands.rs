@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use crate::contract::{HarnessMessage, HarnessToolCall, HarnessToolOutcome};
+use crate::contract::{HarnessMessage, HarnessToolCall, HarnessToolOutcome, stored_outcome_entry};
 use crate::store::read::{TURN_PREVIEW_CHARS, preview};
 use crate::store::{SessionState, Store, commands, now_ms, tools};
 
@@ -358,7 +358,9 @@ pub fn cap_text(text: &str) -> String {
 }
 
 impl CommandOutcome {
-    /// The `tool` transcript entry this result becomes (`sessions.ts:3678-3690`).
+    /// The `tool` transcript entry this result becomes (`sessions.ts:6995-7080` commits the
+    /// command round, and `core/tool-outcome.ts storedOutcomeEntry` decides the `outcome` key):
+    /// a failed command carries `outcome: "failed"`, a successful one carries NO key at all.
     #[must_use]
     pub fn tool_message(&self, call_id: &str) -> HarnessMessage {
         HarnessMessage::Tool {
@@ -366,6 +368,9 @@ impl CommandOutcome {
             tool_call_id: call_id.to_owned(),
             name: COMMAND_TOOL_NAME.to_owned(),
             attachments: Vec::new(),
+            outcome: stored_outcome_entry(self.outcome()),
+            included: None,
+            message_id: None,
         }
     }
 

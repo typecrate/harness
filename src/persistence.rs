@@ -178,6 +178,17 @@ pub struct HarnessPresetRecord {
     pub tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_tools: Option<Vec<String>>,
+    /// The operator's custom-agent instruction map (`persistence.ts:153` `customAgents`, an
+    /// agent id -> text map exactly like the three maps above it, restored by `readStringMap` at
+    /// `:611-613` and written at `:631`).
+    ///
+    /// ADDITIVE: absent means "this preset has no custom agents", and a TS preset written before
+    /// the field existed stays absent on a round trip. A harness DEFINITION never writes it — the
+    /// registry's create/PATCH surface has no custom-agent input — so in practice it only appears
+    /// inside a saved session's own `preset` copy, which is why an uplifter that ignored it would
+    /// drop a restarted session's invented agents out of the roster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_agents: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_models: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -253,6 +264,123 @@ pub struct HarnessGlobalSettingsRecord {
 /// in DECLARED order (`plugins.ts snapshot`), and a documented key order is what makes a saved diff
 /// reviewable.
 pub type HarnessPluginSettingsRecord = Map<String, Value>;
+
+/// The tool NAMES the operator switched off, deployment-wide (`persistence.ts:328`
+/// `HarnessToolSettingsRecord`, the `toolSettings` member at `:390`).
+///
+/// A DENY list, exactly as the TypeScript states it: "everything is enabled unless it is listed",
+/// so the document carries only the exceptions and a deployment that never opened the Tools pane
+/// stores nothing. Names only - a stored name may legitimately stop existing between builds, so it
+/// is never checked against this build's catalogue (`persistence.ts:1512-1514`).
+///
+/// A1 NOTE ON CUSTODY: `persistence.rs` owns this record's SHAPE (validation, normalization, and
+/// the `disabled` list's sorted-set spelling), while `crate::api::tools` owns the live value and the
+/// read-modify-write that puts the member into the document, because `Store` has no field for it
+/// yet. See the module comment there for the one-line follow-up that moves custody into the store.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessToolSettingsRecord {
+    /// The disabled names, in the writer's canonical sorted order. An empty list is stored as an
+    /// ABSENT member, never as `{ "disabled": [] }` (`persistence.ts:1538-1540`), so a load-save
+    /// round trip of a hand-edited file lands on the same bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<Vec<String>>,
+}
+
+/// The document's `toolSettings` member name (`persistence.ts:390`).
+pub const TOOL_SETTINGS_MEMBER: &str = "toolSettings";
+
+/// Reads and NORMALIZES one `toolSettings` value the way the TypeScript reader does
+/// (`persistence.ts:1517-1540`): shape-gate, then de-duplicate, trim, drop blanks, and sort, with
+/// an empty result reported as ABSENT.
+///
+/// The sorted set is not cosmetic: the writer emits a sorted list, so "load then save" is only
+/// byte-stable when the read lands on that order first.
+///
+/// # Errors
+///
+/// The first structural refusal, as the TS sentence - a non-object slot, an unknown field inside
+/// it, or a `disabled` that is not an array of strings.
+/// `validate_document` raises the same three on a whole-document pass.
+pub fn normalize_tool_settings(value: &Value) -> Result<Option<HarnessToolSettingsRecord>, String> {
+    let Some(entry) = value.as_object() else {
+        return Err("The harness database toolSettings must be an object.".to_string());
+    };
+
+    // `Object.keys(entry).filter(key => key !== "disabled")` (`persistence.ts:1523-1528`). The
+    // document is parsed with `preserve_order`, so the offenders are named in the order the file
+    // states them, exactly like `Object.keys`.
+    let unknown: Vec<&String> = entry
+        .keys()
+        .filter(|key| key.as_str() != "disabled")
+        .collect();
+
+    if !unknown.is_empty() {
+        let names: Vec<&str> = unknown.iter().map(|name| name.as_str()).collect();
+
+        return Err(format!(
+            "The harness database toolSettings has unknown field(s): {}. Only \"disabled\" is defined.",
+            names.join(", ")
+        ));
+    }
+
+    let Some(raw) = entry.get("disabled") else {
+        // `if (entry.disabled === undefined) return undefined;` - an explicit `{}` states nothing.
+        return Ok(None);
+    };
+
+    let Some(names) = raw.as_array() else {
+        return Err(
+            "The harness database toolSettings.disabled must be an array of strings.".to_string(),
+        );
+    };
+
+    let mut disabled: Vec<String> = Vec::with_capacity(names.len());
+
+    for (index, entry) in names.iter().enumerate() {
+        // `requireStringArray` (`persistence.ts:1533`): every element must be a string.
+        let Some(name) = entry.as_str() else {
+            return Err(format!(
+                "The harness database toolSettings.disabled[{index}] must be a string."
+            ));
+        };
+
+        let name = name.trim().to_string();
+
+        // Blanks are dropped, and a name already listed is not listed twice (`:1534-1536`).
+        if !name.is_empty() && !disabled.contains(&name) {
+            disabled.push(name);
+        }
+    }
+
+    // `.sort((left, right) => left.localeCompare(right))` - a plain byte order here, which is what
+    // `deleted` and the plugin map already normalize to in this port.
+    disabled.sort();
+
+    Ok((!disabled.is_empty()).then_some(HarnessToolSettingsRecord {
+        disabled: Some(disabled),
+    }))
+}
+
+/// The JSON this port writes for a deny list (`persistence.ts:1562`): the member VALUE, or `None`
+/// when the list is empty, because the writer never emits `{ "disabled": [] }`.
+#[must_use]
+pub fn tool_settings_member_value(disabled: &[String]) -> Option<Value> {
+    let mut names: Vec<String> = disabled.to_vec();
+
+    names.retain(|name| !name.trim().is_empty());
+    names.sort();
+    names.dedup();
+
+    if names.is_empty() {
+        return None;
+    }
+
+    Some(Value::Object(Map::from_iter([(
+        "disabled".to_owned(),
+        Value::Array(names.into_iter().map(Value::String).collect()),
+    )])))
+}
 
 /// One trusted-catalogue agent profile as the GLOBAL override layer records it
 /// (`HarnessAgentRecord`, `persistence.ts:280-287`). A record stores ONLY what the operator
@@ -364,6 +492,98 @@ pub struct SteerRecord {
     pub extra: Map<String, Value>,
 }
 
+/// One recorded event inside `session.turns[].events[]`, as the recorder wrote it
+/// (`protocol.ts:252-273` `SessionTurnEvent = HarnessEvent & { lane?: number }`).
+///
+/// WHY THE STAMP IS THE STORE'S, NOT THE RUNTIME'S
+/// ----------------------------------------------
+/// `HarnessEvent` is what a harness REPORTS, and a harness has no idea what a context bar is. The
+/// lane is a property of the CONVERSATION the event arrived in, and the recorder is the only step
+/// that knows both (`sessions.ts:7925-7936`), so the number is written at record time, read LIVE
+/// from the thread's `contextLane` — never cached at turn start, because a mid-run increment (a
+/// compaction) has to take effect on the very next event for one turn's bar to show both rows.
+///
+///   - ABSENT means lane 0 and a lane of 0 is never written, so every event recorded before lanes
+///     existed — and every event of a conversation that never compacted — keeps its exact recorded
+///     bytes (`Temp/fixtures/harness/lane-compaction/durable/events.*.jsonl` index 0 has no key,
+///     index 1 onwards carries one);
+///   - it rides INSIDE the event object, LAST, which is what `#[serde(flatten)]` produces: the
+///     flattened event's own keys first, then `lane`. The journal envelope nests this value under
+///     its `event` key verbatim (`journal.ts`), and the reader keeps events opaque (`persistence.ts`),
+///     so a restart replays the SAME lanes and the display fold reproduces the same rows
+///     (`turn-projector.ts:1435 laneOfEvent` is the only reader of the stamp);
+///   - it reaches the verbatim events page too (`api-reads.ts:456-493 turnEventRowsOf` copies the
+///     record, and the spec's `HarnessEvent` object is OPEN, so the extra key is contract-valid —
+///     see [`TurnEventRow`]);
+///   - it is NEVER a key of a block patch, so a segment can only change lanes by being removed and
+///     re-minted (`turn-display.ts ContextBlockPatch`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionTurnEvent {
+    /// The event itself, verbatim, and the map the stamp rides in.
+    #[serde(flatten)]
+    pub event: HarnessEvent,
+    /// The conversation's lane counter when this event was recorded (`LaneStamp` writes it only when
+    /// it is non-zero).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<u64>,
+}
+
+impl SessionTurnEvent {
+    /// An event with no lane stamp — the shape every session that never moved a lane holds.
+    #[must_use]
+    pub fn new(event: HarnessEvent) -> Self {
+        Self { event, lane: None }
+    }
+
+    /// An event stamped with the lane it was recorded on.
+    ///
+    /// [`LaneStamp`] decides whether the stamp is written, so passing `Some(0)` here and passing
+    /// `None` produce the SAME bytes, which is the point: a reader that reports 0 and a reader
+    /// that reports nothing make the same statement.
+    #[must_use]
+    pub fn with_lane(event: HarnessEvent, lane: Option<u64>) -> Self {
+        Self {
+            event,
+            lane: LaneStamp::of(lane),
+        }
+    }
+}
+
+/// Turns a bare event list into the stored record form (`SessionTurnEvent`), with no lane stamps.
+///
+/// A repair, a test, or a driver that mints events by hand is stating history that was never
+/// recorded on a lane, and this is the honest spelling of that: no stamp, so the reader reports
+/// lane 0 and the fold paints row 0.
+#[must_use]
+pub fn turn_events(events: Vec<HarnessEvent>) -> Vec<SessionTurnEvent> {
+    events.into_iter().map(SessionTurnEvent::new).collect()
+}
+
+/// The lane-stamp rule, spelled once: 0 and absent are the SAME statement
+/// (`protocol.ts:268-273`, `sessions.ts:7933`, and `api.ts:4890` on the way out).
+///
+/// A writer that emitted `"lane": 0` would change every historical session's bytes on the first
+/// save after this field existed, and a reader that filled in 0 would make `laneWritten` — the
+/// evidence that a stamp was actually recorded — impossible to tell apart from a lane-0 default
+/// (`Temp/fixtures/harness/lane-compaction/lane-evidence.json` records the two separately for
+/// exactly that reason).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneStamp;
+
+impl LaneStamp {
+    /// The value to WRITE for a lane, or `None` when nothing should be written.
+    #[must_use]
+    pub fn of(lane: Option<u64>) -> Option<u64> {
+        lane.filter(|lane| *lane != 0)
+    }
+
+    /// The lane a document REPORTS: the stamp it carries, or 0 when it carries none.
+    #[must_use]
+    pub fn read_as(lane: Option<u64>) -> u64 {
+        lane.unwrap_or(0)
+    }
+}
+
 /// One task submitted to a session, as the server recorded it (`SessionTurn`,
 /// `protocol.ts:122-207`; validated by `persistence.ts:533-671`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -384,6 +604,21 @@ pub struct SessionTurn {
     /// validated against [`labels::AGENT_REFERENCE_LABEL_PATTERN`] on load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_label: Option<String>,
+    /// The display lane the turn STARTED on (`protocol.ts:149-165` `lane?`).
+    ///
+    /// 0 is never written: absence already means lane 0, which keeps every session that never moved
+    /// a lane byte-identical to what this crate wrote before the field existed. The recorder stamps
+    /// it from the conversation's live `contextLane` at the moment the turn starts
+    /// (`sessions.ts:8871-8874` reads `contextLaneOf` THERE and `:8953` writes the field only when
+    /// it is non-zero; a refused-before-start turn copies the lane it was handed,
+    /// `:6727-6774`), and the projector pairs it with the lane stamped on each event to decide which
+    /// stacked row of the context bar a prompt, a steer, or an answer is painted on
+    /// (`turn-projector.ts:1441 laneOfTurn`, `:1449 laneFieldsOf`).
+    ///
+    /// The position is the TS write order (`persistence.ts:806-839`, and `:879-893` for a turn
+    /// refused before it started): between `threadLabel` and `references`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub references: Option<Vec<AgentResultReference>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -399,8 +634,16 @@ pub struct SessionTurn {
     #[serde(default)]
     pub updated_at: u64,
     /// Every event observed while the turn ran, in emission order (`:161`). Stored verbatim.
+    ///
+    /// The element is [`SessionTurnEvent`], not a bare [`HarnessEvent`], because the recorder stamps
+    /// a display lane INSIDE the event object (`protocol.ts:273`), and the projector replays these
+    /// very events after a restart to rebuild the turn display (`turn-projector.ts:1435 laneOfEvent`).
+    /// A bare `HarnessEvent` here would deserialize the stamp away, and a post-compaction segment
+    /// would paint back on row 0. The verbatim events page carries the stamp for the same reason
+    /// ([`contract::TurnEventRow`]); anything that only wants the event itself maps through
+    /// `.event`.
     #[serde(default)]
-    pub events: Vec<HarnessEvent>,
+    pub events: Vec<SessionTurnEvent>,
     /// Epoch milliseconds parallel to `events`: entry i is when `events[i]` was recorded
     /// (`:162-167`). Optional so an older recorded turn stays valid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -492,6 +735,25 @@ pub struct HarnessSessionRecord {
     /// Conversations whose stored transcript could not be read, keyed by thread id (`:224-231`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalid_threads: Option<BTreeMap<String, HarnessInvalidThreadRecord>>,
+    /// The plugin failures this session recorded, oldest first (`SessionRecord.pluginDiagnostics`,
+    /// `protocol.ts:631-635`; read by `persistence.ts:1221-1258`, written at `:1335`).
+    ///
+    /// WHY A CONTAINER THAT CANNOT BREAK A SESSION
+    /// -------------------------------------------
+    /// The read pass is TOLERANT on purpose: `persistence.ts:1224-1257` filters out an entry that is
+    /// not an object, drops a blank `kind`/`owner`/`message`, clamps `at` to 0, and keeps the NEWEST
+    /// [`MAX_PLUGIN_DIAGNOSTICS`] entries. A malformed diagnostic is an operational footnote, and it
+    /// would be a bad trade for one plugin's bad log line to make the whole session unreadable.
+    ///
+    /// The field is ADDITIVE: absent means "no plugin has failed in this session", and a session
+    /// written before the feature round-trips without it. Entries stay opaque JSON because the plugin
+    /// host owns their shape; what the store does enforce is the entry rule and the cap.
+    ///
+    /// It is read back into the session RESOURCE when non-empty (`api-reads.ts:241-256`), and never
+    /// into a plugin row (`api.ts:2735-2763`): a per-plugin problem belongs to the session's log, and
+    /// the one surface that can show it is the session's own problem list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_diagnostics: Option<Vec<Value>>,
     /// The last committed core snapshot (`:232-236`; `HarnessSnapshot` from `types/index.ts`).
     /// Opaque because the core owns that schema; [`repair_interrupted_snapshot`] walks it as
     /// data, exactly as `repairInterruptedToolCalls` does.
@@ -569,6 +831,21 @@ pub struct HarnessThreadRecord {
     pub owner_thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The conversation's CURRENT context-lane counter (`SnapshotThread.contextLane`,
+    /// `types/index.ts:447-461`; validated by `core/snapshot.ts:714-732`).
+    ///
+    /// This is DURABLE fold state, not a wire field: `harness-api.ts:1670-1704` publishes no lane on
+    /// a conversation row or resource, and `api-reads.ts` never reads it, so a client learns the lane
+    /// only through the turn displays it projects. It is the counter the recorder stamps on each
+    /// event and the turn start (`sessions.ts:2745 contextLaneOf`), which is why it has to survive a
+    /// restart: the store materializes it from `core.threads[].contextLane` on restore and writes it
+    /// back into that snapshot, and a restarted conversation that forgets it would paint a
+    /// post-compaction turn's prompt back on row 0.
+    ///
+    /// 0 is never written (`snapshot.ts:714-732` drops it, and `persistence.ts:1201` refuses a
+    /// negative or fractional number with `core.threads[].contextLane must be an integer >= 0.`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_lane: Option<u64>,
     /// The thread's committed transcript, a detached copy (`:443-446`).
     #[serde(default)]
     pub messages: Vec<crate::contract::HarnessMessage>,
@@ -768,6 +1045,20 @@ pub fn validate_document(document: &Value) -> Result<(), String> {
         }
     }
 
+    // R3 global tool switch (`persistence.ts:1507-1540`), same discipline as the block above and
+    // in one fewer dimension:
+    //   - OPTIONAL in both directions - a deployment that never touched the Tools pane keeps its
+    //     exact previous document;
+    //   - STRICT about shape: the slot must be an object, it may name only `disabled`, and
+    //     `disabled` must be an array of strings. A wrong shape is corruption of a named slot and
+    //     fails the load; a stale NAME is not corruption, so names are never checked against this
+    //     build's catalogue;
+    //   - normalization (de-dup, trim, drop blanks, sort, empty to absent) lives in
+    //     [`normalize_tool_settings`], which is the reader the API layer uses.
+    if let Some(settings) = root.get(TOOL_SETTINGS_MEMBER) {
+        normalize_tool_settings(settings)?;
+    }
+
     let mut seen: Vec<&str> = Vec::new();
 
     for (index, entry) in root["sessions"]
@@ -891,6 +1182,21 @@ fn validate_session_value(value: &Value, label: &str) -> Result<(), String> {
                 return Err(format!(
                     "{turn_label}.threadLabel must be a conversation label such as \"RR1\"."
                 ));
+            }
+
+            // DISPLAY LANE (`persistence.ts:784-818`). Optional and additive: a document written
+            // before lanes exist has no key and restores to lane 0, and the writer never writes a 0,
+            // so every pre-lane record keeps its bytes. A corrupt lane DOES fail the load — a lane a
+            // renderer cannot sort is worse than no lane, and `ContextBlock.lane` promises an integer
+            // >= 0. The PER-EVENT lanes need no rule here: the store never rewrites a recorded event,
+            // so a stamped lane replays verbatim, and the projector treats anything that is not an
+            // integer >= 1 as "no lane" rather than trusting a hand-edit (`turn-projector.ts:1435`).
+            if let Some(lane) = turn.get("lane") {
+                let lane = require_document_number(Some(lane), &format!("{turn_label}.lane"))?;
+
+                if lane.fract() != 0.0 || lane < 0.0 {
+                    return Err(format!("{turn_label}.lane must be an integer >= 0."));
+                }
             }
 
             if turn.get("events").is_some_and(|events| !events.is_array()) {
@@ -1079,6 +1385,103 @@ fn format_number(value: f64) -> String {
 ///
 /// Splitting this from [`validate_document`] keeps the two jobs readable; the rules are the
 /// same ones, applied after the shape is known good.
+/// The newest diagnostics one session keeps, oldest dropped first (`protocol.ts:626`).
+///
+/// The cap exists because the journal is DURABLE: a plugin that throws on every turn would otherwise
+/// grow `state.json` without bound, and the entries an operator reads are the newest ones. The
+/// loader has to honour the SAME bound as the writer, because a journal that grew past the cap on
+/// disk — a hand-edit, or a document written by a build with a larger cap — still has to restore to
+/// a document this crate can re-write identically.
+pub const MAX_PLUGIN_DIAGNOSTICS: usize = 24;
+
+/// The four kinds a diagnostic may carry (`persistence.ts:1230`).
+///
+/// An UNKNOWN kind is dropped on read, which is the tolerant direction of this field: a diagnostic
+/// this build cannot name is one it cannot show, and the entry beside it survives.
+pub const PLUGIN_DIAGNOSTIC_KINDS: [&str; 4] = [
+    "handler-threw",
+    "handler-timed-out",
+    "invalid-decision",
+    "policy",
+];
+
+/// `readSessionRecord`'s plugin-diagnostics pass (`persistence.ts:1227-1259`), as a normalization.
+///
+/// An entry is kept only when it is an object, its `kind` is one of [`PLUGIN_DIAGNOSTIC_KINDS`], and
+/// both `owner` and `message` are strings with a non-blank `message` — those two fields are what make
+/// the entry worth reading, so an entry naming neither who failed nor what happened is noise. `at`
+/// becomes 0 when it is not a finite number, `event` is kept only when it is a string, and `data`
+/// only when it is a non-null object.
+///
+/// A list whose every entry is filtered out normalizes to ABSENT, not to `[]`: the writer never emits
+/// an empty journal, so `[]` on disk would otherwise come back as `[]` and break load -> save byte
+/// stability.
+#[must_use]
+pub fn normalize_plugin_diagnostics(entries: &Option<Vec<Value>>) -> Option<Vec<Value>> {
+    let entries = entries.as_ref()?;
+    let mut kept: Vec<Value> = Vec::with_capacity(entries.len());
+
+    for entry in entries {
+        let Some(entry) = entry.as_object() else {
+            continue;
+        };
+
+        let kind = entry.get("kind").and_then(Value::as_str).unwrap_or("");
+
+        if !PLUGIN_DIAGNOSTIC_KINDS.contains(&kind) {
+            continue;
+        }
+
+        let owner = entry.get("owner").and_then(Value::as_str);
+        let message = entry.get("message").and_then(Value::as_str);
+
+        let (Some(owner), Some(message)) = (owner, message) else {
+            continue;
+        };
+
+        if message.trim().is_empty() {
+            continue;
+        }
+
+        // Field order is the TS write order (`:1244-1253`): at, kind, owner, message, then the two
+        // optional keys, each present only when the document carried a usable value.
+        let at = entry
+            .get("at")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite())
+            .map(|value| value as u64)
+            .unwrap_or(0);
+
+        let mut kept_entry = Map::new();
+        kept_entry.insert("at".to_owned(), json!(at));
+        kept_entry.insert("kind".to_owned(), json!(kind));
+        kept_entry.insert("owner".to_owned(), json!(owner));
+        kept_entry.insert("message".to_owned(), json!(message));
+
+        if let Some(event) = entry.get("event").and_then(Value::as_str) {
+            kept_entry.insert("event".to_owned(), json!(event));
+        }
+
+        if entry.get("data").and_then(Value::as_object).is_some() {
+            kept_entry.insert(
+                "data".to_owned(),
+                entry.get("data").cloned().unwrap_or(Value::Null),
+            );
+        }
+
+        kept.push(Value::Object(kept_entry));
+    }
+
+    if kept.is_empty() {
+        return None;
+    }
+
+    // Newest wins: `:1258` is `kept.slice(-PLUGIN_DIAGNOSTIC_LIMIT)`.
+    let start = kept.len().saturating_sub(MAX_PLUGIN_DIAGNOSTICS);
+
+    Some(kept.split_off(start))
+}
+
 fn normalize_database(database: &mut HarnessDatabase) {
     if let Some(deleted) = &database.deleted {
         let mut names: Vec<String> = Vec::with_capacity(deleted.len());
@@ -1119,6 +1522,11 @@ fn normalize_database(database: &mut HarnessDatabase) {
         // the WRITER's (`sessions.ts renameSession`) and is deliberately not enforced here -
         // throwing on a long hand-edited name would drop the whole session.
         session.title = session.title.take().map(|value| value.trim().to_string());
+
+        // `pluginDiagnostics` (`persistence.ts:1227-1259`): the tolerant filter + newest-24 cap, run
+        // on the DESERIALIZED value so a journal a hand-edit grew past the cap restores to a document
+        // this crate can re-write identically. Nothing here can refuse the session.
+        session.plugin_diagnostics = normalize_plugin_diagnostics(&session.plugin_diagnostics);
 
         if session.title.as_deref().is_some_and(str::is_empty) {
             session.title = None;
@@ -1366,11 +1774,13 @@ pub fn write_harness_agent_records(
     write_file_atomic(&directory, &file, &payload, "agents", HARNESS_AGENT_FILE)
 }
 
-/// The overlay document: `{ version, records }`.
+/// The overlay document: a BARE ARRAY of agent records.
 ///
-/// TS writes a bare ARRAY here (`persistence.ts:1679`); this envelope is the stage-brief shape,
-/// and [`parse_harness_agent_records`] accepts BOTH, so an `agents.json` written by the TS
-/// server still loads and the envelope's version gates a future format change.
+/// This is the shape TS writes (`persistence.ts:1679`), and the shape a deployment that has ever
+/// run the TS server already holds on disk — an uplifter that wrote `{ version, records }` here would
+/// put the registry's own file behind an envelope its reader does not speak. [`parse_harness_agent_records`]
+/// still ACCEPTS both spellings, so a `state/agents.json` an earlier build of this crate wrote keeps
+/// loading, and the envelope's `version` still gates a future format change on the way in.
 #[must_use]
 pub fn serialize_agent_records(records: &[HarnessAgentRecord]) -> Value {
     let entries: Vec<Value> = records
@@ -1378,7 +1788,7 @@ pub fn serialize_agent_records(records: &[HarnessAgentRecord]) -> Value {
         .map(|record| serde_json::to_value(record).unwrap_or(Value::Null))
         .collect();
 
-    json!({ "version": HARNESS_AGENT_FILE_VERSION, "records": entries })
+    Value::Array(entries)
 }
 
 /// Parses the overlay text in either spelling (`readHarnessAgentRecords` + `readAgentRecord`,
@@ -1733,7 +2143,7 @@ pub fn repair_interrupted_tool_calls(record: &mut HarnessSessionRecord) -> usize
         let answered: Vec<String> = turn
             .events
             .iter()
-            .filter_map(|event| match event {
+            .filter_map(|entry| match &entry.event {
                 HarnessEvent::ToolResult { call_id, .. } => call_id.clone(),
                 _ => None,
             })
@@ -1742,7 +2152,7 @@ pub fn repair_interrupted_tool_calls(record: &mut HarnessSessionRecord) -> usize
         let requested: Vec<(String, String, String, Option<Value>)> = turn
             .events
             .iter()
-            .filter_map(|event| match event {
+            .filter_map(|entry| match &entry.event {
                 HarnessEvent::ToolCall {
                     agent,
                     call,
@@ -1766,12 +2176,15 @@ pub fn repair_interrupted_tool_calls(record: &mut HarnessSessionRecord) -> usize
             }
 
             repairs += 1;
-            turn.events.push(synthetic_result_event(
-                &agent,
-                &name,
-                Some(call_id),
-                thread.as_ref(),
-            ));
+            // The synthetic result is an event the REPAIR minted, and it carries no lane: the turn it
+            // belongs to is already terminal, and a repair must not restamp history.
+            turn.events
+                .push(SessionTurnEvent::new(synthetic_result_event(
+                    &agent,
+                    &name,
+                    Some(call_id),
+                    thread.as_ref(),
+                )));
         }
 
         // (3) Results without a call. The call list is snapshotted first because the scan below
@@ -1779,7 +2192,7 @@ pub fn repair_interrupted_tool_calls(record: &mut HarnessSessionRecord) -> usize
         let calls: Vec<String> = turn
             .events
             .iter()
-            .filter_map(|event| match event {
+            .filter_map(|entry| match &entry.event {
                 HarnessEvent::ToolCall { call, .. } => Some(call.id.clone()),
                 _ => None,
             })
@@ -1789,7 +2202,7 @@ pub fn repair_interrupted_tool_calls(record: &mut HarnessSessionRecord) -> usize
         // writes one back.
         let mut orphans: Vec<OrphanResult> = Vec::new();
 
-        for (index, event) in turn.events.iter().enumerate() {
+        for (index, entry) in turn.events.iter().enumerate() {
             let HarnessEvent::ToolResult {
                 agent,
                 name,
@@ -1799,7 +2212,7 @@ pub fn repair_interrupted_tool_calls(record: &mut HarnessSessionRecord) -> usize
                 outcome,
                 thread,
                 ..
-            } = event
+            } = &entry.event
             else {
                 continue;
             };
@@ -1848,7 +2261,7 @@ pub fn repair_interrupted_tool_calls(record: &mut HarnessSessionRecord) -> usize
                 repairs += 1;
             }
 
-            turn.events[orphan.index] = HarnessEvent::ToolResult {
+            turn.events[orphan.index] = SessionTurnEvent::new(HarnessEvent::ToolResult {
                 agent: orphan.agent,
                 name: orphan.name,
                 content: orphan.content,
@@ -1860,7 +2273,7 @@ pub fn repair_interrupted_tool_calls(record: &mut HarnessSessionRecord) -> usize
                 duration_ms: None,
                 pending: Vec::new(),
                 thread: thread_from_value(&orphan.thread),
-            };
+            });
         }
     }
 

@@ -647,7 +647,7 @@ pub fn is_tool_busy(state: &SessionState, name: &str) -> bool {
 /// Does one recorded turn reference a tool name (`sessions.ts:4231-4248`).
 #[must_use]
 fn turn_mentions_tool(turn: &crate::persistence::SessionTurn, name: &str) -> bool {
-    turn.events.iter().any(|event| match event {
+    turn.events.iter().any(|entry| match &entry.event {
         crate::contract::HarnessEvent::ToolCall { call, .. } => call.name == name,
         crate::contract::HarnessEvent::ToolResult { name: tool, .. } => tool == name,
         _ => false,

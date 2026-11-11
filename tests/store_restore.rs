@@ -181,11 +181,18 @@ impl TurnExecutor for Executor {
                     HarnessMessage::User {
                         content: prompt,
                         attachments: Vec::new(),
+
+                        included: None,
+                        message_id: None,
                     },
                     HarnessMessage::Assistant {
                         content: answer.text,
                         tool_calls: Vec::new(),
                         reasoning: None,
+
+                        included: None,
+                        reasoning_included: None,
+                        message_id: None,
                     },
                 ],
                 stop_reason: Some("stop".to_owned()),
@@ -254,7 +261,13 @@ struct Fold {
 }
 
 impl Projector for Fold {
-    fn apply(&mut self, event: &HarnessEvent, _at: u64, _index: u64) -> Vec<Value> {
+    fn apply(
+        &mut self,
+        event: &HarnessEvent,
+        _lane: Option<u64>,
+        _at: u64,
+        _index: u64,
+    ) -> Vec<Value> {
         self.events += 1;
         vec![json!({"type": store::read::event_type_name(event)})]
     }
@@ -275,7 +288,7 @@ impl Projector for Fold {
 struct FoldFactory;
 
 impl ProjectorFactory for FoldFactory {
-    fn create(&self) -> Box<dyn Projector> {
+    fn create(&self, _seed: &typecrate_harness::ports::ProjectorSeed) -> Box<dyn Projector> {
         Box::new(Fold::default())
     }
 }
@@ -483,11 +496,18 @@ async fn a_restarted_store_restores_the_session_the_turn_and_the_transcript() {
             HarnessMessage::User {
                 content: "do the thing".to_owned(),
                 attachments: Vec::new(),
+
+                included: None,
+                message_id: None,
             },
             HarnessMessage::Assistant {
                 content: "the answer".to_owned(),
                 tool_calls: Vec::new(),
                 reasoning: None,
+
+                included: None,
+                reasoning_included: None,
+                message_id: None,
             },
         ]
     );
@@ -783,15 +803,18 @@ async fn a_running_turn_is_repaired_into_an_error_row_on_restart() {
 
         turn.status = "running".to_owned();
         turn.started_at = Some(1_700_000_000_000);
-        turn.events.push(HarnessEvent::ToolCall {
-            agent: "instruct".to_owned(),
-            call: HarnessToolCall {
-                id: "call-open".to_owned(),
-                name: "probe".to_owned(),
-                arguments: "{}".to_owned(),
-            },
-            thread: None,
-        });
+        turn.events
+            .push(typecrate_harness::persistence::SessionTurnEvent::new(
+                HarnessEvent::ToolCall {
+                    agent: "instruct".to_owned(),
+                    call: HarnessToolCall {
+                        id: "call-open".to_owned(),
+                        name: "probe".to_owned(),
+                        arguments: "{}".to_owned(),
+                    },
+                    thread: None,
+                },
+            ));
         record.status = "running".to_owned();
     }
     persistence::write_harness_database(&fixture.directory, &database, "restored-by-test")
@@ -817,14 +840,12 @@ async fn a_running_turn_is_repaired_into_an_error_row_on_restart() {
     // (`persistence.ts:704-705`, `INTERRUPTED_TURN_MESSAGE`).
     assert_eq!(repaired.1.status, "error");
     assert!(
-        !repaired.1.events.iter().any(|event| matches!(
-            event,
-            HarnessEvent::ToolResult { call_id, .. } if call_id.as_deref() == Some("call-open")
+        !repaired.1.events.iter().any(|entry| matches!(&entry.event, HarnessEvent::ToolResult { call_id, .. } if call_id.as_deref() == Some("call-open")
         )) || repaired
             .1
             .events
             .iter()
-            .any(|event| matches!(event, HarnessEvent::ToolResult { is_error: true, .. })),
+            .any(|event| matches!(&event.event, HarnessEvent::ToolResult { is_error: true, .. })),
         "a dangling call is answered by a FAILURE result, never left open"
     );
 

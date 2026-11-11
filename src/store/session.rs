@@ -104,6 +104,10 @@ impl SessionStore {
             harness: name.clone(),
             preset: definition.to_record(),
             definition: store::descriptor_record_of(&definition),
+            // A brand-new session has recorded no plugin failure, and the field stays ABSENT — the
+            // container is additive, and a session that never had one keeps the byte layout it had
+            // before the feature (`persistence.ts:1335` writes the key only when there is a journal).
+            plugin_diagnostics: None,
             settings: crate::persistence::HarnessSessionSettingsRecord {
                 base_url: settings.base_url.clone(),
                 model: settings.model.clone(),

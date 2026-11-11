@@ -199,6 +199,8 @@ pub fn scope_publishes(scope: &str) -> &'static [&'static str] {
             "action.opened",
             "action.closed",
             "usage.updated",
+            // Wave 1: a record mutation is session-scoped traffic (`protocol.ts:72`).
+            "records.updated",
             "thread.upsert",
             "thread.removed",
             "tool.registry_updated",
@@ -266,6 +268,8 @@ pub fn scope_baselines(scope: &str) -> &'static [&'static str] {
             "session_agents",
             "session_tools",
             "commands",
+            // Wave 1: the record store is part of the session baseline (`protocol.ts:120`).
+            "records",
         ],
         "thread" => &["thread", "transcript"],
         "turn" => &["turn", "turn_display", "turn_events"],
@@ -293,6 +297,8 @@ pub fn kind_resources(kind: &str) -> &'static [&'static str] {
         "thread.upsert" => &["threads", "thread"],
         "thread.removed" => &["threads"],
         "transcript.updated" => &["transcript"],
+        // Wave 1: the record store moves its own counter, in-epoch (`protocol.ts:140`).
+        "records.updated" => &["records"],
         "tool.registry_updated" => &["session_tools"],
         "agent.registry_updated" => &["session_agents"],
         "config.updated" => &["config"],
@@ -431,6 +437,8 @@ pub fn default_stream_link(resource: &str, ids: &StreamScopeIds) -> String {
         "tools" => format!("{root}/tools?limit={page}"),
         "config" => format!("{root}/config"),
         "commands" => format!("{root}/sessions/{session}/commands?limit={page}"),
+        // Wave 1: the record snapshot is whole, so no page size is part of its link.
+        "records" => format!("{root}/sessions/{session}/records"),
         // An unknown kind still gets a valid link (the root), never a crash.
         _ => root.to_string(),
     }
@@ -1489,7 +1497,10 @@ mod tests {
                 "threads",
                 "session_agents",
                 "session_tools",
-                "commands"
+                "commands",
+                // Wave 1: the record store is the session snapshot's last baseline member
+                // (`harness-stream.ts` `HARNESS_WS_SCOPE_BASELINES`).
+                "records"
             ]
         );
         assert_eq!(

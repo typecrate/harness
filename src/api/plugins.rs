@@ -1,22 +1,24 @@
 //! `{root}/plugins` - the built-in plugin catalogue and the one write the Plugins pane makes.
 //!
-//! TypeScript origin: `src/server/api.ts` - `pluginSettingOf` / `pluginRowOf` (`:1925-1965`),
-//! `getPlugins` (`:1968-1993`) and `patchPlugin` (`:1996-2024`), with the settings store behind
-//! them in `src/server/plugins.ts` (ported to [`crate::plugins`]) and the durable commit in
-//! `src/server/sessions.ts` `updatePluginSettings` (`:1853-1862`).
+//! TypeScript origin: `src/server/api.ts` - `pluginSettingOf` / `pluginRowOf` (`:2300-2364`),
+//! `getPlugins` (`:2368-2395`) and `patchPlugin` (`:2410-2432`), with the settings store behind
+//! them in `src/server/plugins.ts` (ported to [`crate::plugins`]), the hook gate that consumes the
+//! reserved `enabled` key in `src/plugin/host.ts` (ported to [`crate::plugin`]), and the durable
+//! commit in `src/server/sessions.ts` `updatePluginSettings`.
 //!
 //! WHAT THIS ROUTE SURFACES, AND WHAT IT DOES NOT
 //! ----------------------------------------------
 //! The contract's plugin surface is a SETTINGS surface: one read that answers the catalogue with
-//! the values in force, and one patch that edits those values. There is no enable/disable verb
-//! (loading is auto-scanned), no `plugins` stream update kind (the pane rereads on open and on
-//! save), and no per-plugin subresource beyond the row itself. This build additionally executes no
-//! plugin, so a row is metadata plus values rather than a live hook registration - the whole
-//! deviation is recorded in `knowledge.md` "T10 plugin uplift".
+//! the values in force, and one patch that edits those values. There is no enable/disable verb of
+//! its own - the switch is the reserved `enabled` SETTINGS key, which is why `{settings:{enabled:
+//! false}}` is the one-click global off and the response row reports the new state without a reread
+//! (`api.ts:2404-2409`). There is no `plugins` stream update kind (the pane rereads on open and on
+//! save), and no per-plugin subresource beyond the row itself. What runs - or does not run - from a
+//! hook's side lives in [`crate::plugin`], not here.
 //!
 //! WHY THE REVISION IS NOT A HUB COUNTER
 //! -------------------------------------
-//! `api.ts:1985-1991` states it: the collection revision is the plugin SETTINGS store's own counter
+//! `api.ts:2387-2393` states it: the collection revision is the plugin SETTINGS store's own counter
 //! (one bump per accepted patch), not a hub counter, because `plugins` is not a
 //! `StreamResourceKind` and adding one would move the stream's bounded per-scope baseline for a
 //! pane that rereads anyway. The store lives inside the session store's guarded state
@@ -25,10 +27,10 @@
 //!
 //! WHY THE LIST STAMPS NO `X-Harness-Revision`
 //! -------------------------------------------
-//! `getPlugins` calls `json(200, pageMeta(...))` with TWO arguments (`api.ts:1988-1991`), so the
+//! `getPlugins` calls `json(200, pageMeta(...))` with TWO arguments (`api.ts:2391-2394`), so the
 //! collection revision rides the page BODY only - the identical rule `getHarnesses` follows
-//! (`:1503-1509`), and pinned against this port by `tests/plugins.rs`. `patchPlugin` DOES pass the
-//! third argument (`:2022`), because there the figure is the result of the write.
+//! (`:1859-1865`), and pinned against this port by `tests/plugins.rs`. `patchPlugin` DOES pass the
+//! third argument (`:2431`), because there the figure is the result of the write.
 
 use serde_json::{Map, Value};
 
@@ -38,18 +40,19 @@ use crate::error::ApiError;
 use crate::events;
 use crate::paging;
 
-/// `GET {root}/plugins` (`api.ts:1968-1993`): the loaded catalogue plus what each plugin is set to.
+/// `GET {root}/plugins` (`api.ts:2368-2395`): the loaded catalogue plus what each plugin is set to.
 ///
 /// Answerable with no harness and no model, in the manifest's stable order. The `q` filter is the
 /// contract's own haystack - `"{name} {title} {description} {tags}"`, case-insensitively - and NOT
 /// the hooks or the settings keys. Probe-verified against the TypeScript reference server:
 /// `?q=drained` and `?q=dispose` (words that live only inside async-ping's HOOK list) and
-/// `?q=contextlimit` (a declared SETTING key) are all empty pages, while `?q=lifecycle` (a tag both
-/// built-ins carry) answers both. `?q=turn` is deliberately NOT one of the empty cases - the word
+/// `?q=contextlimit` (a declared SETTING key) are all empty pages, while `?q=lifecycle` (a tag every
+/// built-in in this catalogue carries) answers all three. `?q=turn` is deliberately NOT one of the empty cases - the word
 /// sits inside the compaction plugin's DESCRIPTION, which IS in the haystack - so the hook-only
-/// spelling `?q=turn.before` is the probe that separates "description matched" from "hook matched".
+/// spelling `?q=turn.before` is the probe that separates "description matched" from "hook matched". The
+/// capture under `tests/fixtures/` re-derives the same haystack from the three shipped rows.
 pub async fn get_plugins(ctx: &mut Ctx) -> ApiResult {
-    // TS reads `limit`, then `cursor`, then `q`, in that order (`api.ts:1969-1971`), so an invalid
+    // TS reads `limit`, then `cursor`, then `q`, in that order (`api.ts:2369-2371`), so an invalid
     // `limit` is refused before a filter is ever considered.
     let limit = ctx.limit()?;
     let cursor = ctx.cursor()?;
@@ -77,7 +80,7 @@ pub async fn get_plugins(ctx: &mut Ctx) -> ApiResult {
     Ok(api::json(200, body))
 }
 
-/// `PATCH {root}/plugins/{plugin_id}` (`api.ts:1996-2024`): edit one plugin's settings.
+/// `PATCH {root}/plugins/{plugin_id}` (`api.ts:2410-2432`): edit one plugin's settings.
 ///
 /// IMMEDIATE and durable: the store applies the value to the live map, then the document carrying
 /// it is written BEFORE the answer - this crate's rule for every structural mutation. There is no
@@ -93,11 +96,11 @@ pub async fn patch_plugin(ctx: &mut Ctx) -> ApiResult {
     let body = ctx.body_object().await?;
 
     // `settings` is the ONLY field the contract names: there is no enable/disable member, and an
-    // unknown one is refused rather than ignored (`api.ts:2003`).
+    // unknown one is refused rather than ignored (`api.ts:2414`).
     api::require_body_fields(&body, &["settings"])?;
 
     // A MISSING `settings` is the route's own 400, checked before the store is asked about the id
-    // (`api.ts:2005-2007`), so `PATCH /plugins/nope` with an empty body is a 400, not a 404. An
+    // (`api.ts:2416-2418`), so `PATCH /plugins/nope` with an empty body is a 400, not a 404. An
     // explicit `null` is NOT absent: TypeScript spreads it to an empty patch, which is the OTHER 400.
     let Some(submitted) = body.get("settings") else {
         return Err(ApiError::bad_request(
@@ -118,7 +121,7 @@ pub async fn patch_plugin(ctx: &mut Ctx) -> ApiResult {
 
     // DURABLE before the answer. A failed write leaves the applied value in place - the running
     // sessions have already been given it, so a rollback would report a failure the process does not
-    // actually have (`sessions.ts:1848-1851`).
+    // actually have (`sessions.ts:1974` `updatePluginSettings`).
     if let Err(error) = ctx.runtime.save() {
         return Err(ApiError::internal(error.message));
     }
@@ -132,7 +135,7 @@ pub async fn patch_plugin(ctx: &mut Ctx) -> ApiResult {
     let response = contract::PluginDetailResponse { plugin: metadata };
 
     // The figure the header quotes is the SETTINGS store's counter after this write, which is also
-    // the figure the next `GET /plugins` prints in its body (`api.ts:2020-2022`).
+    // the figure the next `GET /plugins` prints in its body (`api.ts:2429-2431`).
     let revision = ctx.runtime.store.plugin_revision();
 
     Ok(api::with_revision(
@@ -142,7 +145,7 @@ pub async fn patch_plugin(ctx: &mut Ctx) -> ApiResult {
     ))
 }
 
-/// The `{ ...body.settings }` the TypeScript route passes to the store (`api.ts:2019`).
+/// The `{ ...body.settings }` the TypeScript route passes to the store (`api.ts:2423`).
 ///
 /// An absent `settings` never reaches here - the route refuses it first - but a `null`, a boolean, a
 /// number and an empty array all spread to an EMPTY object (400 "must change at least one setting"),
@@ -169,7 +172,7 @@ fn settings_patch(submitted: &Value) -> Map<String, Value> {
 }
 
 /// The text one row's `q` filter runs against: `"{name} {title} {description} {tags}"` joined with
-/// single spaces and lower-cased (`api.ts:1978-1983`).
+/// single spaces and lower-cased (`api.ts:2377-2383`).
 ///
 /// The absent description contributes the empty string and the absent tags do too, so the
 /// separators stay - a filter is a substring test, and a shifted space changes which queries hit.

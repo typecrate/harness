@@ -578,7 +578,7 @@ fn wall_now() -> u64 {
 }
 
 /// The `session` scope's baseline kinds, in the contract's order (`protocol.ts:127`).
-const SESSION_BASELINE: [&str; 10] = [
+const SESSION_BASELINE: [&str; 11] = [
     "session",
     "definition",
     "turns",
@@ -589,16 +589,22 @@ const SESSION_BASELINE: [&str; 10] = [
     "session_agents",
     "session_tools",
     "commands",
+    // Wave 1: the record store is the session snapshot's last baseline member
+    // (`shared/harness-stream.ts` `HARNESS_WS_SCOPE_BASELINES`).
+    "records",
 ];
 
 /// The `session` scope's publish set, in the contract's order (`protocol.ts:74-86`).
-const SESSION_PUBLISHES: [&str; 11] = [
+const SESSION_PUBLISHES: [&str; 12] = [
     "session.updated",
     "turn.upsert",
     "turn.removed",
     "action.opened",
     "action.closed",
     "usage.updated",
+    // Wave 1: `records.updated` rides the session scope, right after the usage counter
+    // (`harness-stream.ts` `HARNESS_WS_SCOPE_PUBLISHES`).
+    "records.updated",
     "thread.upsert",
     "thread.removed",
     "tool.registry_updated",
@@ -730,7 +736,7 @@ async fn welcome_is_the_first_frame_and_carries_every_number_in_force() {
             "send_queue_bytes": 1048576,
             "sustained_stall_ms": 10000,
             "ack_timeout_ms": 5000,
-            "revision_records_per_state": 20,
+            "revision_records_per_state": 21,
         })
     );
 
@@ -878,7 +884,8 @@ async fn a_session_subscription_reports_the_baseline_and_a_rest_patch_arrives_as
             .iter()
             .map(|record| record["revision"].as_u64().unwrap())
             .collect::<Vec<_>>(),
-        vec![1, 1, 1, 0, 0, 0, 1, 0, 0, 0]
+        // One more trailing zero: the `records` counter exists and has never moved.
+        vec![1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0]
     );
 
     for record in revisions {
@@ -1463,7 +1470,15 @@ async fn the_handshake_gates_answer_http_status_and_not_a_close_frame() {
         plain.message(),
         "GET /stream expects a WebSocket upgrade (Sec-WebSocket-Key/Version) for the harness.v1 subprotocol."
     );
-    assert_eq!(plain.epoch(), server.broker().epoch());
+    // WAVE 2-C: a handshake refusal carries NO `X-Harness-Epoch` (`stream/transport.ts`
+    // `rejectUpgrade` writes the body plus Content-Type/Content-Length/Connection only; the mount's
+    // epoch header rides the 101 lines, `transport.ts:655-666`), so this pin asserts the absence
+    // rather than the value. The 101 still stamps it, above.
+    assert_eq!(
+        plain.header(&EPOCH_HEADER),
+        None,
+        "the refusal names no epoch (`src/stream/mod.rs`'s `json_error` mirrors `rejectUpgrade`)"
+    );
 
     // A verb that is not the upgrade's (`transport.ts:618`).
     let posted = Reply::send(http.post(&url)).await;

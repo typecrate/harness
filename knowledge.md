@@ -1816,3 +1816,146 @@ compiles the uplifted harness cleanly. Its own `cargo test` currently fails to B
 unrelated to T10: the working tree's uncommitted `src/bin/server.rs` has a `match`-arm type error in the
 SIGTERM handler (`Option<()>` vs `()` at `src/bin/server.rs:633-639`). That file is outside this
 stage's ownership, so the failure is reported rather than fixed.
+
+## Contract resync - the published display lane (`ContextBlock.lane`) - 2026-11-11
+
+Issue 0017 (`packages/underload/harness/docs/issues/minor-rust-port-context-lane-drift.md`) recorded
+the display lane as the ONE published field this port had not caught up with. Its 2026-11-11 update
+claimed steps 2-4 of the proposal had landed and only the contract field was left; the field had not
+landed and neither had the event half of step 3. This section is the spec-sync record criterion 1 asks
+for: what the field is, where each TypeScript rule now lives in Rust, and the facts a later stage must
+not re-derive.
+
+### What landed
+
+* `contract::ContextBlock::lane: Option<u64>` (`src/contract.rs:3029-3076`, the field at `:3050`),
+  `#[serde(default, skip_serializing_if = "Option::is_none")]`, positioned between `section_id` and
+  `name` - the position the generated TypeScript uses (`src/shared/harness-api.ts:3299-3320` puts
+  `lane?` at `:3320`, directly after `sectionId` at `:3309`) and the order
+  a TypeScript-written document already carries. Swagger `harness.swagger.yaml:8122` publishes
+  `integer` + `minimum: 0` + "absent means lane 0", so the Rust spelling is an `Option`: `None` is what
+  "the producer said nothing" looks like, and `LaneStamp::read_as` is what turns it into the number 0.
+  A `TurnBlockDetail` flattens a `ContextBlock` (`src/contract.rs:3097`), so the block-detail route
+  round-trips the lane with no extra work. The lane is NOT a patch key: the fold's `context:set` path
+  builds its patch as a map of the mutable fields only (`src/projector.rs:1448-1471`), and this crate
+  has no `ContextBlockPatch` struct to grow.
+* `src/projector.rs` - the lane is now stamped at the fold's ONE `context:add` mint point
+  (`add_block:961-980`, through `with_lane:450-463`). Before this pass `with_lane` had exactly one
+  caller, `add_block_with_lane`, which is the NON-event seam: the turn's starting lane reached the
+  prompt, instruction and steer segments (the three seams at `:516`, `:547`, `:576`), while the two
+  event-driven mint sites (`tool`, `:1343`; the `done` answer fallback, `:1593`) called `add_block`
+  directly and so minted an UNLANED segment. The consequence was visible in the recorded fixture: a
+  post-compaction turn's prompt sat on row 1 while
+  its tool segments, whose events carried `lane: 1`, sat on row 0 - the exact live-vs-replay divergence
+  the lane exists to prevent. `add_block_with_lane` (`:587-598`) now swaps `event_lane` for the turn's
+  lane, delegates to the same mint point, and restores the previous value, which is what keeps the two
+  sources (`turn-projector.ts:1435 laneOfEvent` vs `:1441 laneOfTurn`) from being conflated while
+  leaving exactly one writer.
+* Nothing else moved. A lane-0 or unlaned fold still writes no key, so the 15 `projector`, 17
+  `http_sessions`, 27 `store`, 4 `store_restore`, 21 `stream` and 13 `turn` tests - every one of which
+  folds lane-free scripts and several of which assert the ABSENCE of a `lane` key
+  (`tests/http_sessions.rs:1329-1330`) - pass unchanged.
+
+### The fixture, and what it can and cannot prove
+
+`tests/fixtures/lane-compaction/` vendors the recorded bytes the issue names
+(`Temp/fixtures/harness/lane-compaction/`, git-ignored and therefore disposable): `MANIFEST.md`,
+`lane-evidence.json`, `turn-displays.json`, `threads-after.json`, `durable/state.json` and
+`durable/events.d8aa98d7-1886-4d3f-a6db-f4869a6623d4.jsonl` - about 250 KiB, the same vendoring move
+`src/plugins.rs:47-50` describes for the plugin-catalogue fixture. A test that compared Rust output with
+`Temp/` would pass on the authoring machine and vanish in a fresh clone.
+
+The fixture proves the two-row case: the seed turn's `0-system-instructions` / `0-user-prompt` carry no
+lane key (that turn started on lane 0) while the segments its lane-1 events opened carry `lane: 1`, and
+the compaction turn - `turns[1].lane = 1`, `core.threads[0].contextLane = 1` - carries a WRITTEN `1` on
+every segment including its prompt. This build mints 4 of the recorded 10 segments and 2 of the
+recorded 4: a streamed `reasoning`/`text` window becomes a prose NODE here, not a bar segment per
+window (`README.md` "Context bar", `src/projector.rs:1301-1305` folding deltas through `fold_prose` and
+the answer-segment note at `src/projector.rs:1568-1573`), so the six prose segments are absent
+from its output. Parity is asserted over every segment the fold DOES mint, ids and lanes included, and
+the recorded tables are pinned as literals in the test so a swapped fixture cannot quietly weaken the
+comparison.
+
+### Tests
+
+`tests/context_lane.rs` - 11 tests: the contract decode/encode both ways (present, absent, `0`
+accepted, negative / fractional / text / boolean refused, and the same through the flattened
+`TurnBlockDetail`); the journal's 337 records read back with their 336 stamps and re-print byte-identically;
+the checkpoint's per-turn and per-conversation lanes plus the round-tripped shape; the fold's lane table
+against the recorded displays for BOTH turns; the restored store's replay of the same document, the
+conversation counter a restarted recorder reads (`context_lane_of`), and the events page's verbatim
+stamp; the live `context:add` ops (stamped, and no `context:set` patch ever carries a lane); the
+lane-free fold reproducing the lane-bearing fold byte for byte with the lane keys removed; and the
+snapshot reader's accept/refuse pair with the written-`0` normalization.
+
+### Facts a later stage must not re-derive
+
+1. `serde_json::Map` under `preserve_order` removes a member with a SWAP-REMOVE: the LAST member moves
+   into the freed slot. A test that removes a `lane` key to compare against a pre-lane document must
+   REBUILD the map (`tests/context_lane.rs::strip_lane_keys`), or the comparison measures the removal
+   mechanics instead of the fold.
+2. The TypeScript journal line is `{type, v, turnId, index, at, event}` (see the fixture's
+   `durable/events.*.jsonl`), while `journal::journal_event` (`src/journal.rs:104-112`) writes
+   `{version, sequence, timestamp, event}` and `HarnessJournal::read` filters on `sequence` - so a
+   TypeScript-written journal reads back as ZERO records here. The fixture's events load through
+   `state.json`'s per-turn `events` array, which is the same `SessionTurnEvent` shape; the `.jsonl` half
+   is exercised at the record-decode level only. Do not claim journal-file interoperability from these
+   tests until that envelope is ported (open item 3 below).
+3. `store::restore_threads` (`src/store/mod.rs:2469-2478`) is TOLERANT by design: `core_of` swallows a
+   failed decode, so a `core.threads` carrying a bad `contextLane` restores as an EMPTY roster rather
+   than refusing the load. TypeScript's `core/snapshot.ts:758-763` `readThreads` THROWS. What this build
+   does refuse is the lane at the typed record boundary (`persistence::HarnessThreadRecord::context_lane`
+   is a `u64`, so `-1` / `2.5` / `"2"` are decode errors) and the per-turn lane in
+   `persistence::validate_document` (`.lane must be an integer >= 0.`, `:1194-1198`).
+4. The doc comment at `src/persistence.rs:846` attributes the `contextLane` sentence to
+   `persistence.ts:1201`. TypeScript's `server/persistence.ts` has NO `contextLane` clause at all (zero
+   matches), and the rule that does exist lives in `core/snapshot.ts:758-763` under the label
+   `snapshot.threads` (`:950`), not `core.threads`. The cite is stale; the behaviour it claims is real
+   but lives one module over.
+5. A conversation row publishes no lane and no `contextLane` (the fixture's own `threads-after.json`
+   row is pinned whole in the test to prove it). Restored threads from a TypeScript document are also
+   invisible to `SessionState::host_thread_records` (`src/store/read.rs:132-138`), which filters on
+   `origin == "host"` while `readThreads` never reads an `origin` - use `store::restore_threads` when a
+   test needs the durable roster of a foreign-authored session.
+
+### Follow-ups this pass deliberately left open
+
+1. **Proposal step 5, blocked not skipped.** The summarize pass is the only producer of a lane bump
+   (`src/plugins/context-compaction.plugin.ts:1059-1113`), and no plugin hook executes in this build
+   (T10, "NO plugin hook executes"), so nothing in the port can RAISE a lane: it can carry, stamp,
+   persist, fold and publish one.
+2. **Prose bar segments.** Until a streamed prose window mints its own segment, a lane-1 turn's Rust bar
+   holds only the tool and non-event segments, and parity against a TypeScript display covers that
+   subset. The recorded lanes of the prose segments are pinned in `tests/context_lane.rs` so the port
+   that adds them has the expected values in front of it.
+3. **The journal envelope** (fact 2 above): porting `{type, v, turnId, index, at, event}` is what turns
+   "the same records, decoded from a different file" into "the same file".
+4. **`restore_threads` strictness.** Making it refuse like `readThreads` is a signature decision
+   (`Vec<_>` today, tolerant by design); this pass recorded the difference and pinned both halves.
+
+### Verification (this pass's last run)
+
+From `packages/typecrate/harness` with `TMPDIR` pointed at repo-root `Temp/T7` (cargo 1.99.1 /
+rustc 1.99.1):
+
+- `cargo fmt -- --check` - clean.
+- `cargo test --no-fail-fast` - **414 passed, 16 failed** across 20 targets. Every one of the 16
+  failures is the plugin-catalogue WIP that was already in the tree before this pass: 3 in
+  `unittests src/lib.rs` (`plugins::tests::a_restore_drops_what_this_build_cannot_use`,
+  `a_rejected_patch_leaves_the_store_untouched`,
+  `the_reserved_enabled_key_switches_a_plugin_that_never_declared_it`) and 13 in `tests/plugins.rs`.
+  Their assertions are catalogue-shaped, not lane-shaped: `left: Number(3) / right: 2` for the row count
+  (`context-trimmer` is an uncommitted addition - zero matches for that id under `git grep
+  "context-trimmer" HEAD -- src/plugins.rs`, `src/plugins.rs` is +584/-87 against HEAD while
+  `tests/plugins.rs` is UNMODIFIED against HEAD), the "This build ships:" sentence now naming three
+  plugins, and `context-compaction` answers carrying `modelLimits` / `enabled` / `minTokens` /
+  `safetyTurns` / `mode` plus a `contextLimit` default of `200000`. No failure message mentions a lane.
+- The lane target on its own: `cargo test --test context_lane` - **11 passed, 0 failed**.
+- Green after this pass, with these counts: `bin/server` 8, `contract_message_flags` 9, `data_plane` 15,
+  `foundation` 24, `http_host` 17, `http_sessions` 17, `projector` 15, `routes` 6,
+  `runtime_execution` 12, `store` 27, `store_restore` 4, `stream` 21, `tools` 24, `transport` 24,
+  `turn` 13, `wave_one` 10, `worker_execution_http` 1.
+- `cargo clippy --all-targets -- -D warnings` under rustc 1.99.1 - still SIX findings, at
+  `src/core_pruning.rs:76,80,331,541,778` and `src/plugins.rs:904,1598`; none in a file this pass
+  touched. They are toolchain-version findings in that stage's own WIP files and were left for that
+  stage.

@@ -26,7 +26,7 @@ use axum::http::HeaderMap;
 use serde_json::{Value, json};
 
 use typecrate_harness::contract;
-use typecrate_harness::{api, environment, events, runtime};
+use typecrate_harness::{api, environment, runtime};
 
 /// The exact refusal, identical to the one `tests/runtime_execution.rs` and the standalone
 /// executable print: one message, wherever the deployment is refused.
@@ -146,14 +146,22 @@ async fn a_worker_deployment_answers_every_mounted_request_with_400() {
         json!({ "error": { "message": THREAD_WORKER_REFUSAL } })
     );
 
-    // A refusal is still a contract response, so the epoch header is stamped (`api/mod.rs`'s
-    // `write_error`): the process epoch, because no runtime was built to own one.
+    // Wave 1 criterion (iii): a refusal is the error writer's own response, and `write_error`
+    // stamps NEITHER contract header - so this 400 names the refusal and carries no epoch and no
+    // revision, exactly like the 404/405/400 bodies every other route answers.
     assert_eq!(
         boot.headers
             .get(contract::HARNESS_EPOCH_HEADER)
             .and_then(|value| value.to_str().ok()),
-        Some(events::process_epoch()),
-        "the 400 carries X-Harness-Epoch"
+        None,
+        "the 400 carries no X-Harness-Epoch (`sendError` writes the body and the cache headers only)"
+    );
+    assert_eq!(
+        boot.headers
+            .get(contract::HARNESS_REVISION_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        None,
+        "and no X-Harness-Revision"
     );
 
     // The refusal is not route-specific: a session read, the config document and an unknown path are

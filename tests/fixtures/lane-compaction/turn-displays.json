@@ -1,0 +1,390 @@
+{
+    "af7b4021-15e9-4199-ad1f-4b537d7aa050": {
+        "display": {
+            "turnId": "af7b4021-15e9-4199-ad1f-4b537d7aa050",
+            "sections": [
+                {
+                    "id": "af7b4021-15e9-4199-ad1f-4b537d7aa050:0",
+                    "role": "primary",
+                    "agent": "general",
+                    "agentLabel": "GL1",
+                    "threadId": "thread-1",
+                    "nodes": [
+                        {
+                            "kind": "reasoning",
+                            "id": "n1",
+                            "text": "No endpoint is attached to this preset, so the transport is scripted. Only toolRequest is declared, so I have to discover timeNow before I can read the time.",
+                            "chars": 157,
+                            "share": 54
+                        },
+                        {
+                            "kind": "text",
+                            "id": "n56",
+                            "text": "Asking the catalogue for time-related tools first, since only toolRequest is visible.",
+                            "committed": true,
+                            "chars": 85
+                        },
+                        {
+                            "kind": "tool",
+                            "id": "80",
+                            "turnId": "af7b4021-15e9-4199-ad1f-4b537d7aa050",
+                            "sectionId": "af7b4021-15e9-4199-ad1f-4b537d7aa050:0",
+                            "callId": "call_tool_request_1",
+                            "name": "toolRequest",
+                            "argsPreview": "{\"tags\":[\"time\"]}",
+                            "state": "ok",
+                            "startedAt": 1794327612999,
+                            "detail": {
+                                "stepId": "80",
+                                "hasResult": true,
+                                "truncated": true,
+                                "resultStepId": "82"
+                            },
+                            "outcome": "completed",
+                            "preview": "{\"enabled\":[\"timeNow\",\"actionRequest\",\"threadFork\",\"toolManage\",\"toolRegistry\"],\"tools\":[{\"name\":\"timeNow\",\"description\":\"Read the current time. Returns an ISO 8601 timestamp and the Unix time in seconds. The timezone argument is only a label for the answer.\",\"tags\":[\"time\",\"clo…",
+                            "durationMs": 1,
+                            "endedAt": 1794327613003
+                        },
+                        {
+                            "kind": "reasoning",
+                            "id": "n83",
+                            "text": "Found it. Calling timeNow now.",
+                            "chars": 30,
+                            "share": 10
+                        },
+                        {
+                            "kind": "tool",
+                            "id": "93",
+                            "turnId": "af7b4021-15e9-4199-ad1f-4b537d7aa050",
+                            "sectionId": "af7b4021-15e9-4199-ad1f-4b537d7aa050:0",
+                            "callId": "call_time_now_1",
+                            "name": "timeNow",
+                            "argsPreview": "{\"timezone\":\"UTC\"}",
+                            "state": "ok",
+                            "startedAt": 1794327613154,
+                            "detail": {
+                                "stepId": "93",
+                                "hasResult": true,
+                                "truncated": false,
+                                "resultStepId": "95"
+                            },
+                            "outcome": "completed",
+                            "preview": "{\"timezone\":\"UTC\",\"iso\":\"2026-11-10T16:20:13.155Z\",\"unix\":1794327613}",
+                            "durationMs": 1,
+                            "endedAt": 1794327613156,
+                            "panels": [
+                                {
+                                    "id": "timeNow",
+                                    "slot": "right",
+                                    "title": "Current time",
+                                    "blocks": [
+                                        {
+                                            "type": "keyValue",
+                                            "items": 3
+                                        },
+                                        {
+                                            "type": "text",
+                                            "length": 45
+                                        }
+                                    ],
+                                    "preview": "Timezone UTC · ISO 8601 2026-11-10T16:20:13.155Z",
+                                    "truncated": true,
+                                    "totalPanels": 1
+                                }
+                            ]
+                        },
+                        {
+                            "kind": "text",
+                            "id": "n96",
+                            "text": "timeNow returned {\"timezone\":\"UTC\",\"iso\":\"2026-11-10T16:20:13.155Z\",\"unix\":1794327613}. That is the whole loop: the harness ran the tool, appended its result, and re-requested until the model answered with text. Switch to a live preset and set an endpoint to try this against a real model.",
+                            "committed": true,
+                            "chars": 289
+                        },
+                        {
+                            "kind": "reasoning",
+                            "id": "n178",
+                            "text": "No endpoint is attached to this preset, so the transport is scripted. Only toolRequest is declared, so I have to discover timeNow before I can read the time.",
+                            "chars": 157,
+                            "share": 54
+                        },
+                        {
+                            "kind": "text",
+                            "id": "n233",
+                            "text": "Asking the catalogue for time-related tools first, since only toolRequest is visible.",
+                            "committed": false,
+                            "chars": 85
+                        },
+                        {
+                            "kind": "notice",
+                            "id": "n256",
+                            "tone": "error",
+                            "text": "Agent \"general\" reused tool call id \"call tool request 1\" from an earlier turn; tool call ids must be unique within the conversation.",
+                            "at": 1794327615762
+                        }
+                    ],
+                    "context": [
+                        {
+                            "kind": "system",
+                            "id": "0-system-instructions",
+                            "turnId": "af7b4021-15e9-4199-ad1f-4b537d7aa050",
+                            "sectionId": "af7b4021-15e9-4199-ad1f-4b537d7aa050:0",
+                            "name": "instructions",
+                            "at": 1794327611692,
+                            "chars": 1227,
+                            "inPrompt": true
+                        },
+                        {
+                            "kind": "user",
+                            "id": "0-user-prompt",
+                            "turnId": "af7b4021-15e9-4199-ad1f-4b537d7aa050",
+                            "sectionId": "af7b4021-15e9-4199-ad1f-4b537d7aa050:0",
+                            "name": "prompt",
+                            "at": 1794327611692,
+                            "chars": 5657,
+                            "inPrompt": true
+                        },
+                        {
+                            "kind": "reasoning",
+                            "id": "0-reasoning-1",
+                            "turnId": "af7b4021-15e9-4199-ad1f-4b537d7aa050",
+                            "sectionId": "af7b4021-15e9-4199-ad1f-4b537d7aa050:0",
+                            "name": "reasoning",
+                            "at": 1794327611726,
+                            "chars": 157,
+                            "inPrompt": false,
+                            "eventFrom": 1,
+                            "eventTo": 55,
+                            "lane": 1,
+                            "durationMs": 892
+                        },
+                        {
+                            "kind": "assistant",
+                            "id": "0-assistant-56",
+                            "turnId": "af7b4021-15e9-4199-ad1f-4b537d7aa050",
+                            "sectionId": "af7b4021-15e9-4199-ad1f-4b537d7aa050:0",
+                            "name": "answer",
+                            "at": 1794327612634,
+                            "chars": 85,
+                            "inPrompt": true,
+                            "eventFrom": 56,
+                            "eventTo": 78,
+                            "lane": 1,
+                            "durationMs": 362
+                        },
+                        {
+                            "kind": "tool",
+                            "id": "0-tool-80",
+                            "turnId": "af7b4021-15e9-4199-ad1f-4b537d7aa050",
+                            "sectionId": "af7b4021-15e9-4199-ad1f-4b537d7aa050:0",
+                            "name": "toolRequest",
+                            "at": 1794327612999,
+                            "chars": 3495,
+                            "argsChars": 17,
+                            "inPrompt": true,
+                            "state": "ok",
+                            "eventFrom": 80,
+                            "eventTo": 82,
+                            "lane": 1,
+                            "resultChars": 3478,
+                            "endedAt": 1794327613003,
+                            "durationMs": 1
+                        },
+                        {
+                            "kind": "reasoning",
+                            "id": "0-reasoning-83",
+                            "turnId": "af7b4021-15e9-4199-ad1f-4b537d7aa050",
+                            "sectionId": "af7b4021-15e9-4199-ad1f-4b537d7aa050:0",
+                            "name": "reasoning",
+                            "at": 1794327613021,
+                            "chars": 30,
+                            "inPrompt": false,
+                            "eventFrom": 83,
+                            "eventTo": 91,
+                            "lane": 1,
+                            "durationMs": 131
+                        },
+                        {
+                            "kind": "tool",
+                            "id": "0-tool-93",
+                            "turnId": "af7b4021-15e9-4199-ad1f-4b537d7aa050",
+                            "sectionId": "af7b4021-15e9-4199-ad1f-4b537d7aa050:0",
+                            "name": "timeNow",
+                            "at": 1794327613154,
+                            "chars": 87,
+                            "argsChars": 18,
+                            "inPrompt": true,
+                            "state": "ok",
+                            "eventFrom": 93,
+                            "eventTo": 95,
+                            "lane": 1,
+                            "resultChars": 69,
+                            "endedAt": 1794327613156,
+                            "durationMs": 1
+                        },
+                        {
+                            "kind": "assistant",
+                            "id": "0-assistant-96",
+                            "turnId": "af7b4021-15e9-4199-ad1f-4b537d7aa050",
+                            "sectionId": "af7b4021-15e9-4199-ad1f-4b537d7aa050:0",
+                            "name": "answer",
+                            "at": 1794327613175,
+                            "chars": 289,
+                            "inPrompt": true,
+                            "eventFrom": 96,
+                            "eventTo": 174,
+                            "lane": 1,
+                            "durationMs": 1282
+                        },
+                        {
+                            "kind": "reasoning",
+                            "id": "0-reasoning-178",
+                            "turnId": "af7b4021-15e9-4199-ad1f-4b537d7aa050",
+                            "sectionId": "af7b4021-15e9-4199-ad1f-4b537d7aa050:0",
+                            "name": "reasoning",
+                            "at": 1794327614485,
+                            "chars": 157,
+                            "inPrompt": false,
+                            "eventFrom": 178,
+                            "eventTo": 232,
+                            "lane": 1,
+                            "durationMs": 892
+                        },
+                        {
+                            "kind": "assistant",
+                            "id": "0-assistant-233",
+                            "turnId": "af7b4021-15e9-4199-ad1f-4b537d7aa050",
+                            "sectionId": "af7b4021-15e9-4199-ad1f-4b537d7aa050:0",
+                            "name": "answer",
+                            "at": 1794327615394,
+                            "chars": 85,
+                            "inPrompt": true,
+                            "eventFrom": 233,
+                            "eventTo": 255,
+                            "lane": 1,
+                            "durationMs": 364
+                        }
+                    ],
+                    "state": "done",
+                    "invocationId": "1",
+                    "threadLabel": "GL1",
+                    "startedAt": 1794327611696,
+                    "model": "local/basalt",
+                    "tail": {
+                        "kind": "assistant",
+                        "nodeId": "n233",
+                        "blockId": "0-assistant-233",
+                        "chars": 6,
+                        "truncated": false
+                    },
+                    "latestInput": 148,
+                    "cachedInput": 168,
+                    "answerNodeId": "n96",
+                    "endedAt": 1794327614464
+                }
+            ],
+            "revision": 260
+        }
+    },
+    "ed1e7c3f-7ce5-496a-a428-986606904267": {
+        "display": {
+            "turnId": "ed1e7c3f-7ce5-496a-a428-986606904267",
+            "sections": [
+                {
+                    "id": "ed1e7c3f-7ce5-496a-a428-986606904267:0",
+                    "role": "primary",
+                    "agent": "general",
+                    "agentLabel": "GL1",
+                    "threadId": "thread-1",
+                    "nodes": [
+                        {
+                            "kind": "reasoning",
+                            "id": "n1",
+                            "text": "No endpoint is attached to this preset, so the transport is scripted. Only toolRequest is declared, so I have to discover timeNow before I can read the time.",
+                            "chars": 157
+                        },
+                        {
+                            "kind": "text",
+                            "id": "n56",
+                            "text": "Asking the catalogue for time-related tools first, since only toolRequest is visible.",
+                            "committed": false,
+                            "chars": 85
+                        },
+                        {
+                            "kind": "notice",
+                            "id": "n79",
+                            "tone": "error",
+                            "text": "Agent \"general\" reused tool call id \"call tool request 1\" from an earlier turn; tool call ids must be unique within the conversation.",
+                            "at": 1794327617328
+                        }
+                    ],
+                    "context": [
+                        {
+                            "kind": "system",
+                            "id": "0-system-instructions",
+                            "turnId": "ed1e7c3f-7ce5-496a-a428-986606904267",
+                            "sectionId": "ed1e7c3f-7ce5-496a-a428-986606904267:0",
+                            "name": "instructions",
+                            "at": 1794327616014,
+                            "chars": 1227,
+                            "inPrompt": true,
+                            "lane": 1
+                        },
+                        {
+                            "kind": "user",
+                            "id": "0-user-prompt",
+                            "turnId": "ed1e7c3f-7ce5-496a-a428-986606904267",
+                            "sectionId": "ed1e7c3f-7ce5-496a-a428-986606904267:0",
+                            "name": "prompt",
+                            "at": 1794327616014,
+                            "chars": 33,
+                            "inPrompt": true,
+                            "lane": 1
+                        },
+                        {
+                            "kind": "reasoning",
+                            "id": "0-reasoning-1",
+                            "turnId": "ed1e7c3f-7ce5-496a-a428-986606904267",
+                            "sectionId": "ed1e7c3f-7ce5-496a-a428-986606904267:0",
+                            "name": "reasoning",
+                            "at": 1794327616036,
+                            "chars": 157,
+                            "inPrompt": false,
+                            "eventFrom": 1,
+                            "eventTo": 55,
+                            "lane": 1,
+                            "durationMs": 903
+                        },
+                        {
+                            "kind": "assistant",
+                            "id": "0-assistant-56",
+                            "turnId": "ed1e7c3f-7ce5-496a-a428-986606904267",
+                            "sectionId": "ed1e7c3f-7ce5-496a-a428-986606904267:0",
+                            "name": "answer",
+                            "at": 1794327616956,
+                            "chars": 85,
+                            "inPrompt": true,
+                            "eventFrom": 56,
+                            "eventTo": 78,
+                            "lane": 1,
+                            "durationMs": 368
+                        }
+                    ],
+                    "state": "error",
+                    "invocationId": "3",
+                    "threadLabel": "GL1",
+                    "startedAt": 1794327616017,
+                    "model": "local/basalt",
+                    "tail": {
+                        "kind": "assistant",
+                        "nodeId": "n56",
+                        "blockId": "0-assistant-56",
+                        "chars": 6,
+                        "truncated": false
+                    },
+                    "endedAt": 1794327617328
+                }
+            ],
+            "revision": 83
+        }
+    }
+}

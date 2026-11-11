@@ -3,32 +3,34 @@
 //!
 //! TypeScript origin: `packages/underload/harness/src/server/plugins.ts` (the settings store and
 //! every validation sentence in it), `src/plugin/manifest.ts` (the GENERATED built-in catalogue
-//! this static table replaces), `src/plugins/async-ping.plugin.ts` +
-//! `src/plugins/context-compaction.plugin.ts` (the exact metadata each row carries), and
-//! `src/server/api.ts` `pluginSettingOf` / `pluginRowOf` (`:1925-1965`) for the wire projection.
+//! this static table replaces), the `metadata` export of each
+//! `src/plugins/{async-ping,context-compaction,context-trimmer}.plugin.ts` (what each row carries),
+//! and `src/server/api.ts` `pluginSettingOf` / `pluginRowOf` (`:2300-2364`) with `getPlugins` /
+//! `patchPlugin` (`:2368-2432`) for the wire projection.
 //!
 //! WHAT THIS MODULE IS, AND WHAT IT IS NOT
 //! ---------------------------------------
-//! The TypeScript package has a plugin HOST: `harness()` scans `src/plugins/**/*.plugin.ts`, the
-//! generated manifest wires what the scan found, and each plugin's `setup(api)` registers hooks
-//! that change a run. THIS build has no plugin host and no runtime compiler, so it executes no
-//! hook at all - and it does not need one to satisfy the HTTP contract. Everything the harness
-//! front-end's Plugins pane reads and writes is here:
+//! The plugin HOST - the bus that delivers lifecycle events to registered handlers - is
+//! [`crate::plugin`]. THIS module is the half the HTTP contract touches:
 //!
-//!   * the CATALOGUE - the two built-ins this build ships, as a STATIC table (there is no scan, so
+//!   * the CATALOGUE - the three built-ins this build ships, as a STATIC table (there is no scan, so
 //!     this table IS the manifest: same rows, same order, same declared metadata);
 //!   * the SETTINGS DESCRIPTORS - key, label, declared type, declared default, `min`/`max`/`step`,
 //!     description;
 //!   * the EFFECTIVE VALUES - the declared default unless the operator stored an override, which is
 //!     what a row paints and what a `null` patch restores;
+//!   * the FRAMEWORK SWITCH - the reserved `enabled` key ([`PLUGIN_ENABLED_KEY`]), which the host's
+//!     delivery gate consults ([`crate::plugin`] / `plugin/host.ts` rule 9) and this store resolves
+//!     through the SAME stored -> declared -> fallback chain as every declared key;
 //!   * the WRITE EDGE - validation against the descriptor, with the contract's exact sentences;
 //!   * the DURABLE DELTA - [`PluginSettingsStore::snapshot`] is the `pluginSettings` member of
 //!     `state.json`.
 //!
-//! The one behaviour a plugin runtime would add is a LIVE PROVIDER a running harness reads on its
-//! next turn (`plugins.ts provider`). Here the live map IS the store, so an accepted patch is
-//! immediately visible to every later read of every key by every session in the process; there is
-//! simply no plugin code that consumes it. `knowledge.md` "T10 plugin uplift" records this.
+//! The one behaviour the TypeScript build adds on top is a LIVE PROVIDER a running harness reads on
+//! its next turn (`plugins.ts provider`). Here the live map IS the store, so an accepted patch is
+//! immediately visible to every later read of every key by every session in the process - which is
+//! also what the host's handlers see when they re-read their settings per pass. `knowledge.md`
+//! "T10 plugin uplift" records the port decisions and the remaining deviations.
 //!
 //! WHY THE CATALOGUE IS A `static`
 //! -------------------------------
@@ -37,6 +39,15 @@
 //! the next. Only the OPERATOR's overrides move at runtime, and they are stored in the descriptor's
 //! declared type (see [`SettingValue`]) so a restored document, a submitted patch and an answered
 //! row cannot disagree about a value's spelling.
+//!
+//! HOW THE ROWS WERE WRITTEN
+//! -------------------------
+//! Every title, description, label, default and bound below was generated mechanically from the
+//! reference server's own `GET /v1/harness/plugins` body (the captured fixture
+//! `Temp/fixtures/harness/plugin-catalogue/descriptors-by-plugin.json`, see its `MANIFEST.md`), not
+//! transcribed by hand - these descriptions run to a thousand characters each and a single drifted
+//! word would fail the byte-exact row test. `tests/plugins.rs` re-pins the same rows from fixture
+//! copies under `tests/fixtures/`, so a drift is caught at either end.
 //!
 //! THE NUMBER SPELLING RULE
 //! ------------------------
@@ -102,7 +113,7 @@ impl DeclaredDefault {
     }
 }
 
-/// One DECLARED setting of a plugin (`HarnessPluginSettingDescriptor`, `types/index.ts:3053`, and
+/// One DECLARED setting of a plugin (`HarnessPluginSettingDescriptor`, `types/index.ts:3764`, and
 /// the `metadata.settings` literal of each `*.plugin.ts`).
 #[derive(Debug, Clone, Copy)]
 pub struct PluginSettingDescriptor {
@@ -140,18 +151,18 @@ pub struct PluginMetadata {
 }
 
 /// The shipped catalogue, in the TypeScript manifest's SCAN ORDER (path ascending from
-/// `src/plugins`): `async-ping.plugin.ts` before `context-compaction.plugin.ts`.
+/// `src/plugins`): `async-ping.plugin.ts`, then `context-compaction.plugin.ts`, then
+/// `context-trimmer.plugin.ts`.
 ///
 /// The order is contract-visible: `GET /plugins` answers in it, the Plugins pane renders it as-is,
-/// and the 404 sentence joins these names with `", "`.
-pub static BUILTIN_PLUGINS: [PluginMetadata; 2] = [
-    // `src/plugins/async-ping.plugin.ts`'s `metadata` export, verbatim.
+/// the `state.json` snapshot is written in it, and the 404 sentence joins these names with `", "`.
+pub static BUILTIN_PLUGINS: [PluginMetadata; 3] = [
+    // `async-ping.plugin.ts`'s `metadata` export, verbatim - captured from the reference
+    // server's own `GET /plugins` row (see the module header for the provenance).
     PluginMetadata {
         name: "async-ping",
         title: "Background Ping",
-        description: "Keeps a conversation waiting on background tool work moving by emitting a \
-                      periodic ping with the calls that are still running, replacing the fixed \
-                      scheduler heartbeat.",
+        description: "Keeps a conversation waiting on background tool work moving by emitting a periodic ping with the calls that are still running, replacing the fixed scheduler heartbeat.",
         version: "1.0.0",
         tags: &["background", "async", "lifecycle"],
         hooks: &[
@@ -166,43 +177,260 @@ pub static BUILTIN_PLUGINS: [PluginMetadata; 2] = [
             key: "intervalMs",
             label: "Ping interval (ms)",
             kind: PluginSettingType::Number,
-            // The documented 10-minute wake (`async-ping.plugin.ts DEFAULT_PING_INTERVAL_MS`).
-            default: DeclaredDefault::Number(600_000.0),
-            min: Some(1_000.0),
+            default: DeclaredDefault::Number(600000.0),
+            min: Some(1000.0),
             max: None,
-            step: Some(1_000.0),
+            step: Some(1000.0),
             description: Some(
-                "How often a still-running background tool is reported while work \
-                               is pending. Defaults to the historical 10-minute wake.",
+                "How often a still-running background tool is reported while work is pending. Defaults to the historical 10-minute wake.",
             ),
         }],
     },
-    // `src/plugins/context-compaction.plugin.ts`'s `metadata` export, verbatim.
+    // `context-compaction.plugin.ts`'s `metadata` export, verbatim - captured from the reference
+    // server's own `GET /plugins` row (see the module header for the provenance).
     PluginMetadata {
         name: "context-compaction",
         title: "Context Compaction",
-        description: "Watches each agent conversation against a context limit and, when the limit \
-                      is reached, compacts the transcript at the turn boundary before the next \
-                      model request is sent.",
+        description: "Watches each agent conversation against a context limit and, when the limit is reached, compacts the conversation at the turn boundary before the next model request is sent. In the default \"summarize\" mode the conversation does the work: the thread is parked, an instruction the plugin commits into the transcript is answered by this same agent with a summary of what is done, what it is working on and where it left off, and everything before that instruction (and the turns between it and the answer) stops being sent. The thread resumes with a nudge to continue, and the context is small again: the instruction plus the agent's own summary. The older \"exclude\" mode prunes only the tool units a later success already answered. Neither mode deletes anything: a withheld unit keeps its place in history and can be switched back on. The limit is the firing point: compaction starts as soon as the estimate reaches the effective limit, which is the per-model override for the model the conversation is running, capped by that model's declared context window when one is declared.",
         version: "1.0.0",
         tags: &["context", "compaction", "lifecycle"],
+        hooks: &[
+            "turn.before",
+            "turn.after",
+            "thread.idle",
+            "run.finished",
+            "run.failed",
+        ],
+        settings: &[
+            PluginSettingDescriptor {
+                key: "contextLimit",
+                label: "Context limit (tokens)",
+                kind: PluginSettingType::Number,
+                default: DeclaredDefault::Number(200000.0),
+                min: Some(1000.0),
+                max: None,
+                step: Some(1000.0),
+                description: Some(
+                    "The firing point: estimated tokens a conversation may reach before this plugin compacts it, measured with the ~4 characters/token estimate the UI context bar uses, anchored on the reported prompt size of the last request that reported usage — so after the first report it can differ from the bar by whatever the tool schemas and message framing actually cost. There is no separate headroom: the estimate at or above this number fires the pass on that turn. It is this value unless modelLimits overrides it for the model this conversation runs, or caps it at that model's declared context window. Set to 0 to turn compaction off for every model.",
+                ),
+            },
+            PluginSettingDescriptor {
+                key: "modelLimits",
+                label: "Per-model limits (JSON)",
+                kind: PluginSettingType::String,
+                default: DeclaredDefault::Text("{}"),
+                min: None,
+                max: None,
+                step: None,
+                description: Some(
+                    "A JSON object keyed by model id, each value `{ \"limit\": number, \"window\": number }` — both optional. `limit` replaces contextLimit for that model, for an operator who is willing to pay more (or less) for one model than for the rest. `window` states the model's HARD context window: it caps whatever limit is in force, so a 512000 ceiling on a 262144-token model still compacts around the 256k behaviour rather than waiting for a size the provider never accepts. Example: `{\"gpt-4o\": {\"limit\": 512000, \"window\": 131072}, \"llama-8b\": {\"window\": 8192}}`. The model id is read live from the agent, so switching models changes the ceiling on the next turn. Anything malformed — broken JSON, a value that is not an object, a non-positive or non-numeric limit — is ignored and the global limit applies, never an error.",
+                ),
+            },
+            PluginSettingDescriptor {
+                key: "enabled",
+                label: "Compact conversations",
+                kind: PluginSettingType::Boolean,
+                default: DeclaredDefault::Flag(true),
+                min: None,
+                max: None,
+                step: None,
+                description: Some(
+                    "Runs compaction on or off, in either mode. Off changes nothing else: the limit is still read, the context bar still measures, and no other plugin is affected. It is the switch an operator expects when they want the behaviour gone without removing the built-in.",
+                ),
+            },
+            PluginSettingDescriptor {
+                key: "minTokens",
+                label: "Minimum saving per pass (tokens)",
+                kind: PluginSettingType::Number,
+                default: DeclaredDefault::Number(200.0),
+                min: Some(0.0),
+                max: None,
+                step: Some(50.0),
+                description: Some(
+                    "A pass must withhold at least this many estimated tokens, or it does nothing at all — no flag write, no persistence notification, no save. A prune that saves 40 tokens is a provider prompt-cache invalidation for nothing, so this floor is what makes running on every turn cheap. Measured as a difference of the same estimate, so any provider anchor cancels out of it and only the withheld characters count. In \"summarize\" mode the same number is read the other way round, as a trivial floor on the LIVE estimate: a conversation smaller than this is never worth a compaction round trip, so the pass refuses rather than paying for a summary of a handful of turns. Set it to 0 to remove the floor, which a small per-model limit needs: a floor above that limit would never be crossed.",
+                ),
+            },
+            PluginSettingDescriptor {
+                key: "safetyTurns",
+                label: "Recent units to protect",
+                kind: PluginSettingType::Number,
+                default: DeclaredDefault::Number(6.0),
+                min: Some(0.0),
+                max: None,
+                step: Some(1.0),
+                description: Some(
+                    "How many units at the END of the conversation no pass may touch. A unit is one assistant tool-call block plus its results, or one standalone message. The horizon counts UNITS from the end, never the per-run turn counter: a failure the model has not moved past yet is the highest-signal thing in the window, and pruning it is how an agent repeats the call it just watched fail. 0 removes the horizon. It belongs to \"exclude\" mode; \"summarize\" mode needs no horizon because the recent tail is exactly what the agent is summarizing.",
+                ),
+            },
+            PluginSettingDescriptor {
+                key: "mode",
+                label: "Compaction mode",
+                kind: PluginSettingType::String,
+                default: DeclaredDefault::Text("summarize"),
+                min: None,
+                max: None,
+                step: None,
+                description: Some(
+                    "Which compaction runs when the limit is reached. \"summarize\" — the default since the 2026-11-10 context-compaction ruling — parks the conversation at the turn boundary and lets its NEXT model turn write the summary: the agent condenses what is done, what it is working on and where it left off, everything before that instruction stops being sent, and the conversation resumes with a nudge. \"exclude\" is the earlier behaviour: a superseded tool unit keeps its place in canonical history and simply stops being sent, which is the reversible option the evidence favours and the cheaper one — no extra model turn. \"annotate\" — replace the result with a one-line handle back to the full text — is the planned SECOND WRITER over the same candidate list the policy already computes before writing anything, and any value other than these two (including that one) behaves as \"exclude\", the flow that cannot spend a model turn by accident. The value actually used is reported in the pass diagnostic.",
+                ),
+            },
+        ],
+    },
+    // `context-trimmer.plugin.ts`'s `metadata` export, verbatim - captured from the reference
+    // server's own `GET /plugins` row (see the module header for the provenance).
+    PluginMetadata {
+        name: "context-trimmer",
+        title: "Context Trimmer",
+        description: "The posture this built-in exists to hold: the engine core trims nothing by default — every recorded message stays in the provider request — and this plugin is the one place trimming happens, one rule per switch. At the start of each assistant turn it finds tool calls that failed or were rejected and were later replaced by a successful call to the same tool, and excludes those paired call+result units from the context. Which outcomes count as invalid, whether supersession matches the tool name or the exact call fingerprint, whether thinking from earlier turns stops being replayed, and how much a pass must save before it writes anything are each a separate switch, and every one of them defaults to today's behaviour. A unit is withheld whole or not at all, an unanswered call is never touched, and a completed result is never invalid on its own unless dropDuplicateCalls is on and the fingerprints match. Nothing is deleted: a withheld unit keeps its place in canonical history and can be switched back on, and a switch flipped off stops new writes without restoring what an earlier turn already withheld.",
+        version: "1.0.0",
+        tags: &["context", "trimming", "lifecycle"],
         hooks: &["turn.before"],
-        settings: &[PluginSettingDescriptor {
-            key: "contextLimit",
-            label: "Context limit (tokens)",
-            kind: PluginSettingType::Number,
-            // `context-compaction.plugin.ts CONTEXT_LIMIT_DEFAULT`, which the plugin file requires
-            // to equal this declared default (the number is written twice and both places move).
-            default: DeclaredDefault::Number(100_000.0),
-            min: Some(1_000.0),
-            max: None,
-            step: Some(1_000.0),
-            description: Some(
-                "Estimated tokens a conversation may reach before this plugin \
-                               compacts it. Measured with the same ~4 characters/token estimate \
-                               the UI context bar uses.",
-            ),
-        }],
+        settings: &[
+            PluginSettingDescriptor {
+                key: "enabled",
+                label: "Context trimming",
+                kind: PluginSettingType::Boolean,
+                default: DeclaredDefault::Flag(true),
+                min: None,
+                max: None,
+                step: None,
+                description: Some(
+                    "Runs every trimming policy this plugin has, on or off. Off stops the pass, so none of the switches below is consulted and nothing is withheld from that turn on; it changes nothing else: units an earlier turn already trimmed stay trimmed until they are switched back on from the context view, no other plugin is affected, and the transcript is never rewritten. This is the framework's own key, so the switch in the Plugins row and this read are one stored value with one write path. Off is NOT the engine's posture: the engine's posture is every policy below off, which sends everything that was recorded.",
+                ),
+            },
+            PluginSettingDescriptor {
+                key: "dropSupersededToolCalls",
+                label: "Drop superseded tool calls",
+                kind: PluginSettingType::Boolean,
+                default: DeclaredDefault::Flag(true),
+                min: None,
+                max: None,
+                step: None,
+                description: Some(
+                    "The shipped rule, verbatim. A tool-call unit whose every committed result was failed or rejected, that is FULLY answered, and where EVERY tool name it called has a completed answer in some later unit that is still included, stops being sent as a whole unit: the assistant block and every result answering one of its calls leave together, so the request stays pair-clean. Every name must be answered, so a block that called A and B where only A was retried successfully stays whole — half a unit leaving is worse than the whole unit staying, and the failed half's result is what the model would lose. Flipping this off stops new writes and restores nothing an earlier turn already withheld. An unanswered unit is never touched, and a completed result is never invalid on its own: only dropDuplicateCalls can withhold a healthy unit, and only on an exact fingerprint match.",
+                ),
+            },
+            PluginSettingDescriptor {
+                key: "dropInvalidToolCallsOnceAnswered",
+                label: "Drop invalid tool calls once answered",
+                kind: PluginSettingType::Boolean,
+                default: DeclaredDefault::Flag(true),
+                min: None,
+                max: None,
+                step: None,
+                description: Some(
+                    "The same rule generalised over what counts as an invalid result, which is what invalidOutcomes decides. It is INDEPENDENT of dropSupersededToolCalls: turning one off leaves the other running, and with both off no tool unit is ever withheld, so the request carries every recorded tool call the harness has — the engine's posture. Like the shipped rule it withholds only a fully answered unit, only as a whole unit, and only once a still-included later unit has answered every name it called; a resolver that is itself withheld is not evidence, because then the model would see neither the failure nor the answer. Off stops new writes and restores nothing.",
+                ),
+            },
+            PluginSettingDescriptor {
+                key: "invalidOutcomes",
+                label: "Outcomes that count as invalid",
+                kind: PluginSettingType::String,
+                default: DeclaredDefault::Text("failed,rejected"),
+                min: None,
+                max: None,
+                step: None,
+                description: Some(
+                    "Which committed results count as invalid for dropInvalidToolCallsOnceAnswered, as a comma-separated set drawn from failed, rejected, cancelled, empty. failed and rejected are the shipped rule. cancelled is opt-in only: the agent CHOSE to stop there, and a healthy control outcome is not garbage in this package — a unit mixing a cancelled answer with a healthy one is a keep either way. empty is opt-in and dangerous: it treats a completed result whose text is blank as invalid, and a legitimately empty answer — a grep with no matches, a zero-hit search — is indistinguishable from a stub, so withholding it removes the one fact that proves the agent already looked. Unknown names (including completed, which is only ever reachable through dropDuplicateCalls) are dropped and the pass says so; a set that resolves to nothing disables the generalisation, leaving dropSupersededToolCalls as the only tool policy. The set actually used is reported in the pass diagnostic.",
+                ),
+            },
+            PluginSettingDescriptor {
+                key: "dropOldThoughts",
+                label: "Drop old thinking",
+                kind: PluginSettingType::String,
+                default: DeclaredDefault::Text("turn"),
+                min: None,
+                max: None,
+                step: None,
+                description: Some(
+                    "Which of the model's own thinking stops being replayed. \"off\": nothing is ever withheld and every recorded thought stays eligible for replay — the engine's posture, and the right value for a backend whose template concatenates historical thinking. \"turn\" (the default): the OPEN turn keeps its thinking — every committed assistant entry after the last user entry, which is why a mailbox or autoanswer user message legitimately moves the boundary — and the thinking of every CLOSED turn is withheld; it is the only tier every strict provider contract accepts at once, and it pins the provider's cache divergence point one turn back forever instead of walking it backwards through history. \"all\": every committed thought is withheld, including the open turn's — only sane on a transport that replays nothing, and it costs the current-turn continuity that every measured failure mode blames for re-deciding and for thin tool calls. Any other string behaves as \"turn\" and the diagnostic says so. The write is a per-entry FLAG on the assistant entry, never an edit of the text: the entry still travels, with its content and tool calls intact, and only its request copy drops the thinking, so provider pairing is untouched and canonical history keeps every thought — including of an entry this pass flagged. An entry with no recorded thinking, one that is already flagged, and one whose whole unit is already withheld are never candidates, so a second pass over an unchanged transcript writes nothing. The estimator does not count reasoning, so a withheld thought registers as zero saved tokens; measure the effect in characters with minThoughtChars. Withhold-only: switching to \"off\" stops new writes and restores nothing.",
+                ),
+            },
+            PluginSettingDescriptor {
+                key: "thoughtKeepUnits",
+                label: "Earlier units that keep thinking",
+                kind: PluginSettingType::Number,
+                default: DeclaredDefault::Number(0.0),
+                min: Some(0.0),
+                max: Some(32.0),
+                step: Some(1.0),
+                description: Some(
+                    "How many otherwise-withheld thinking entries, counted from the NEWEST entry backwards, additionally keep their thinking — the recent-N tier, for the backends that are trained on their own reasoning (local Qwen/GLM/Kimi, DeepSeek with tools, the keep-all Claude generations). Only consulted while dropOldThoughts is \"turn\" or \"all\"; it counts only entries that actually carry recorded thinking, and it never re-enables thinking an earlier turn already withheld. Every value ABOVE 0 is documented as cache-hostile: a sliding window walks the provider's divergence point backwards through previously-stable history on every eviction, which is strictly worse than 0 on both the window and the cache — use \"off\" if the whole history is wanted. 0 keeps exactly one turn: the open one. It runs BEFORE minThoughtChars, which measures what the rescue leaves behind.",
+                ),
+            },
+            PluginSettingDescriptor {
+                key: "supersedeMatch",
+                label: "Supersession match",
+                kind: PluginSettingType::String,
+                default: DeclaredDefault::Text("name"),
+                min: None,
+                max: None,
+                step: None,
+                description: Some(
+                    "What makes a later call the answer to an earlier one. \"name\" is the shipped rule: the tool NAME alone, deliberately looser than compaction's fingerprint, because a failed call followed later by a successful call of the same tool is almost always superseded work whether or not the retry used the same arguments (read(\"a.ts\") failing and read(\"b.ts\") answering the question the agent actually had). \"fingerprint\" is compaction's exact rule — tool name AND canonical arguments must match — which makes the two passes agree by construction instead of by comment and is the value that makes compaction's failure-retry pruning redundant. Any other string behaves as \"name\" and the diagnostic says so. Neither value relaxes granularity: the unit still leaves whole, and every name the block called still has to be answered.",
+                ),
+            },
+            PluginSettingDescriptor {
+                key: "dropDuplicateCalls",
+                label: "Drop duplicate tool calls",
+                kind: PluginSettingType::Boolean,
+                default: DeclaredDefault::Flag(false),
+                min: None,
+                max: None,
+                step: None,
+                description: Some(
+                    "Withhold an EARLIER unit when a later, still-included unit re-ran the SAME work and answered it — matched on the exact fingerprint (tool name plus canonical arguments), NEVER on name alone — whatever the earlier unit's own outcome, so a unit the model read and used is reachable. Off by default: this is the one switch here that can withhold work the model actually used, and it is the largest class of redundant context in a long trajectory. It never touches an unanswered unit, never acts on a name-only match, and only ever withholds a unit whose re-run produced completed answers.",
+                ),
+            },
+            PluginSettingDescriptor {
+                key: "minTokens",
+                label: "Minimum saving per pass (tokens)",
+                kind: PluginSettingType::Number,
+                default: DeclaredDefault::Number(0.0),
+                min: Some(0.0),
+                max: Some(1000000.0),
+                step: Some(50.0),
+                description: Some(
+                    "A pass must withhold at least this many estimated tokens of TOOL-UNIT text, or it writes nothing at all: no flag, no notification, no save, no diagnostic. A prune that saves 40 tokens is a provider prompt-cache invalidation for nothing, so this floor is what makes trimming on every turn cheap. 0 (the default) is the shipped posture: the rule only ever removes pure noise, so no floor was needed. The scoping to tool writes is not a detail — the estimator does not count reasoning, so a floor shared with the thinking writes would silently disable the thoughts switch whenever it was above zero.",
+                ),
+            },
+            PluginSettingDescriptor {
+                key: "minThoughtChars",
+                label: "Minimum thinking saved per pass (characters)",
+                kind: PluginSettingType::Number,
+                default: DeclaredDefault::Number(0.0),
+                min: Some(0.0),
+                max: Some(1000000.0),
+                step: Some(50.0),
+                description: Some(
+                    "The thinking twin of minTokens, measured in CHARACTERS of withheld thinking — the only measure available for text the estimator does not count. A thinking pass below this floor writes nothing at all. 0 (the default) removes the floor. Do not convert this number into tokens: while the estimator is not reasoning-aware the two figures cannot be compared, and a tokens-saved number that includes thinking would disagree with the context bar the operator is reading.",
+                ),
+            },
+            PluginSettingDescriptor {
+                key: "safetyUnits",
+                label: "Recent units to protect",
+                kind: PluginSettingType::Number,
+                default: DeclaredDefault::Number(0.0),
+                min: Some(0.0),
+                max: Some(4096.0),
+                step: Some(1.0),
+                description: Some(
+                    "How many units at the END of the transcript no tool trim may touch. A unit is one assistant tool-call block plus its results, or one standalone message, and the horizon counts UNITS from the end — never the per-run turn counter, which counts model steps inside one run and cannot express a conversation-level position. 0 (the default) removes the horizon, which is the shipped argument: a failure the model just replaced with a success is exactly the pair that is safe to drop from the NEXT request. Raise it when re-sending the last few units is cheaper than re-prefilling from the oldest trimmed position in the provider's cache.",
+                ),
+            },
+            PluginSettingDescriptor {
+                key: "maxUnits",
+                label: "Maximum units per pass",
+                kind: PluginSettingType::Number,
+                default: DeclaredDefault::Number(0.0),
+                min: Some(0.0),
+                max: Some(4096.0),
+                step: Some(1.0),
+                description: Some(
+                    "Cap on how many tool units ONE pass may withhold; 0 (the default) is unbounded. It exists for the first pass over a conversation restored weeks ago: unbounded, that single turn withholds every superseded unit at once and the provider's cached prefix diverges at the oldest trimmed position. Withholding is oldest-first, so a cap removes the oldest noise now and leaves the newest superseded units for a later turn.",
+                ),
+            },
+        ],
     },
 ];
 
@@ -224,10 +452,88 @@ pub fn settings_of(plugin: &str) -> &'static [PluginSettingDescriptor] {
     metadata_of(plugin).map_or(&[], |entry| entry.settings)
 }
 
-/// The declared descriptor of one key, when the plugin declared it.
+/// The DECLARED descriptor of one key, when the plugin declared it.
+///
+/// Deliberately declared-only: this is the lookup behind the row's `settings[]` and `values`
+/// projection, which are both declared-only by contract. Everything that DECIDES about a key - the
+/// patch allowlist, the snapshot order, the restore filter - goes through
+/// [`effective_descriptor_of`] instead, because the reserved `enabled` key is writable on every
+/// plugin.
 #[must_use]
 pub fn descriptor_of(plugin: &str, key: &str) -> Option<&'static PluginSettingDescriptor> {
     settings_of(plugin).iter().find(|entry| entry.key == key)
+}
+
+// ---------------------------------------------------------------------------
+// The framework's reserved `enabled` key
+// ---------------------------------------------------------------------------
+
+/// The one setting key every plugin answers to whether or not it declares one
+/// (`plugins.ts PLUGIN_ENABLED_KEY`), and the key the host's delivery gate consults.
+///
+/// The rule is one line: effective enablement = stored override ?? declared default ?? `true`.
+/// Nothing else about a plugin changes - it stays loaded, its tools / agents / commands stay
+/// registered, and `GET /plugins` still lists it with `enabled: false`; only hook delivery stops.
+/// It is deliberately a normal key in the same override map rather than a second per-plugin boolean
+/// column, so the durable document, the validation edge and the settings view all carry it with no
+/// new storage shape.
+pub const PLUGIN_ENABLED_KEY: &str = "enabled";
+
+/// The synthesized descriptor for a plugin that does not declare the key itself
+/// (`plugins.ts RESERVED_ENABLED_DESCRIPTOR`). Its `default: true` is the "a plugin nobody switched
+/// off runs" answer the gate falls back to, and it is what lets `enabled` resolve through the SAME
+/// stored -> declared -> fallback chain as every other key - no special-case read anywhere.
+///
+/// It never reaches the wire: a row's `settings[]` and `values` are declared-only
+/// (`api.ts:2361-2362`), which is why the capture of `GET /plugins` shows no `enabled` entry in
+/// async-ping's `values` even though that plugin is switchable.
+pub static RESERVED_ENABLED_DESCRIPTOR: PluginSettingDescriptor = PluginSettingDescriptor {
+    key: PLUGIN_ENABLED_KEY,
+    label: "Enabled",
+    kind: PluginSettingType::Boolean,
+    default: DeclaredDefault::Flag(true),
+    min: None,
+    max: None,
+    step: None,
+    description: Some(
+        "Framework switch: off stops this plugin's lifecycle hooks from running, in every session, from the next turn. The plugin stays loaded and listed; its tools and commands are unaffected.",
+    ),
+};
+
+/// The descriptors a WRITE is validated against: the plugin's declared list plus the reserved
+/// `enabled` key appended when the plugin does not declare it (`plugins.ts effectiveSettingsOf`).
+///
+/// That is the allowlist, so `PATCH ... {settings:{enabled:false}}` is accepted for EVERY plugin
+/// while an invented key is still a 400 that names the whole accepted set. A plugin that declares
+/// `enabled` itself (both context plugins do) keeps its OWN descriptor - and therefore its own label,
+/// description and default - so the framework switch and the plugin's own read are one stored value.
+///
+/// An unknown plugin answers only the reserved descriptor, which is what keeps
+/// [`PluginSettingsStore::enabled`] total (no read path throws; the 404 is the ROUTE's decision).
+#[must_use]
+pub fn effective_settings_of(plugin: &str) -> Vec<&'static PluginSettingDescriptor> {
+    let declared = settings_of(plugin);
+
+    if declared.iter().any(|entry| entry.key == PLUGIN_ENABLED_KEY) {
+        return declared.iter().collect();
+    }
+
+    let mut effective: Vec<&'static PluginSettingDescriptor> = declared.iter().collect();
+
+    effective.push(&RESERVED_ENABLED_DESCRIPTOR);
+
+    effective
+}
+
+/// The effective descriptor of one key - declared, or the reserved `enabled` ([`effective_settings_of`]).
+#[must_use]
+pub fn effective_descriptor_of(
+    plugin: &str,
+    key: &str,
+) -> Option<&'static PluginSettingDescriptor> {
+    effective_settings_of(plugin)
+        .into_iter()
+        .find(|entry| entry.key == key)
 }
 
 // ---------------------------------------------------------------------------
@@ -575,9 +881,49 @@ impl PluginSettingsStore {
         self.overrides.get(plugin)?.get(key).cloned()
     }
 
+    /// Whether one plugin RUNS right now: the stored `enabled` override, otherwise the plugin's
+    /// declared `enabled` default, otherwise `true` (`plugins.ts enabled()` - and the exact value
+    /// the host's delivery gate consults, so a row and a live session can never disagree).
+    ///
+    /// Resolved through the EFFECTIVE descriptor, which is what makes an undeclaring plugin
+    /// (async-ping) switchable while its `values` map stays declared-only.
+    ///
+    /// A stored value of the WRONG kind cannot exist here: the patch validator and the restore filter
+    /// both normalize to the declared type, so anything else in the map is treated as "nothing
+    /// stored" and the default applies rather than panicking on a mismatch.
+    #[must_use]
+    pub fn enabled(&self, plugin: &str) -> bool {
+        if let Some(SettingValue::Flag(flag)) = self.get(plugin, PLUGIN_ENABLED_KEY) {
+            return flag;
+        }
+
+        // The effective descriptor answers the plugin's OWN default when it declares the key, and the
+        // reserved `true` otherwise; an unknown plugin has no descriptors besides the reserved one, so
+        // it answers `true` and stays total. A non-boolean default would be a catalogue bug, and the
+        // fallback side of the chain (`?? true`) is the documented answer for it.
+        effective_descriptor_of(plugin, PLUGIN_ENABLED_KEY)
+            .filter(|descriptor| descriptor.kind == PluginSettingType::Boolean)
+            .map_or(true, |descriptor| match descriptor.default {
+                DeclaredDefault::Flag(flag) => flag,
+                // Declared `boolean`, defaulted to something else: the framework's own fallback.
+                _ => true,
+            })
+    }
+
     /// The EFFECTIVE map a plugin would read right now, in DECLARED key order: the stored override
     /// when there is one, the declared default otherwise. This is the projection the UI paints, so
     /// a row can never disagree with runtime behaviour.
+    ///
+    /// Deliberately DECLARED-ONLY (`plugins.ts valuesOf`): `values` is the projection of the plugin's
+    /// own form fields, and the contract states a key absent from `settings[]` can never appear here.
+    /// The reserved `enabled` therefore travels in its own row field ([`PluginSettingsStore::enabled`])
+    /// rather than in this map - which is why the reference capture of async-ping (a plugin that does
+    /// NOT declare `enabled`) has exactly one `values` entry.
+    ///
+    /// The resolution is equivalent to the plugin's own settings view (`src/plugin/settings.ts`:
+    /// stored -> declared -> fallback) because every stored value here was normalized to its declared
+    /// type on the way in: the view's `number`/`boolean` coercions can never fire on a value this
+    /// store holds, so the third link of that chain is unreachable from a row.
     ///
     /// An unknown plugin answers an empty map, exactly like `plugins.ts values` - it has no
     /// declared settings to resolve.
@@ -629,6 +975,10 @@ impl PluginSettingsStore {
             // so `builtin` is `true`; the field stays explicit (never inferred client-side) for a
             // plugin a later release makes configurable.
             builtin: true,
+            // R2 - read live from the same store the host's gate consults, so the row and the runtime
+            // answer with one voice (`api.ts:2360`). A plugin that declares no `enabled` setting still
+            // has one (the reserved key), while its `values` map stays declared-only.
+            enabled: self.enabled(metadata.name),
             settings: settings_of(metadata.name)
                 .iter()
                 .map(plugin_setting_of)
@@ -646,8 +996,8 @@ impl PluginSettingsStore {
             .collect()
     }
 
-    /// Only what the operator changed, in CATALOGUE order and DECLARED key order - the `state.json`
-    /// projection (`plugins.ts snapshot`).
+    /// Only what the operator changed, in CATALOGUE order and EFFECTIVE-DESCRIPTOR key order - the
+    /// `state.json` projection (`plugins.ts snapshot` / `snapshotOf`).
     ///
     /// A plugin with no remaining override keeps no entry, so a document that does not name a
     /// plugin means exactly "nothing has ever been changed about it".
@@ -662,9 +1012,11 @@ impl PluginSettingsStore {
 
             let mut values: Map<String, Value> = Map::new();
 
-            // Declared order, so a document stays DIFF-STABLE even when an older build wrote the
-            // keys in another order.
-            for descriptor in metadata.settings {
+            // EFFECTIVE-DESCRIPTOR order, so a document stays DIFF-STABLE even when an older build
+            // wrote the keys in another order (`plugins.ts snapshotOf`). The reserved `enabled` key is
+            // part of that order, which is what persists a switch flipped on a plugin that does NOT
+            // declare it - and a declared `enabled` keeps the position the plugin gave it.
+            for descriptor in effective_settings_of(metadata.name) {
                 if let Some(value) = entries.get(descriptor.key) {
                     values.insert(descriptor.key.to_owned(), value.to_json());
                 }
@@ -695,10 +1047,11 @@ impl PluginSettingsStore {
         };
 
         for (plugin, raw) in values {
-            // A plugin this build stopped shipping: drop the whole entry.
-            let Some(metadata) = metadata_of(plugin) else {
+            // A plugin this build stopped shipping: drop the whole entry. The identity check is the
+            // only use of the metadata here - the descriptor walk below runs off the EFFECTIVE list.
+            if metadata_of(plugin).is_none() {
                 continue;
-            };
+            }
 
             // The loader refuses a member that is not an object (`persistence::validate_document`),
             // so reaching here without one means a caller handed this store an UNvalidated document -
@@ -707,7 +1060,10 @@ impl PluginSettingsStore {
                 continue;
             };
 
-            for descriptor in metadata.settings {
+            // The EFFECTIVE set is the allowlist here too, so an `enabled` override saved for a
+            // plugin that never declares the key survives the restart exactly like a declared one
+            // (`plugins.ts applyRestore` - R2's durability criterion).
+            for descriptor in effective_settings_of(plugin) {
                 let Some(value) = entries.get(descriptor.key) else {
                     continue;
                 };
@@ -736,19 +1092,19 @@ impl PluginSettingsStore {
     /// # Errors
     ///
     /// [`ApiError::not_found`] `Unknown plugin "<id>". This build ships: async-ping,
-    /// context-compaction.`, and [`ApiError::bad_request`] for an empty patch, an unknown key, or
-    /// an out-of-bounds / mistyped value.
+    /// context-compaction, context-trimmer.`, and [`ApiError::bad_request`] for an empty patch, an
+    /// unknown key, or an out-of-bounds / mistyped value.
     pub fn update(&mut self, plugin: &str, patch: &Map<String, Value>) -> Result<(), ApiError> {
         // The plugin check comes FIRST: `requirePlugin` throws the 404 before the patch is even
         // looked at, so a wrong id with an empty body is a 404, not a 400.
-        let Some(metadata) = metadata_of(plugin) else {
+        if metadata_of(plugin).is_none() {
             let known = plugin_names().join(", ");
 
             return Err(ApiError::not_found(format!(
                 "Unknown plugin \"{plugin}\". This build ships: {}.",
                 if known.is_empty() { "none" } else { &known }
             )));
-        };
+        }
 
         if patch.is_empty() {
             return Err(ApiError::bad_request(
@@ -756,7 +1112,10 @@ impl PluginSettingsStore {
             ));
         }
 
-        let declared = metadata.settings;
+        // The EFFECTIVE list is the allowlist: the plugin's declared keys plus the reserved
+        // `enabled`, so the operator's switch works on EVERY plugin (R2) while an invented key is
+        // still a 400 that names everything accepted (`plugins.ts update`).
+        let allowed_descriptors = effective_settings_of(plugin);
 
         // Validate in SUBMISSION order (`serde_json`'s `preserve_order` keeps the client's own key
         // order, so the first refusal names the first field the operator got wrong).
@@ -764,8 +1123,9 @@ impl PluginSettingsStore {
             Vec::with_capacity(patch.len());
 
         for (key, submitted) in patch {
-            let Some(descriptor) = descriptor_of(plugin, key) else {
-                let allowed: Vec<&str> = declared.iter().map(|entry| entry.key).collect();
+            let Some(descriptor) = effective_descriptor_of(plugin, key) else {
+                let allowed: Vec<&str> =
+                    allowed_descriptors.iter().map(|entry| entry.key).collect();
 
                 return Err(ApiError::bad_request(format!(
                     "Unknown setting \"{key}\" for plugin \"{plugin}\". Allowed settings: {}.",
@@ -1043,7 +1403,7 @@ mod tests {
         );
         assert_eq!(
             store.values("context-compaction"),
-            object(json!({ "contextLimit": 100_000 })),
+            object(json!({ "contextLimit": 200_000 })),
             "the valid half did not land"
         );
         assert_eq!(store.revision(), 0, "and a refusal is not a write");
@@ -1057,7 +1417,7 @@ mod tests {
         assert_eq!(unknown.status, 404);
         assert_eq!(
             unknown.message,
-            "Unknown plugin \"retired\". This build ships: async-ping, context-compaction."
+            "Unknown plugin \"retired\". This build ships: async-ping, context-compaction, context-trimmer."
         );
     }
 
@@ -1092,8 +1452,8 @@ mod tests {
         assert_eq!(store.revision(), 2, "both writes counted");
     }
 
-    /// 8. The snapshot is CATALOGUE order with DECLARED keys, whatever order the writes arrived in -
-    ///    the property that keeps a saved document diff-stable.
+    /// 8. The snapshot is CATALOGUE order with EFFECTIVE-DESCRIPTOR keys, whatever order the writes
+    ///    arrived in - the property that keeps a saved document diff-stable.
     #[test]
     fn the_snapshot_follows_the_catalogue_not_the_submission() {
         let mut store = PluginSettingsStore::new();
@@ -1132,7 +1492,7 @@ mod tests {
         );
         assert_eq!(
             store.values("context-compaction"),
-            object(json!({ "contextLimit": 100_000 })),
+            object(json!({ "contextLimit": 200_000 })),
             "1 is below the plugin's own `min`, so the override is not restored"
         );
         assert_eq!(
@@ -1154,7 +1514,8 @@ mod tests {
     }
 
     /// 10. `values` resolves declared defaults, so an untouched deployment already answers a complete
-    ///     row - and an unknown plugin has nothing to resolve.
+    ///     row - and an unknown plugin has nothing to resolve. The maps below are byte-equal to the
+    ///     `values` member of each row in the reference capture.
     #[test]
     fn values_answer_the_declared_defaults_for_every_known_plugin() {
         let store = PluginSettingsStore::new();
@@ -1165,39 +1526,175 @@ mod tests {
         );
         assert_eq!(
             store.values("context-compaction"),
-            object(json!({ "contextLimit": 100_000 }))
+            object(json!({
+                "contextLimit": 200_000,
+                "modelLimits": "{}",
+                "enabled": true,
+                "minTokens": 200,
+                "safetyTurns": 6,
+                "mode": "summarize"
+            }))
+        );
+        assert_eq!(
+            store.values("context-trimmer"),
+            object(json!({
+                "enabled": true,
+                "dropSupersededToolCalls": true,
+                "dropInvalidToolCallsOnceAnswered": true,
+                "invalidOutcomes": "failed,rejected",
+                "dropOldThoughts": "turn",
+                "thoughtKeepUnits": 0,
+                "supersedeMatch": "name",
+                "dropDuplicateCalls": false,
+                "minTokens": 0,
+                "minThoughtChars": 0,
+                "safetyUnits": 0,
+                "maxUnits": 0
+            }))
         );
         assert!(store.values("nobody").is_empty());
 
-        // The catalogue is the two shipped built-ins, in scan order.
-        assert_eq!(plugin_names(), vec!["async-ping", "context-compaction"]);
-        assert_eq!(store.rows().len(), 2);
+        // The catalogue is the three shipped built-ins, in scan order.
+        assert_eq!(
+            plugin_names(),
+            vec!["async-ping", "context-compaction", "context-trimmer"]
+        );
         assert_eq!(
             store
                 .rows()
                 .iter()
                 .map(|row| row.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["async-ping", "context-compaction"]
+            vec!["async-ping", "context-compaction", "context-trimmer"]
         );
 
-        // Both rows state `builtin` and carry their declared descriptor beside the value.
+        // Every row states `builtin` AND `enabled`, and carries its full declared descriptor beside the
+        // value: the projection (`pluginSettingOf`) may not drop or respell a declared bound.
         for row in store.rows() {
             assert!(row.builtin);
-            assert_eq!(row.settings.len(), 1);
-            assert_eq!(row.values.len(), 1);
+            assert!(row.enabled, "an untouched deployment runs every built-in");
 
-            let setting = &row.settings[0];
-            let declared = descriptor_of(&row.name, &setting.key).expect("the key is declared");
+            let declared = settings_of(&row.name);
 
-            assert_eq!(setting.default, declared.default.to_json());
-            assert_eq!(setting.min, declared.min.map(number_to_json));
-            assert_eq!(setting.step, declared.step.map(number_to_json));
-            assert_eq!(
-                setting.max, None,
-                "neither shipped plugin declares an upper bound"
-            );
+            assert_eq!(row.settings.len(), declared.len());
+            assert_eq!(row.values.len(), declared.len());
+
+            for setting in &row.settings {
+                let entry = descriptor_of(&row.name, &setting.key).expect("the key is declared");
+
+                assert_eq!(setting.default, entry.default.to_json());
+                assert_eq!(setting.min, entry.min.map(number_to_json));
+                assert_eq!(setting.max, entry.max.map(number_to_json));
+                assert_eq!(setting.step, entry.step.map(number_to_json));
+                assert_eq!(setting.kind, entry.kind);
+                assert_eq!(setting.label, entry.label);
+                assert_eq!(setting.description, entry.description.map(str::to_owned));
+            }
         }
+    }
+
+    /// 11. The reserved `enabled` key switches EVERY plugin - including the one that never declares it
+    ///     - through the same write path, the same durable document and the same reset as a declared
+    ///     key, and never leaks into the row's `settings[]` or `values`.
+    #[test]
+    fn the_reserved_enabled_key_switches_a_plugin_that_never_declared_it() {
+        let mut store = PluginSettingsStore::new();
+
+        // async-ping declares ONE key; its effective allowlist has TWO, with the reserved one last.
+        assert_eq!(
+            effective_settings_of("async-ping")
+                .iter()
+                .map(|entry| entry.key)
+                .collect::<Vec<_>>(),
+            vec!["intervalMs", "enabled"]
+        );
+        // context-compaction declares its OWN `enabled`, so its descriptor wins - position and label
+        // included - and the framework switch and the plugin's own read are one stored value.
+        assert_eq!(
+            effective_settings_of("context-compaction")
+                .iter()
+                .map(|entry| entry.key)
+                .collect::<Vec<_>>(),
+            vec![
+                "contextLimit",
+                "modelLimits",
+                "enabled",
+                "minTokens",
+                "safetyTurns",
+                "mode"
+            ]
+        );
+        assert_eq!(
+            effective_descriptor_of("context-compaction", PLUGIN_ENABLED_KEY)
+                .expect("declared")
+                .label,
+            "Compact conversations"
+        );
+        assert_eq!(
+            effective_descriptor_of("async-ping", PLUGIN_ENABLED_KEY)
+                .expect("reserved")
+                .label,
+            RESERVED_ENABLED_DESCRIPTOR.label
+        );
+
+        // The word `"false"` is one of the two the runtime parses, so the switch writes a real boolean.
+        store
+            .update("async-ping", &object(json!({ "enabled": "false" })))
+            .expect("the reserved key is allowed on every plugin");
+
+        assert_eq!(
+            store.get("async-ping", PLUGIN_ENABLED_KEY),
+            Some(SettingValue::Flag(false))
+        );
+        assert!(!store.enabled("async-ping"));
+        assert!(!store.row_of("async-ping").expect("known").enabled);
+        assert_eq!(
+            store.snapshot(),
+            object(json!({ "async-ping": { "enabled": false } })),
+            "a switch flipped on an undeclaring plugin is still persisted"
+        );
+        assert!(
+            !store.values("async-ping").contains_key(PLUGIN_ENABLED_KEY),
+            "`values` stays declared-only (`api.ts:2362`), so the switch travels in its own row field"
+        );
+
+        // It survives a restart: the effective set is the restore allowlist too.
+        let restored = PluginSettingsStore::seeded(Some(&store.snapshot()));
+
+        assert!(!restored.enabled("async-ping"));
+        assert_eq!(restored.revision(), 0, "a boot is not a write");
+
+        // A declared default of `false` would be respected the same way - the fallback chain is
+        // stored -> declared -> `true`, and the reserved descriptor is only the THIRD link.
+        store
+            .update("context-trimmer", &object(json!({ "enabled": false })))
+            .expect("a declaring plugin takes the same write");
+
+        assert!(!store.enabled("context-trimmer"));
+
+        // `null` resets it exactly like a declared key, and the plugin disappears from the document.
+        store
+            .update("async-ping", &object(json!({ "enabled": Value::Null })))
+            .expect("a reset is accepted");
+
+        assert!(store.enabled("async-ping"));
+        assert!(
+            store.snapshot().is_empty(),
+            "the only override was `enabled`"
+        );
+
+        // An unknown plugin still answers the TOTAL `true` (the 404 is the route's decision), and an
+        // unknown key still names the EFFECTIVE set in its refusal.
+        assert!(store.enabled("retired"));
+
+        let refused = store
+            .update("async-ping", &object(json!({ "nope": 1 })))
+            .expect_err("an invented key is still a 400");
+
+        assert_eq!(
+            refused.message,
+            "Unknown setting \"nope\" for plugin \"async-ping\". Allowed settings: intervalMs, enabled."
+        );
     }
 
     fn object(value: Value) -> Map<String, Value> {

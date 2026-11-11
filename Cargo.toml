@@ -107,6 +107,23 @@ regex = "1"
 thiserror = "2"
 # Cancellation/watch channels for the turn lanes and the worker bridges.
 tokio-util = { version = "0.7", features = ["rt"] }
+# The `syntax` tool's javascript/typescript/tsx/jsx half (`tools/syntax/javascript.ts` runs a
+# V8 CLASSIC-SCRIPT parse and `typescript.ts` runs `transpileModule` with
+# `reportDiagnostics`, i.e. SYNTAX diagnostics only). The TypeScript package gets that from
+# `node:vm` plus the `typescript` compiler it already depends on; a Rust build has neither, so
+# this is the parser-only crate that answers the same verdict: `oxc_parser` parses ECMAScript,
+# TypeScript, JSX and TSX grammars and returns syntax errors, with NO transforms, NO emit, NO
+# type checking, NO linker/toolchain crates - exactly the surface the tool promises. The
+# residual is documented in `tools/syntax.rs`: parser DIAGNOSTIC TEXT differs from V8's and
+# tsc's, so the exact-error-text upgrade is the wave-3 node-sidecar bridge; the verdict
+# (parses / does not parse) and the per-dialect grammar are ported here.
+oxc_parser = "0.158.0"
+# The two support crates `oxc_parser`'s entry point needs: `Allocator` (the arena the parsed
+# AST lives in) and `SourceType` (the dialect switch - script / ts / tsx / jsx). Both are part
+# of the same parser family and pull in nothing beyond it, so this stays parser-only: no
+# transforms, no emit, no type checker, no linker.
+oxc_allocator = "0.158.0"
+oxc_span = "0.158.0"
 
 [dev-dependencies]
 # tests/ drive the hub and (later) the listener on a real runtime; `full` keeps the

@@ -32,6 +32,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -211,9 +212,15 @@ pub trait Projector: Send + Sync {
     /// (`projector.apply(event, at, index)`, `sessions.ts:7150`). `index` is the event's
     /// ordinal WITHIN the turn, because a display step's id IS that ordinal as a decimal
     /// string (`harness-api.ts:1792`).
+    /// `lane` is the display lane the RECORDER stamped on this event (`persistence::SessionTurnEvent`),
+    /// i.e. the conversation's `contextLane` at record time, read LIVE so a mid-run compaction takes
+    /// effect on the very next event (`sessions.ts:7925-7936`). `None` means lane 0
+    /// (`persistence::LaneStamp` never writes a 0), and it is the ONLY lane an event-driven segment
+    /// may take: the fold never invents one (`turn-projector.ts:1435 laneOfEvent`).
     fn apply(
         &mut self,
         event: &contract::HarnessEvent,
+        lane: Option<u64>,
         at: u64,
         index: u64,
     ) -> Vec<serde_json::Value>;
@@ -233,9 +240,80 @@ pub trait Projector: Send + Sync {
     fn settle(&mut self, status: &str, at: u64);
 }
 
+/// What the store hands a projector when it opens one turn
+/// (`createTurnProjector`'s `DisplayProjectContext`, `sessions.ts:4160-4240`).
+///
+/// WHY A SEED RATHER THAN A RECORD
+/// -------------------------------
+/// Three of the context bar's segments are NOT events, so folding the event stream alone cannot
+/// produce them, and a fold that started from the event stream alone would drop them on a restart:
+///
+///   - the ONE `system` segment, which comes from the system instructions THIS turn's agents actually
+///     ran with (`record.turnInstructionSources[turnId]`, and the segment's `callId` is
+///     `instructions-${sectionId}` — `turn-projector.ts:1556`);
+///   - the `user` segment for the turn's prompt, whose `callId` is `transcript-${messageId}` of the
+///     conversation's first user entry (`:1578`), so the block detail route can resolve it;
+///   - every `steer` segment, from the merged submit list (`syncSteerBlocks`, `:1609`), which lives in
+///     the turn's steer archive and never in the event stream.
+///
+/// All three take the lane the TURN STARTED ON (`turn.lane`, `turn-projector.ts:1441 laneOfTurn`) —
+/// the pairing that makes a turn that starts after a compaction paint its prompt and its answer on the
+/// SAME row. The seed also carries the SECTION ORDINAL, which is the prefix of every block id
+/// (`blockIdOf`, `:1407`): ids are position-independent, so a discarded attempt can never renumber a
+/// surviving segment, before or after a restart.
+///
+/// Every field is optional-or-empty by default so a scripted test projector can seed an empty fold and
+/// the store can still compile and be tested against it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectorSeed {
+    /// The task's own id, which every op and the display document are addressed by.
+    #[serde(default)]
+    pub turn_id: String,
+    /// The trimmed prompt text (`SessionTurn.prompt`).
+    #[serde(default)]
+    pub prompt: String,
+    /// The lane the turn STARTED on, already normalized so 0 is absent (`LaneStamp`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<u64>,
+    /// When the turn started, which is the `at` the two non-event segments report (`:1556`/`:1578`
+    /// stamp the record's own start, not an event time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+    /// The thread the task belongs to, and its display label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_label: Option<String>,
+    /// The agent the turn runs as, and the label the root section reports.
+    #[serde(default)]
+    pub agent: String,
+    /// The ordinal of the conversation's section (`SectionRecord.ordinal`, 0-based). It is the
+    /// `{ordinal}-` prefix of every block id and step id the fold mints.
+    #[serde(default)]
+    pub section_ordinal: u64,
+    /// The section's id, which is the `instructions-${sectionId}` call id of the `system` segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<String>,
+    /// The id of the conversation's first user transcript entry, which is the `transcript-${id}` call
+    /// id of the `user` segment. Absent for a conversation whose transcript was never readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_message_id: Option<String>,
+    /// The system instruction sources recorded for THIS turn (`turnInstructionSources[turnId]`),
+    /// verbatim JSON. Empty means "no recorded source", and the fold then emits no `system` segment.
+    #[serde(default)]
+    pub instruction_sources: Vec<serde_json::Value>,
+    /// Every accepted steered submit, merged from the audit ring and the text archive and ordered by
+    /// `at` (the fold's own merge rule, `turn-projector.ts:1609-1660`). Entries are
+    /// `{ id, at, prompt, threadId? }`.
+    #[serde(default)]
+    pub steers: Vec<serde_json::Value>,
+}
+
 /// Builds one projector per turn (`createTurnProjector`, `turn-projector.ts`). A factory is
 /// needed because the projector is per-turn state, not a shared service: the store calls
-/// `create` when a turn is opened (and again at restore, before folding).
+/// `create` when a turn is opened (and again at restore, before folding), and the seed is what
+/// lets a rebuilt fold reproduce the three non-event segments instead of dropping them.
 pub trait ProjectorFactory: Send + Sync {
-    fn create(&self) -> Box<dyn Projector>;
+    fn create(&self, seed: &ProjectorSeed) -> Box<dyn Projector>;
 }

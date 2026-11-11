@@ -544,11 +544,18 @@ async fn a_text_answer_streams_then_done_with_no_commit_boundary() {
                 HarnessMessage::User {
                     content: "What is 2 + 2?".to_owned(),
                     attachments: vec![],
+
+                    included: None,
+                    message_id: None,
                 },
                 HarnessMessage::Assistant {
                     content: "Four.".to_owned(),
                     tool_calls: vec![],
                     reasoning: None,
+
+                    included: None,
+                    reasoning_included: None,
+                    message_id: None,
                 },
             ],
             stop_reason: Some("stop".to_owned()),
@@ -824,6 +831,9 @@ async fn a_cancelled_run_reports_no_error_and_keeps_the_original_transcript() {
         transcript: vec![HarnessMessage::User {
             content: "an earlier question".to_owned(),
             attachments: vec![],
+
+            included: None,
+            message_id: None,
         }],
         ..Case::default()
     };
@@ -1098,6 +1108,9 @@ async fn an_existing_system_entry_is_never_duplicated() {
         Case {
             transcript: vec![HarnessMessage::System {
                 content: "The store's own ladder.".to_owned(),
+
+                included: None,
+                message_id: None,
             }],
             ..Case::default()
         },
@@ -1123,11 +1136,18 @@ async fn a_recorded_transcript_continues_the_conversation() {
         HarnessMessage::User {
             content: "Earlier question".to_owned(),
             attachments: vec![],
+
+            included: None,
+            message_id: None,
         },
         HarnessMessage::Assistant {
             content: "Earlier answer".to_owned(),
             tool_calls: vec![],
             reasoning: None,
+
+            included: None,
+            reasoning_included: None,
+            message_id: None,
         },
     ];
     let case = Case {
@@ -1164,6 +1184,9 @@ async fn a_recorded_transcript_continues_the_conversation() {
         HarnessMessage::User {
             content: "What is 2 + 2?".to_owned(),
             attachments: vec![],
+
+            included: None,
+            message_id: None,
         }
     );
 }

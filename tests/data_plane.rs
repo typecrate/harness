@@ -510,12 +510,18 @@ fn atomic_write_leaves_no_staging_file() {
         persistence::read_harness_agent_records(fixture.root()).expect("the overlay reads");
     assert_eq!(parsed, records);
 
-    // A TS-written BARE ARRAY still parses, so an existing database keeps loading.
+    // The writer emits the TS shape: a BARE ARRAY (`persistence.ts:1679`). An uplifter that wrote
+    // `{ version, records }` here would put the registry's file behind an envelope the TS reader does
+    // not speak, so the array is what has to be on disk.
     let text =
         std::fs::read_to_string(persistence::agent_file_path(fixture.root())).expect("readable");
-    let envelope: Value = serde_json::from_str(&text).expect("valid JSON");
-    assert_eq!(envelope["version"], json!(1));
-    assert_eq!(envelope["records"].as_array().expect("array").len(), 1);
+    let written: Value = serde_json::from_str(&text).expect("valid JSON");
+    let entries = written
+        .as_array()
+        .expect("agents.json is a bare array")
+        .clone();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], json!("research"));
 
     let from_array =
         persistence::parse_harness_agent_records(r#"[{"name":"workspace","retired":true}]"#)
@@ -540,7 +546,7 @@ fn repair_closes_running_turns_and_dangling_calls() {
             .expect("the fixture session record is valid");
 
     session.turns[0].status = "running".to_string();
-    session.turns[0].events = vec![
+    session.turns[0].events = typecrate_harness::persistence::turn_events(vec![
         call_event("call-a", "read"),
         result_event("call-a", "file text", false),
         // The call that was still executing when the process died.
@@ -559,7 +565,7 @@ fn repair_closes_running_turns_and_dangling_calls() {
             pending: Vec::new(),
             thread: None,
         },
-    ];
+    ]);
 
     let repairs = persistence::repair_interrupted_tool_calls(&mut session);
 
@@ -580,20 +586,18 @@ fn repair_closes_running_turns_and_dangling_calls() {
     );
 
     // Exactly one terminal record for `call-b`, and it is a failure with the interrupted text.
-    let for_b: Vec<&HarnessEvent> = turn
+    let for_b: Vec<&typecrate_harness::persistence::SessionTurnEvent> = turn
         .events
         .iter()
-        .filter(|event| {
-            matches!(
-                event,
-                HarnessEvent::ToolResult { call_id: Some(id), .. } if id == "call-b"
+        .filter(|entry| {
+            matches!(&entry.event, HarnessEvent::ToolResult { call_id: Some(id), .. } if id == "call-b"
             )
         })
         .collect();
 
     assert_eq!(for_b.len(), 1);
 
-    match &for_b[0] {
+    match &for_b[0].event {
         HarnessEvent::ToolResult {
             content,
             is_error,
@@ -616,20 +620,18 @@ fn repair_closes_running_turns_and_dangling_calls() {
     }
 
     // The already-answered call keeps its recorded result untouched - evidence is never trimmed.
-    let for_a: Vec<&HarnessEvent> = turn
+    let for_a: Vec<&typecrate_harness::persistence::SessionTurnEvent> = turn
         .events
         .iter()
-        .filter(|event| {
-            matches!(
-                event,
-                HarnessEvent::ToolResult { call_id: Some(id), .. } if id == "call-a"
+        .filter(|entry| {
+            matches!(&entry.event, HarnessEvent::ToolResult { call_id: Some(id), .. } if id == "call-a"
             )
         })
         .collect();
 
     assert_eq!(for_a.len(), 1);
     assert!(matches!(
-        for_a[0],
+        &for_a[0].event,
         HarnessEvent::ToolResult { content, is_error: false, .. } if content == "file text"
     ));
 
@@ -639,7 +641,7 @@ fn repair_closes_running_turns_and_dangling_calls() {
         "turn-1:interrupted-result:3"
     );
 
-    match &turn.events[3] {
+    match &turn.events[3].event {
         HarnessEvent::ToolResult {
             call_id,
             is_error,
@@ -966,7 +968,9 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
         registry.get("instruct").expect("shipped").core_tools(),
         names(&[
             "toolRequest",
-            "task",
+            // Wave 1: the manifest renamed the task-board row `task` -> `tasks`, and the shipped
+            // cards' core set names the CURRENT row (`core/tool-manifest.ts`).
+            "tasks",
             "delegate",
             "read",
             "write",
@@ -1591,6 +1595,7 @@ fn the_agent_color_map_follows_the_same_rules_as_the_other_two() {
         .expect("a legacy row")
         .clone();
     let mut saved_builtin = persistence::HarnessPresetRecord {
+        custom_agents: None,
         name: "instruct".to_string(),
         title: legacy.title.clone(),
         description: legacy.description.clone(),

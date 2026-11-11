@@ -188,11 +188,11 @@ fn the_catalogue_lists_every_group_in_the_published_order() {
 
     assert_eq!(
         rows.len(),
-        31,
-        "every LISTED runtime, preset, harness and web row: the 35 generated rows minus the four \
+        32,
+        "every LISTED runtime, preset, harness and web row: the 36 generated rows minus the four \
          the manifest marks `listed: false` (`tool-manifest.ts:1002, 1046, 1692, 1811`)"
     );
-    assert_eq!(names.len(), 31);
+    assert_eq!(names.len(), 32);
     assert_eq!(rows[0].name, "toolRegistry");
     assert_eq!(names[0], "toolRegistry");
 
@@ -257,9 +257,9 @@ fn the_catalogue_lists_every_group_in_the_published_order() {
     };
 
     assert_eq!(visibility("toolRequest"), ToolVisibility::Core);
-    assert_eq!(visibility("task"), ToolVisibility::Core);
+    assert_eq!(visibility("tasks"), ToolVisibility::Core);
     assert_eq!(visibility("read"), ToolVisibility::Core);
-    assert_eq!(visibility("fileList"), ToolVisibility::Searchable);
+    assert_eq!(visibility("files"), ToolVisibility::Searchable);
     assert_eq!(visibility("toolList"), ToolVisibility::Searchable);
 
     // Tags come from the same table the TS runtime registers.
@@ -302,7 +302,7 @@ fn the_identified_read_carries_the_schema_and_the_execution_gate() {
         json!("global")
     );
 
-    let task = runtime.detail("task").expect("a catalogued row");
+    let task = runtime.detail("tasks").expect("a catalogued row");
 
     assert_eq!(
         serde_json::to_value(task.execution.scope).expect("the scope spelling"),
@@ -347,6 +347,9 @@ fn a_keyless_host_reports_search_unconfigured_and_never_leaks_a_credential() {
             exa: Some("super-secret".to_owned()),
             tavily: None,
             linkup: None,
+            // The published provider endpoints; only the key's effect on availability is under
+            // test here.
+            endpoint_base: None,
         },
         fetch_enabled: false,
     });
@@ -405,7 +408,7 @@ fn declarations_are_catalogue_ordered_and_follow_the_policy() {
     assert!(names.contains(&"shell"), "enabled");
     assert!(names.contains(&"read"), "declared");
     assert!(names.contains(&"toolRequest"), "always declared");
-    assert!(names.contains(&"task"), "always declared");
+    assert!(names.contains(&"tasks"), "always declared");
     // T7b: `delegate` is catalogued-only in this build (no nested-run runtime), so a subagent
     // roster no longer buys the model a tool whose call can only fail. The same rule covers every
     // name in `MISSING_CAPABILITY` - including one the model ENABLED, which is the case that used
@@ -419,12 +422,12 @@ fn declarations_are_catalogue_ordered_and_follow_the_policy() {
         "a created tool is appended by the store"
     );
     assert!(
-        !names.contains(&"fileList"),
+        !names.contains(&"files"),
         "searchable waits for toolRequest"
     );
 
     let enabled_but_unexecutable = ToolPolicy {
-        enabled: vec!["profileManage".to_owned(), "threadRead".to_owned()],
+        enabled: vec!["profiles".to_owned(), "threadRead".to_owned()],
         ..ToolPolicy::default()
     };
     let offered = runtime.declarations(&enabled_but_unexecutable);
@@ -432,7 +435,7 @@ fn declarations_are_catalogue_ordered_and_follow_the_policy() {
     assert!(
         !offered
             .iter()
-            .any(|decl| decl.name == "profileManage" || decl.name == "threadRead"),
+            .any(|decl| decl.name == "profiles" || decl.name == "threadRead"),
         "an enabled tool this build cannot execute is offered to neither the model nor toolRequest"
     );
     assert!(
@@ -752,7 +755,7 @@ async fn file_list_pages_prefixes_and_marks_directories() {
 
     let outcome = call(
         &runtime,
-        "fileList",
+        "files",
         json!({ "paths": ["src", "."] }),
         &fixture.directory,
     )
@@ -777,7 +780,7 @@ async fn file_list_pages_prefixes_and_marks_directories() {
 
     let paged = call(
         &runtime,
-        "fileList",
+        "files",
         json!({ "paths": ["src"], "limit": 1, "offset": 1 }),
         &fixture.directory,
     )
@@ -790,7 +793,7 @@ async fn file_list_pages_prefixes_and_marks_directories() {
 
     let missing = call(
         &runtime,
-        "fileList",
+        "files",
         json!({ "paths": ["gone"] }),
         &fixture.directory,
     )
@@ -1140,12 +1143,18 @@ async fn paths_resolve_against_the_cwd_and_reject_nul() {
 }
 
 #[tokio::test]
-async fn an_oversized_result_becomes_the_named_budget_envelope() {
+async fn an_oversized_read_is_bounded_by_the_tool_not_by_the_result_envelope() {
     let runtime = registry();
     let fixture = Fixture::new("result-budget");
 
-    // One line per 2 KiB, 200 lines: `read` caps its own content at 64 KiB, so the serialized
-    // document lands just over the 65 536-byte model budget and the envelope must fire.
+    // One line per 2 KiB, 200 lines: `read` caps its OWN content at 64 KiB and says so with
+    // `truncated`, so the document arrives at ~65 KiB — inside the 256 KiB model-facing tool
+    // budget (`contract::MODEL_TOOL_RESULT_BUDGET_BYTES`, the reference's
+    // `core/result-budget.ts MODEL_TOOL_RESULT_BUDGET_BYTES`). The registry therefore hands
+    // back the read document whole. The named budget envelope is a DELIVERY-layer rule
+    // (`result::bound_tool_result`, unit-tested in `src/tools/result.rs`), and double-capping
+    // here would replace that document with the envelope and drop the paging keys a model
+    // needs to resume — which is the failure this pin exists to prevent.
     let text = (0..200)
         .map(|line| format!("{:0<2047}\n", format!("line {line}")))
         .collect::<String>();
@@ -1159,21 +1168,27 @@ async fn an_oversized_result_becomes_the_named_budget_envelope() {
         &fixture.directory,
     )
     .await;
-    let envelope: Value = serde_json::from_str(&outcome.content).expect("the envelope is JSON");
+    let document: Value =
+        serde_json::from_str(&outcome.content).expect("the read document is JSON");
 
-    assert!(outcome.ok);
-    assert_eq!(envelope["truncated"], json!(true));
-    assert_eq!(envelope["budgetBytes"], json!(65_536));
-    assert!(envelope["originalBytes"].as_u64().expect("a count") > 65_536);
-    assert!(
-        envelope["content"]
-            .as_str()
-            .expect("a prefix")
-            .starts_with('{')
+    assert!(outcome.ok, "{}", outcome.error.unwrap_or_default());
+    assert_eq!(
+        document["truncated"],
+        json!(true),
+        "the tool reports its own cut"
     );
     assert!(
-        result::utf8_byte_length(&outcome.content) <= 65_536,
-        "the wire text never exceeds the budget"
+        document["files"].is_array(),
+        "the read document survives intact"
+    );
+    assert!(
+        document.get("budgetBytes").is_none(),
+        "no envelope was substituted here"
+    );
+    assert!(document.get("originalBytes").is_none());
+    assert!(
+        result::utf8_byte_length(&outcome.content) <= 400_000,
+        "the tool's own cap keeps the document well inside the model budget"
     );
 }
 
@@ -1232,7 +1247,8 @@ async fn shell_captures_exit_stdout_stderr_and_the_timeout_flags() {
     assert!(!empty.ok);
     assert_eq!(
         empty.error.as_deref(),
-        Some("Tool \"shell\" failed: shell command must not be empty.")
+        // `shell.tool.ts:196` — the reference sentence, not the older local one.
+        Some("Tool \"shell\" failed: shell requires a non-empty command string.")
     );
     assert_eq!(empty.duration_ms, 0);
 }
@@ -1524,12 +1540,12 @@ async fn tool_list_and_tool_request_answer_from_the_catalogue_and_the_policy() {
     );
     assert!(names.contains(&"read"));
     assert!(names.contains(&"shell"));
-    assert!(names.contains(&"task"));
+    assert!(names.contains(&"tasks"));
 
     let requested = call(
         &runtime,
         "toolRequest",
-        json!({ "names": ["fileList"], "tags": ["git", "diff"], "regex": "^shell$" }),
+        json!({ "names": ["files"], "tags": ["git", "diff"], "regex": "^shell$" }),
         &fixture.directory,
     )
     .await;
@@ -1543,14 +1559,14 @@ async fn tool_list_and_tool_request_answer_from_the_catalogue_and_the_policy() {
 
     // Ranked by each row's STRONGEST criterion (`discovery.ts:373-378`): the exact requested
     // name first (in the caller's own order), then the regex hit, then the tag-only match.
-    assert_eq!(tools, vec!["fileList", "shell", "gitDiff"]);
+    assert_eq!(tools, vec!["files", "shell", "gitDiff"]);
     assert_eq!(document["matched"], json!(3));
     assert_eq!(document["remaining"], json!(0));
     assert!(
         document["enabled"]
             .as_array()
             .expect("an array")
-            .contains(&json!("fileList"))
+            .contains(&json!("files"))
     );
     assert!(
         document["availableTags"]
@@ -1605,7 +1621,7 @@ async fn task_passes_through_the_host_and_action_request_answers_with_the_choice
 
     let task = call_with_task(
         &runtime,
-        "task",
+        "tasks",
         json!({ "tasks": [{ "text": "ship T4" }] }),
         &fixture.directory,
         std::sync::Arc::new(EchoTaskHost),
@@ -1620,17 +1636,17 @@ async fn task_passes_through_the_host_and_action_request_answers_with_the_choice
         "the host's own JSON is the result content"
     );
 
-    let no_host = call(&runtime, "task", json!({}), &fixture.directory).await;
+    let no_host = call(&runtime, "tasks", json!({}), &fixture.directory).await;
 
     assert!(!no_host.ok);
     assert_eq!(
         no_host.error.as_deref(),
-        Some("Tool \"task\" failed: task needs this session's task board, and this run has none.")
+        Some("Tool \"tasks\" failed: task needs this session's task board, and this run has none.")
     );
 
     let refused = call_with_task(
         &runtime,
-        "task",
+        "tasks",
         json!({}),
         &fixture.directory,
         std::sync::Arc::new(RefusingTaskHost),
@@ -1640,7 +1656,7 @@ async fn task_passes_through_the_host_and_action_request_answers_with_the_choice
     assert!(!refused.ok);
     assert_eq!(
         refused.content,
-        "Tool \"task\" failed: the task board is full"
+        "Tool \"tasks\" failed: the task board is full"
     );
     // A call that EXECUTED and failed states the same text in `error` as in `content`, and it
     // carries no panels or media - the shape the turn engine turns into `isError: true`.
@@ -1702,9 +1718,9 @@ async fn a_catalogued_only_tool_fails_well_formed_and_never_panics() {
         "toolRegistry",
         "toolManage",
         "toolCreate",
-        "profileManage",
-        "chapterManage",
-        "locationManage",
+        "profiles",
+        "chapters",
+        "locations",
         "agentManage",
         "agentResult",
         "delegate",

@@ -87,20 +87,34 @@ pub const MAX_STEER_RECORDS: usize = 64;
 pub const MAX_CREATED_TOOLS: usize = 32;
 /// Model-facing tool-result text budget (`tool_result_bytes`, `core/result-budget.ts`).
 ///
-/// THIS BUILD's enforced window, not the published one. The uplift moved the budget to
-/// 256 KiB (`core/result-budget.ts:54 MODEL_TOOL_RESULT_BUDGET_BYTES = 256 * 1024`), and
-/// `harness-api.ts:216` / `harness.swagger.yaml:243` publish the same `262144` in the boot
-/// document. The tool stage here still cuts one model-facing result at 64 KiB, because the
-/// tool implementations and their suite (`tests/tools.rs`) are written against that window and
-/// widening it is a behaviour change of THAT stage, not of this contract. The boot document
-/// therefore advertises [`PUBLISHED_TOOL_RESULT_BYTES`] while enforcement keeps this number;
-/// `knowledge.md` "T10 plugin uplift" records the split so the next agent sees the gap.
-pub const MODEL_TOOL_RESULT_BUDGET_BYTES: usize = 65_536;
+/// THE PUBLISHED FIGURE, and the enforced one: `core/result-budget.ts:54` sets
+/// `MODEL_TOOL_RESULT_BUDGET_BYTES = 256 * 1024`, and `harness-api.ts:216` /
+/// `harness.swagger.yaml:243` publish the same `262144` in the boot document, so the two
+/// TypeScript sources agree and this build now enforces what it advertises. The number was
+/// 64 KiB here while the document said 256 KiB (documented deviation 17), and the reason TS
+/// raised it is the reason the gap had to close: "`read` budgets its own output at the same
+/// order of magnitude, and the two numbers MUST agree" — with both at 64 KiB a read that
+/// exactly filled its content budget was ALWAYS over the wire cap (JSON escaping adds 2-15%),
+/// so the harness cut the result mid-string and replaced the whole object with its envelope,
+/// destroying the `nextLine`/`nextColumn` fields an agent needs to continue
+/// (`core/result-budget.ts:66-76`).
+pub const MODEL_TOOL_RESULT_BUDGET_BYTES: usize = 256 * 1024;
 
 /// The `tool_result_bytes` figure the boot document publishes (`harness-api.ts:216`,
-/// `harness.swagger.yaml:243`). Named as a constant so the ONE place this build advertises a
-/// budget a different stage enforces more tightly is greppable rather than a bare literal.
-pub const PUBLISHED_TOOL_RESULT_BYTES: u64 = 262_144;
+/// `harness.swagger.yaml:243`). Derived from the ENFORCED budget so the advertised figure and
+/// the enforced one can never drift apart again — which is exactly how deviation 17 got away.
+pub const PUBLISHED_TOOL_RESULT_BYTES: u64 = MODEL_TOOL_RESULT_BUDGET_BYTES as u64;
+
+/// The aggregate sibling of the cap above: the most TOTAL tool-result text ONE turn may
+/// commit, summed over every call the model asked for in one assistant message
+/// (`core/result-budget.ts:94` `MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES`, enforced by
+/// `createToolResultTurnBudget` / [`crate::tools::result::ToolResultTurnBudget`]).
+///
+/// It is 2x the per-result cap ON PURPOSE: one full-budget `read` (256 KiB) plus one more
+/// large result still fit UNCHANGED — the case the 256 KiB number was raised for — while a
+/// turn that fires eight big reads and a build-log dump can no longer spend 2 MiB of the
+/// window in one round (`core/result-budget.ts:78-87`).
+pub const MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES: usize = 512 * 1024;
 
 /// The `service` identity the root document advertises. TS sends the literal
 /// `'noobscript-harness'` (`api.ts:1307`) and the published contract documents that value,
@@ -620,24 +634,94 @@ pub struct AgentResultReference {
     pub label: String,
 }
 
-/// One transcript entry (`types/index.ts:116`), discriminated by `role`. The provider
+/// One transcript entry (`types/index.ts:181-303`), discriminated by `role`. The provider
 /// wire mapping happens in the transport; this is the shape the transcript routes page.
+///
+/// THE THREE CONTEXT KEYS every variant now carries, and the exact rule each one follows
+/// (all three are TS-persisted, none of them is a provider field - the transport
+/// field-selects per role, `transport/openai.ts wireMessage`):
+///
+/// * `included` (`types/index.ts:117-139`, present on ALL four roles) - a persisted,
+///   default-true flag that decides whether the entry reaches the MODEL, never whether it
+///   stays in the transcript. Absent means included; the literal `false` is the ONLY stored
+///   value; re-enabling DELETES the key, so `included: true` is never written anywhere
+///   (`api.ts:925-949 messagesWithUnitInclusion`, mirrored from `harness.ts writeIncluded`).
+/// * `reasoningIncluded` (assistant variant only, `types/index.ts:213-236`) - the second
+///   axis. Same storage rule as `included`, but it does not exclude the entry: the entry
+///   travels and the projection OMITS `reasoning` from its request copy
+///   (`core/agent.ts:245-253 withoutWithheldReasoning`, `api.ts:899-923
+///   messagesWithReasoningInclusion`). There is deliberately no key on the other roles,
+///   because `reasoning` exists only beside it; the snapshot reader's assistant whitelist
+///   is the only place that admits it (`core/snapshot.ts:420-430`).
+/// * `messageId` (`types/index.ts:161-180`, all four roles) - the stable transcript address
+///   of THIS turn. Minted once where a canonical message is created, copied verbatim by
+///   every copy path, and stripped from every REQUEST projection copy
+///   (`core/agent.ts:203-230 withIncluded` always drops the key, keeping the `false` flags),
+///   while the host read surfaces (transcript routes, `threadMessages()`, `snapshot()`) DO
+///   report it. Modeled here as a plain `Option<String>` that is emitted when present: the
+///   mint/backfill rule (`core/snapshot.ts:300-332`) belongs to the store, not to this type.
+///
+/// HOW THE ONLY-`false`-IS-VISIBLE RULE IS ENFORCED (the three keys above are the only
+/// fields with it, so it lives in the field attributes rather than in a hand-written impl):
+/// `deserialize_with = "read_context_flag"` accepts a literal boolean and normalizes
+/// `true` to the absent form - TS accepts a submitted `true` at every whole-message entry
+/// point and silently normalizes it (types/index.ts:150-159 "HOST HYGIENE",
+/// `core/snapshot.ts:225-265 applyIncluded`/`applyReasoningIncluded`), and refuses any
+/// non-boolean, `null` included, exactly like TS's `readSnapshotBoolean`.
+/// `skip_serializing_if = "context_flag_absent"` then emits the key ONLY for
+/// `Some(false)`, so a `true` a Rust caller sets by hand can never reach a document either
+/// (TS's writers `delete copy.included` instead, `api.ts:919-920` and `:944-945`).
+///
+/// * `outcome` (tool variant only, `types/index.ts:276-298`, compaction T1.4) - WHY the call
+///   ended, persisted so the classification survives a restart, a snapshot, a fork and a
+///   `threadRead` instead of living only on the live `tool_result` event. Same minimal-delta
+///   storage family as the two flags: **only a NON-`completed` outcome is ever stored**, absent
+///   reads as `completed`, and nothing re-derives an outcome from the failure prose
+///   (`core/tool-outcome.ts` rules 1-3: `storedOutcomeEntry` / `toolOutcomeOf` /
+///   `toolResultIsError`, the last of which is why `isError` stays DERIVED and is never stored
+///   beside it). NOT model-facing: the transport field-selects the tool wire shape
+///   (`transport/openai.ts`, mirrored by `transport.rs:1046-1064`), so a provider payload is
+///   byte-identical with or without the key.
+///
+/// KEY ORDER is the declaration order below, and the internal `role` tag prints first;
+/// each variant lists its fields in the exact order the TS union declares them, so a
+/// round-trip of a TS-shaped document is byte-for-byte identical. The tool variant declares
+/// `outcome` BEFORE `included` exactly as `types/index.ts:293-298` does.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum HarnessMessage {
     /// A system message: one entry per recorded instruction.
     #[serde(rename_all = "camelCase")]
-    System { content: String },
+    System {
+        content: String,
+        /// Withholds this entry from the model request; only `Some(false)` is stored.
+        #[serde(
+            default,
+            deserialize_with = "read_context_flag",
+            skip_serializing_if = "context_flag_absent"
+        )]
+        included: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
     /// A user message; `attachments` is omitted for a text-only entry so every pre-attachment
-    /// transcript keeps its exact old shape (`:121-128`).
+    /// transcript keeps its exact old shape (`:186-193`).
     #[serde(rename_all = "camelCase")]
     User {
         content: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<HarnessAttachment>,
+        #[serde(
+            default,
+            deserialize_with = "read_context_flag",
+            skip_serializing_if = "context_flag_absent"
+        )]
+        included: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
     /// An assistant entry: `tool_calls` only when the turn requested tools, `reasoning`
-    /// kept out of the wire payload but retained so a UI can replay a turn (`:130-137`).
+    /// kept out of the wire payload but retained so a UI can replay a turn (`:202-242`).
     #[serde(rename_all = "camelCase")]
     Assistant {
         content: String,
@@ -645,9 +729,29 @@ pub enum HarnessMessage {
         tool_calls: Vec<HarnessToolCall>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning: Option<String>,
+        #[serde(
+            default,
+            deserialize_with = "read_context_flag",
+            skip_serializing_if = "context_flag_absent"
+        )]
+        included: Option<bool>,
+        /// THE SECOND AXIS, and the one field this variant owns that no other role may
+        /// carry. Serde's internally-tagged reader IGNORES an unknown key on another
+        /// variant (this crate has no `deny_unknown_fields` - see the module header), so
+        /// the "a `reasoningIncluded` on a non-assistant entry is refused, not quietly
+        /// dropped" rule of `core/snapshot.ts:252-254`/`:420-430` is a HANDLER-level check,
+        /// where every other TS refusal sentence lives (`api.ts:504-510`).
+        #[serde(
+            default,
+            deserialize_with = "read_context_flag",
+            skip_serializing_if = "context_flag_absent"
+        )]
+        reasoning_included: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
     /// A tool result; `attachments` are out-of-band media (`toolMedia()`), flushed by the
-    /// transport as a labelled user-role message AFTER the tool block (`:143-160`).
+    /// transport as a labelled user-role message AFTER the tool block (`:243-303`).
     #[serde(rename_all = "camelCase")]
     Tool {
         content: String,
@@ -655,7 +759,189 @@ pub enum HarnessMessage {
         name: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<HarnessAttachment>,
+        /// WHY this call ended, in the storage form `core/tool-outcome.ts` rule 1 states:
+        /// `completed` (and "never classified") has NO stored form, so the three non-healthy
+        /// values are the only ones a document ever shows, and ABSENT reads as `completed`
+        /// (`types/index.ts:276-298`). Placed BEFORE `included` because the TS union declares it
+        /// there (`:293`), which keeps a TS-written entry round-tripping in TS's key order.
+        #[serde(
+            default,
+            deserialize_with = "read_stored_outcome",
+            skip_serializing_if = "stored_outcome_absent"
+        )]
+        outcome: Option<HarnessToolOutcome>,
+        /// A UNIT member: `false` here withholds the whole tool-call block, the assistant
+        /// entry that asked for it included (`types/index.ts:135-139`, `:294-298`).
+        #[serde(
+            default,
+            deserialize_with = "read_context_flag",
+            skip_serializing_if = "context_flag_absent"
+        )]
+        included: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
+}
+
+impl HarnessMessage {
+    /// Whether this entry is withheld from the model request: the literal `false` is the
+    /// only excluding value, absent means included (`types/index.ts:127-128`).
+    #[must_use]
+    pub fn is_withheld(&self) -> bool {
+        self.included_flag() == Some(&false)
+    }
+
+    /// Whether this entry's THINKING is withheld from the model request. Non-assistant
+    /// entries have no thinking to withhold, so their answer is always `false`
+    /// (`core/agent.ts:210-211`).
+    #[must_use]
+    pub fn is_reasoning_withheld(&self) -> bool {
+        self.reasoning_included_flag() == Some(&false)
+    }
+
+    /// The stored `included` flag of whichever variant this is (`None` = included).
+    #[must_use]
+    pub fn included_flag(&self) -> Option<&bool> {
+        match self {
+            Self::System { included, .. }
+            | Self::User { included, .. }
+            | Self::Assistant { included, .. }
+            | Self::Tool { included, .. } => included.as_ref(),
+        }
+    }
+
+    /// The stored `reasoningIncluded` flag; only the assistant variant has one, so every
+    /// other role reports `None` rather than a phantom `true`.
+    #[must_use]
+    pub fn reasoning_included_flag(&self) -> Option<&bool> {
+        match self {
+            Self::Assistant {
+                reasoning_included, ..
+            } => reasoning_included.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The stable transcript address of this entry, when it carries one.
+    #[must_use]
+    pub fn message_id(&self) -> Option<&str> {
+        match self {
+            Self::System { message_id, .. }
+            | Self::User { message_id, .. }
+            | Self::Assistant { message_id, .. }
+            | Self::Tool { message_id, .. } => message_id.as_deref(),
+        }
+    }
+
+    /// The stored `outcome` of a tool entry (`None` for every other role, and for a tool entry
+    /// whose outcome is the unwritten `completed` form).
+    #[must_use]
+    pub fn outcome_flag(&self) -> Option<&HarnessToolOutcome> {
+        match self {
+            Self::Tool { outcome, .. } => outcome.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// READ rule 2 of `core/tool-outcome.ts`: absent means `completed`. This is the ONLY reading
+    /// that keeps every pre-outcome transcript valid, and it is a deliberate migration decision
+    /// rather than a bridge - nothing here re-derives an outcome from the failure prose, which is
+    /// why a pruning policy must additionally require a superseding later success
+    /// (`types/index.ts:276-291`).
+    #[must_use]
+    pub fn stored_outcome(&self) -> HarnessToolOutcome {
+        self.outcome_flag()
+            .copied()
+            .unwrap_or(HarnessToolOutcome::Completed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The only-`false`-is-visible boundary for a TS context flag
+// (`types/index.ts:117-148`, `core/snapshot.ts:225-265`, `api.ts:899-949`)
+// ---------------------------------------------------------------------------
+
+/// `skip_serializing_if` for `included` / `reasoningIncluded`: the key is written ONLY for
+/// `Some(false)`. `None` is "included" and must stay unwritten so a pre-flag transcript
+/// keeps its exact old shape; `Some(true)` is a value the runtime never stores - a host
+/// that wants a turn back DELETES the key (`api.ts:919-920`, `:944-945`) - so it is omitted
+/// here too, which keeps `restore -> snapshot` idempotent (`core/snapshot.ts:226-228`).
+fn context_flag_absent(flag: &Option<bool>) -> bool {
+    *flag != Some(false)
+}
+
+/// `deserialize_with` for the same two fields: read a literal boolean and normalize `true`
+/// to the absent form (`core/snapshot.ts:237-239` and `:262-264` both compare `=== false`
+/// and write nothing otherwise, and `core/agent.ts:213-222` strips a `true` key from every
+/// copy). Anything that is not a literal boolean is REFUSED, `null` included, matching TS's
+/// `readSnapshotBoolean`; an absent key never reaches this function at all, because the
+/// fields carry `#[serde(default)]`.
+fn read_context_flag<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // `bool::deserialize` goes through `deserialize_bool`, so a string, a number, an object
+    // or a `null` all fail with serde's own "invalid type" wording instead of silently
+    // reading as included - the only divergence from TS is the WORDING, which no route
+    // prints today because the transcript body is still an untyped `Value`
+    // (`api/transcript.rs` module header) until the wave that validates it lands.
+    let value = bool::deserialize(deserializer)?;
+
+    // `true` is accepted and normalized away; `false` is the only value with a stored form.
+    Ok(if value { None } else { Some(false) })
+}
+
+/// WRITE rule 1 of `core/tool-outcome.ts` (`storedOutcomeEntry`): the spread a message literal
+/// wants, where `completed` and "never classified" BOTH mean no key at all. That is what keeps
+/// every pre-outcome transcript, snapshot and fixture byte-identical, and it is the form every
+/// writer here uses so the omission decision cannot be spelled three ways
+/// (`types/index.ts:276-291`).
+#[must_use]
+pub fn stored_outcome_entry(outcome: HarnessToolOutcome) -> Option<HarnessToolOutcome> {
+    match outcome {
+        HarnessToolOutcome::Completed => None,
+        other => Some(other),
+    }
+}
+
+/// `skip_serializing_if` for the tool `outcome` key: a hand-set `Some(completed)` is dropped on
+/// the way out too, so `restore -> snapshot` stays idempotent (`core/snapshot.ts:294-297`
+/// normalizes the same value away on the way in).
+fn stored_outcome_absent(outcome: &Option<HarnessToolOutcome>) -> bool {
+    !matches!(
+        outcome,
+        Some(
+            HarnessToolOutcome::Failed
+                | HarnessToolOutcome::Rejected
+                | HarnessToolOutcome::Cancelled
+        )
+    )
+}
+
+/// `deserialize_with` for the same field: read one declared value and normalize `completed` to
+/// the absent form (`core/snapshot.ts:281-298 applyOutcome`). Anything the union does not admit
+/// is REFUSED rather than read as `completed`, because a mistyped outcome must not hide a
+/// failure (`core/tool-outcome.ts isToolOutcome`); the refusal sentence is TS's own.
+fn read_stored_outcome<'de, D>(deserializer: D) -> Result<Option<HarnessToolOutcome>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let text = String::deserialize(deserializer)?;
+
+    let outcome = match text.as_str() {
+        // `completed` is stored as nothing at all, so it reads as the absent form.
+        "completed" => return Ok(None),
+        "failed" => HarnessToolOutcome::Failed,
+        "rejected" => HarnessToolOutcome::Rejected,
+        "cancelled" => HarnessToolOutcome::Cancelled,
+        other => {
+            return Err(serde::de::Error::custom(format!(
+                "outcome must be one of: completed, failed, rejected, cancelled (or be omitted); received \"{other}\"."
+            )));
+        }
+    };
+
+    Ok(Some(outcome))
 }
 
 /// A finished assistant turn (`types/index.ts:165`): the payload of the `done` event and
@@ -1566,7 +1852,7 @@ impl ToolCallResult {
 // Built-in plugin catalogue (`GET {root}/plugins`, `PATCH {root}/plugins/{plugin_id}`)
 // ---------------------------------------------------------------------------
 
-/// The declared type of one plugin setting (`harness-api.ts:650 PluginSetting.type`).
+/// The declared type of one plugin setting (`harness-api.ts:667 PluginSetting.type`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PluginSettingType {
@@ -1576,7 +1862,7 @@ pub enum PluginSettingType {
 }
 
 /// One DECLARED setting of a plugin, copied verbatim from the plugin's own metadata
-/// (`harness-api.ts:649`). `default` is the value the plugin falls back to when nothing is
+/// (`harness-api.ts:664`). `default` is the value the plugin falls back to when nothing is
 /// stored AND the target a `null` patch entry restores. `min`/`max` bound what the server
 /// accepts; `step` bounds only what a client offers and is deliberately NOT enforced
 /// (`server/plugins.ts` header, "VALIDATION AT THE WRITE EDGE").
@@ -1604,13 +1890,19 @@ pub struct PluginSetting {
     pub description: Option<String>,
 }
 
-/// One built-in plugin as an operator sees it (`harness-api.ts:663`): identity, the lifecycle
+/// One built-in plugin as an operator sees it (`harness-api.ts:682`): identity, the lifecycle
 /// hooks it declares, its settings descriptors, and the values in force RIGHT NOW.
 ///
 /// `builtin` is always `true` on this route - the catalogue is the set this build ships - and it
 /// stays explicit on the wire so a client renders one row shape for a plugin a future release
 /// makes configurable. The optional members are ABSENT, never `null`: a plugin that declares no
 /// description, version, tags or hooks omits those keys (`api.ts pluginRowOf`'s presence filters).
+///
+/// `enabled` is the framework's global switch (`api.ts:2360 plugins.enabled(name)`, the reserved
+/// `enabled` settings key - `server/plugins.ts PLUGIN_ENABLED_KEY`). It is REQUIRED, not optional:
+/// every plugin has one whether or not it declares the setting, and the row reads the same stored
+/// value the hook gate consults, so a row that says `false` means that plugin runs no hooks in ANY
+/// session right now.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct PluginSummary {
@@ -1625,13 +1917,17 @@ pub struct PluginSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<Vec<String>>,
     pub builtin: bool,
+    /// Whether the plugin RUNS right now: the stored `enabled` override, otherwise its declared
+    /// `enabled` default, otherwise `true` (`server/plugins.ts` `enabled()` - the same read the
+    /// hook gate makes). Required by the contract (`harness-api.ts:690`), never absent.
+    pub enabled: bool,
     pub settings: Vec<PluginSetting>,
     /// The EFFECTIVE map (`declared default` unless the operator stored an override), in the
-    /// plugin's own DECLARED key order (`api.ts:1963 plugins.values(metadata.name)`).
+    /// plugin's own DECLARED key order (`api.ts:2362 plugins.values(metadata.name)`).
     pub values: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Page of built-in plugin rows (`harness-api.ts:681`). Modeled as a flat struct that FLATTENS
+/// Page of built-in plugin rows (`harness-api.ts:698`). Modeled as a flat struct that FLATTENS
 /// `PageMeta` exactly like `HarnessCardPage`, so the five page members keep their contract names.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PluginSummaryPage {
@@ -1640,7 +1936,7 @@ pub struct PluginSummaryPage {
     pub items: Vec<PluginSummary>,
 }
 
-/// Envelope of one plugin row, read or patched (`harness-api.ts:693`). A patch returns the WHOLE
+/// Envelope of one plugin row, read or patched (`harness-api.ts:708`). A patch returns the WHOLE
 /// row rather than a receipt, because the values it reports ARE the result of the write and an
 /// editor needs the reset targets beside them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1649,7 +1945,7 @@ pub struct PluginDetailResponse {
     pub plugin: PluginSummary,
 }
 
-/// Settings patch for one plugin (`harness-api.ts:706`). A value REPLACES that key's override, an
+/// Settings patch for one plugin (`harness-api.ts:721`). A value REPLACES that key's override, an
 /// explicit `null` clears it (the declared default applies again), and an omitted key is no
 /// change. Unknown keys are refused rather than ignored, and there is no enable/disable field:
 /// plugin loading is auto-scanned, so no HTTP affordance exists for it.
@@ -2558,7 +2854,12 @@ pub struct TurnEventRow {
     pub index: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<u64>,
-    pub event: HarnessEvent,
+    /// The stored record, VERBATIM — including the display-lane stamp the recorder put inside it
+    /// (`persistence::SessionTurnEvent`). TS copies the same value here
+    /// (`api-reads.ts:484-490`), and the spec's `HarnessEvent` object is OPEN, so the extra key is
+    /// contract-valid; dropping it on the read path would make a reload draw the context bar with
+    /// every segment on row 0.
+    pub event: crate::persistence::SessionTurnEvent,
 }
 
 /// The same pairing on the step-detail route (`harness-api.ts:1924`).
@@ -2730,6 +3031,23 @@ pub struct ContextBlock {
     pub id: String,
     pub turn_id: String,
     pub section_id: String,
+    /// DISPLAY LANE (`harness.swagger.yaml:8122`, `integer` + `minimum: 0`): which stacked row of the
+    /// context bar this segment belongs to. Pure UI metadata, never model-facing, and `None` IS lane 0 —
+    /// the spec's "absent means lane 0" reading, spelled in Rust as an `Option` so a decoder can tell
+    /// "the producer said nothing" from "the producer said 1" without inventing a number.
+    ///
+    /// It is minted by the `context:add` that creates the block and immutable afterwards, so it is NOT a
+    /// key of the block-patch shape: the fold's `context:set` path builds its patch as a JSON map of the
+    /// mutable fields only (`projector.rs:1448-1471`), which is why no patch here can carry a lane.
+    ///
+    /// The writer is the fold's ONE `context:add` mint point (`projector::add_block`, `:961-980`), which
+    /// stamps through [`crate::projector`]'s `with_lane` (`:450-463`): the key goes in LAST and only for a
+    /// non-zero lane, and the value is the lane of the event that opened the segment — or the TURN's
+    /// starting lane for a segment that is not an event, which the fold swaps in around the same call
+    /// (`add_block_with_lane`, `:587-598`). That suppression is what keeps a session that never compacted
+    /// byte-identical to the document this crate wrote before lanes existed (`persistence::LaneStamp`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2833,7 +3151,7 @@ pub const HARNESS_WS_SCOPES: [&str; 4] = ["global", "session", "thread", "turn"]
 
 /// Every resource kind that owns a revision counter (`harness-stream.ts:53`). Order is the
 /// contract's, so a baseline iteration matches the TS one.
-pub const HARNESS_STREAM_RESOURCE_KINDS: [&str; 20] = [
+pub const HARNESS_STREAM_RESOURCE_KINDS: [&str; 21] = [
     "session",
     "definition",
     "turns",
@@ -2854,6 +3172,8 @@ pub const HARNESS_STREAM_RESOURCE_KINDS: [&str; 20] = [
     "tools",
     "config",
     "commands",
+    // Wave 1: the record-store surface owns a counter, so it participates in the baseline.
+    "records",
 ];
 
 /// Frame tags a client may send (`harness-stream.ts:56`).
@@ -2872,7 +3192,7 @@ pub const HARNESS_WS_SERVER_MESSAGE_TYPES: [&str; 7] = [
 ];
 
 /// Update kinds inside `update` frames (`harness-stream.ts:62`).
-pub const HARNESS_WS_UPDATE_KINDS: [&str; 15] = [
+pub const HARNESS_WS_UPDATE_KINDS: [&str; 16] = [
     "session.updated",
     "turn.upsert",
     "turn.removed",
@@ -2883,6 +3203,8 @@ pub const HARNESS_WS_UPDATE_KINDS: [&str; 15] = [
     "thread.upsert",
     "thread.removed",
     "transcript.updated",
+    // Wave 1: a record-store mutation; ordering matches `harness-stream.ts:62`.
+    "records.updated",
     "tool.registry_updated",
     "agent.registry_updated",
     "run.event",
@@ -2949,7 +3271,8 @@ pub fn ws_stream_limits() -> WsStreamLimits {
         send_queue_bytes: 1_048_576,
         sustained_stall_ms: 10_000,
         ack_timeout_ms: 5_000,
-        revision_records_per_state: 20,
+        // 20 kinds plus `records` (`harness-stream.ts:28`).
+        revision_records_per_state: 21,
     }
 }
 
@@ -3176,4 +3499,284 @@ where
 {
     serde_json::from_value(value).map_err(|error| ApiError::bad_request(error.to_string()))
 }
+// ---------------------------------------------------------------------------
+// Wave 1 (`A1`) additions - the record surface, the two new writes, and the
+// harness-wide tool switch. Every shape here is a verbatim projection of the TS
+// contract; the comments name the interface it mirrors.
+// ---------------------------------------------------------------------------
+
+/// Body of `PATCH {root}/tools/{tool_id}` (`harness-api.ts` `PatchHarnessToolRequest`, parsed at
+/// `api.ts:2228-2260`). ONE field, the harness-wide enable switch.
+///
+/// `enabled` stays a raw `Value` on purpose: the contract refuses a non-boolean with its OWN
+/// sentence ("`\"enabled\"` must be a boolean ..."), which serde's type error would otherwise
+/// replace. The handler reads the boolean out of it after the unknown-field gate, so a missing,
+/// `null`, string, or number body all answer the contract's message.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PatchHarnessToolRequest {
+    #[serde(default)]
+    pub enabled: Option<serde_json::Value>,
+}
+
+impl PatchHarnessToolRequest {
+    /// The boolean the contract demands, or the contract's own refusal (`api.ts:2243-2249`).
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::bad_request`] with the enable-switch sentence.
+    pub fn enabled_boolean(&self) -> Result<bool, ApiError> {
+        self.enabled
+            .as_ref()
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "\"enabled\" must be a boolean (true runs the tool, false disables it for every session)."
+                        .to_owned(),
+                )
+            })
+    }
+}
+
+/// One catalogue row plus the harness-wide enable switch (`harness-api.ts:640` `ToolSummary` as
+/// `GET /tools` sends it, with the `enabled` member `persistence.ts:322` `toolSettings` decides).
+///
+/// A WRAPPER rather than a field on [`ToolSummary`], because the summary is built by
+/// `read.rs::tool_summary_of`, which Wave 1 does not touch; `#[serde(flatten)]` makes the wire
+/// identical to TS's single flat object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolListEntry {
+    #[serde(flatten)]
+    pub summary: ToolSummary,
+    pub enabled: bool,
+}
+
+/// A catalogue detail plus the same switch (`harness-api.ts:654` `ToolDetail` as
+/// `GET /tools/{tool_id}` and the PATCH answer send it).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolDetailEntry {
+    #[serde(flatten)]
+    pub detail: ToolDetail,
+    pub enabled: bool,
+}
+
+/// Envelope of the identified catalogue read and of the enable switch (`harness-api.ts:677`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolDetailEntryResponse {
+    pub tool: ToolDetailEntry,
+}
+
+/// Body of `PATCH {root}/sessions/{session_id}/turns/{turn_id}/blocks/{block_id}`
+/// (`harness-api.ts:2222` `PatchTurnBlockRequest`): the two inclusion axes, and at least one of
+/// them must be present. Request-side spelling is camelCase, so `reasoningIncluded` is spelled as
+/// TS spells it.
+///
+/// The values stay `Option<bool>` because that is the shape; the ROUTE does not decode through
+/// this type, it validates the raw body first (`api.ts:4597-4620` states one refusal sentence per
+/// axis, which serde's type error would replace), then answers. Keeping the shape here is what
+/// lets `tests/wave_one.rs` pin the wire form the route accepts.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchTurnBlockRequest {
+    /// The segment's own prompt axis - the exclusion unit behind a recorded call, or the
+    /// `included` flag of the assistant entry a `reasoning` segment names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub included: Option<bool>,
+    /// The thinking axis (`reasoningIncluded`), writable on a `reasoning` segment only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_included: Option<bool>,
+}
+
+/// The links a block-write receipt hands back (`harness-api.ts:2266-2269`), so the caller can
+/// refetch exactly what it changed without guessing a path.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TurnBlockWriteLinks {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
+}
+
+/// Receipt of the segment inclusion write (`harness-api.ts:2246`): the state the server
+/// PERSISTED, which is what lets the dialog repaint from the write rather than from what it asked
+/// for. `reasoning_included` appears exactly when the segment names a thinking entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TurnBlockWriteReceipt {
+    pub session_id: String,
+    pub turn_id: String,
+    pub block_id: String,
+    pub included: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_included: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links: Option<TurnBlockWriteLinks>,
+}
+
+/// Envelope of the segment write (`harness-api.ts` `PatchTurnBlockResponse`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TurnBlockWriteResponse {
+    pub receipt: TurnBlockWriteReceipt,
+}
+
+/// One declared field of a record collection, projected for a renderer (`harness-api.ts:1463`
+/// `RecordFieldDescriptor`): enough to draw columns and a filter, never the full engine spec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RecordFieldDescriptor {
+    pub key: String,
+    pub r#type: RecordFieldType,
+    pub required: bool,
+    /// The closed value set of an `enum` field; absent for every other type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<String>>,
+}
+
+/// The value types a declared field may take (`harness-api.ts:1466`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordFieldType {
+    Text,
+    Boolean,
+    Integer,
+    Enum,
+    Strings,
+}
+
+/// What one record did, in the store-wide feed (`harness-api.ts:1509` `RecordChangeRow.op`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordChangeOp {
+    Add,
+    Update,
+    Remove,
+}
+
+/// One stored record, projected exactly like a list page (`harness-api.ts:1478`
+/// `RecordEntryRow`). Keys are OPEN: the declared fields are the collection's own, so they ride in
+/// `extra` and serialise inline beside the four fixed keys. `rev` is the CAS token a guarded write
+/// sends back as `expects: [{id, rev}]` - NOT the stream's `store_rev`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RecordEntryRow {
+    pub id: String,
+    pub rev: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_thread_id: Option<String>,
+    /// The recorded time as the engine spells it (an ISO-8601 text stamp, not an epoch figure).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    /// The collection's declared fields, in canonical order. A `getOnly` field (a chapter body)
+    /// is ABSENT here, never emptied.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// One entry of the store-wide change feed (`harness-api.ts:1502` `RecordChangeRow`). A `remove`
+/// names the record and stops: its `rev`/`item_rev` is the removal's store event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RecordChangeRow {
+    pub seq: u64,
+    pub collection: String,
+    pub rev: u64,
+    pub id: String,
+    pub op: RecordChangeOp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub at: String,
+    /// Which fields an `update` actually changed, in canonical order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_rev: Option<u64>,
+}
+
+/// One collection of the session's record store, whole (`harness-api.ts:1524`
+/// `RecordCollectionRow`). Entries are the whole collection up to its own bound, not a paged slice.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RecordCollectionRow {
+    pub name: String,
+    pub store_rev: u64,
+    pub count: u64,
+    pub fields: Vec<RecordFieldDescriptor>,
+    pub entries: Vec<RecordEntryRow>,
+}
+
+/// The bootstrap read (`harness-api.ts:1538` `RecordsSnapshotResponse`), which IS the response
+/// body of `GET {root}/sessions/{session_id}/records` - no envelope key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RecordsSnapshotResponse {
+    pub session_id: String,
+    pub revision: u64,
+    pub store_rev: u64,
+    pub collections_rev: u64,
+    pub collections: Vec<RecordCollectionRow>,
+    pub changes: Vec<RecordChangeRow>,
+}
+
+/// The delta read (`harness-api.ts:1556` `RecordsDeltaResponse`): the feed after `since` and
+/// nothing else. `reset: true` says the cursor is no longer answerable and the client re-bootstraps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RecordsDeltaResponse {
+    pub session_id: String,
+    pub revision: u64,
+    pub store_rev: u64,
+    pub collections_rev: u64,
+    pub changes: Vec<RecordChangeRow>,
+    pub reset: bool,
+}
+
+/// The whole `records.updated` payload (`harness-api.ts:1571` `RecordsSignal`): the two
+/// watermarks and no record, ever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RecordsSignal {
+    pub store_rev: u64,
+    pub collections_rev: u64,
+}
+
+/// Why a plugin's contribution is missing (`harness-api.ts:930` `SessionPluginDiagnostic.kind`).
+/// The wire spells these kebab-case; the Rust names are the same words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionPluginDiagnosticKind {
+    /// A hook that threw.
+    HandlerThrew,
+    /// A hook that outlived its budget.
+    HandlerTimedOut,
+    /// A hook whose decision could not be parsed, so the fail-open rule dropped it.
+    InvalidDecision,
+    /// The plugin's own report of what it decided - the only kind with no `event`.
+    Policy,
+}
+
+/// One plugin diagnostic the server received for a session (`harness-api.ts:930`): without this
+/// record a broken policy plugin and an inert one answer identically.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionPluginDiagnostic {
+    pub at: u64,
+    pub kind: SessionPluginDiagnosticKind,
+    pub owner: String,
+    /// The hook the diagnostic names; absent for a `policy` report, which names no hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
 // -- CONTRACT-END --

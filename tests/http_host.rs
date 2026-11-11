@@ -335,11 +335,14 @@ impl Reply {
             .map(str::to_owned)
     }
 
-    /// The contract requires the epoch on every JSON response, so nearly every test asserts it on
-    /// the way past.
+    /// The epoch header a SUCCESSFUL JSON response carries, so nearly every test asserts it on the
+    /// way past. Wave 1 criterion (iii) takes the header off error responses - `api.ts`'s
+    /// `sendError` writes the body plus the cache/content headers only, and `stampContractHeaders`
+    /// is reached from the success writers - so this accessor reads the 2xx/3xx half, and
+    /// `assert_contract_headers` pins the absence half.
     fn epoch(&self) -> String {
         self.header(&EPOCH_HEADER)
-            .expect("X-Harness-Epoch on every JSON response")
+            .expect("X-Harness-Epoch on every successful JSON response")
     }
 }
 
@@ -356,6 +359,28 @@ fn assert_contract_headers(reply: &Reply, revision: Option<u64>) {
         "no-store",
         "a control-plane read is never cacheable"
     );
+
+    // Wave 1 criterion (iii): a refusal carries NEITHER contract header. Checked first, because a
+    // caller that asks an error reply for a revision is itself a contract break.
+    if reply.status.as_u16() >= 400 {
+        assert_eq!(
+            revision, None,
+            "an error response has no revision to stamp, so a caller must not name one"
+        );
+        assert_eq!(
+            reply.header(&EPOCH_HEADER),
+            None,
+            "`sendError` never reaches `stampContractHeaders`, so a 4xx/5xx body carries no \
+             X-Harness-Epoch (`api.ts`'s error writer)"
+        );
+        assert_eq!(
+            reply.header(&REVISION_HEADER),
+            None,
+            "and no X-Harness-Revision either"
+        );
+
+        return;
+    }
 
     let epoch = reply.epoch();
     let tail = epoch.rsplit('-').next().unwrap_or_default().to_owned();
@@ -456,9 +481,9 @@ async fn the_boot_document_advertises_the_contract() {
             "pending_actions": 4,
             "steer_records": 64,
             "created_tools": 32,
-            // `harness-api.ts:216` / `harness.swagger.yaml:243`. The advertised budget is the
-            // CONTRACT's 256 KiB; this build still ENFORCES `MODEL_TOOL_RESULT_BUDGET_BYTES`
-            // (64 KiB) until the tool stage widens - `tests/foundation.rs` pins both figures.
+            // `harness-api.ts:222` / `harness.swagger.yaml:243`. Advertised AND enforced are the
+            // same 256 KiB in this build now (`core/result-budget.ts:54`); `tests/foundation.rs`
+            // pins both figures and their equality.
             "tool_result_bytes": 262_144,
             "page_limit_default": 25,
             "page_limit_max": 100,
@@ -633,7 +658,26 @@ async fn an_unknown_route_names_the_request_and_the_stream_answers_400() {
         stream.message(),
         "GET /stream expects a WebSocket upgrade (Sec-WebSocket-Key/Version) for the harness.v1 subprotocol."
     );
+
+    // WAVE 2-C: parity, not deviation. TypeScript's handshake refusals are written by
+    // `rejectUpgrade` (`stream/transport.ts:134-146`), which writes the JSON body plus
+    // `Content-Type`/`Content-Length`/`Connection: close` and the caller's extra lines and NOTHING
+    // else — the mount's `X-Harness-Epoch` rides the 101 lines only (`transport.ts:655-666` from
+    // `mount.ts:146`). The dispatcher's own error writer agrees (`sendError` never reaches
+    // `stampContractHeaders`), so this refusal is now an ordinary error response and the shared
+    // helper proves it: content type, `no-store`, and NEITHER contract header.
     assert_contract_headers(&stream, None);
+    assert_eq!(
+        stream.header(&EPOCH_HEADER),
+        None,
+        "a handshake refusal names no epoch - the client has not been told which server refused it \
+         (`stream/transport.ts:134-146`); the header appears only on the 101 (`tests/stream.rs`)"
+    );
+    assert_eq!(
+        stream.header(&REVISION_HEADER),
+        None,
+        "and never a revision - the record store did not move"
+    );
 
     server.stop().await;
 }
@@ -1648,8 +1692,9 @@ async fn the_agent_surface_lists_reads_persists_and_retires() {
 
     let records = root.agent_records();
 
+    // The overlay on disk is a BARE ARRAY (`persistence.ts:1679`), so the rows are the document.
     assert_eq!(
-        records["records"]
+        records
             .as_array()
             .expect("records")
             .iter()
@@ -1679,10 +1724,7 @@ async fn the_agent_surface_lists_reads_persists_and_retires() {
     // The second write on the same collapsed host counter (`api.ts:1763-1764`).
     assert_eq!(restored.body["agent"]["revision"], 4);
     assert_eq!(
-        root.agent_records()["records"]
-            .as_array()
-            .expect("records")
-            .len(),
+        root.agent_records().as_array().expect("records").len(),
         0,
         "an override equal to the shipped value is DROPPED from the decision list \
          (`agent-state.ts:274-290`)"
@@ -1767,7 +1809,7 @@ async fn the_agent_surface_lists_reads_persists_and_retires() {
     );
 
     assert_eq!(
-        root.agent_records()["records"]
+        root.agent_records()
             .as_array()
             .expect("records")
             .iter()
@@ -1808,8 +1850,8 @@ async fn the_tool_read_carries_the_catalogue_the_filters_and_the_gate() {
 
     assert_eq!(
         summaries.len(),
-        31,
-        "the LISTED catalogue: 35 generated rows minus the four `listed: false` runtime rows \
+        32,
+        "the LISTED catalogue: 36 generated rows minus the four `listed: false` runtime rows \
          (`tool-manifest.ts:1002, 1046, 1692, 1811`)"
     );
 
@@ -1835,15 +1877,33 @@ async fn the_tool_read_carries_the_catalogue_the_filters_and_the_gate() {
 
     assert_eq!(page.status, StatusCode::OK);
     assert_contract_headers(&page, Some(0));
+    // Wave 1: every row of the page also states its switch, and a server that has never answered a
+    // `PATCH /tools/{id}` has nothing disabled - so the page is the library rows plus
+    // `"enabled": true` on each (`api.ts`'s `getTools` reads the same `toolSettings.disabled` set).
+    let expected_rows: Vec<Value> = summaries
+        .iter()
+        .map(|row| {
+            let mut value = serde_json::to_value(row).expect("a row serializes");
+
+            value
+                .as_object_mut()
+                .expect("an object row")
+                .insert("enabled".to_owned(), json!(true));
+
+            value
+        })
+        .collect();
+
     assert_eq!(
         page.body["items"],
-        serde_json::to_value(&summaries).expect("rows serialize"),
-        "`GET /tools` is the deployment catalogue, in catalogue order and unsorted"
+        json!(expected_rows),
+        "`GET /tools` is the deployment catalogue, in catalogue order and unsorted, and every row \
+         carries its switch"
     );
-    assert_eq!(page.body["limit"], 31);
+    assert_eq!(page.body["limit"], 32);
     assert_eq!(page.body["next_cursor"], Value::Null);
 
-    // The default page is 25 of 31 rows, so it must advertise the next one.
+    // The default page is 25 of 32 rows, so it must advertise the next one.
     let first = Reply::send(client().get(server.url("/v1/harness/tools"))).await;
 
     assert_eq!(first.body["limit"], 25);
@@ -1866,7 +1926,7 @@ async fn the_tool_read_carries_the_catalogue_the_filters_and_the_gate() {
             .map(|row| row.name.clone())
             .collect::<Vec<_>>()
     );
-    assert_eq!(second.body["limit"], 6);
+    assert_eq!(second.body["limit"], 7);
     assert_eq!(
         second.body["next_cursor"],
         Value::Null,
@@ -1972,9 +2032,17 @@ async fn the_tool_read_carries_the_catalogue_the_filters_and_the_gate() {
             .cloned()
             .collect::<Vec<_>>()
             .len(),
-        8,
-        "the six summary members a listed-and-always-available tool has, plus `parameters` and \
-         `execution`; `availability` is emitted only for an entry that needs a credential"
+        9,
+        "the six summary members a listed-and-always-available tool has, plus `parameters`, \
+         `execution` and the Wave 1 `enabled` switch (`api.ts:2203` `toolDetailOf(entry, name, \
+         toolEnablementOf(name))`); `availability` is emitted only for an entry that needs a \
+         credential"
+    );
+    assert_eq!(
+        tool["enabled"],
+        json!(true),
+        "a server that has never answered `PATCH /tools/{{id}}` reports every tool as enabled \
+         (`toolEnablementOf` reads the empty `toolSettings.disabled` set)"
     );
 
     // The global execution route is a policy refusal for a session-bound tool, and it is a 403

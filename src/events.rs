@@ -531,6 +531,8 @@ pub fn baseline_link(resource: &str, id: Option<&str>) -> String {
         "session_agents" => format!("{HARNESS_API_ROOT}/sessions/{key}/agents"),
         "session_tools" => format!("{HARNESS_API_ROOT}/sessions/{key}/tools?limit={page}"),
         "commands" => format!("{HARNESS_API_ROOT}/sessions/{key}/commands?limit={page}"),
+        // Wave 1: the record snapshot is keyed by session and read whole, so no page size appears.
+        "records" => format!("{HARNESS_API_ROOT}/sessions/{key}/records"),
         "harnesses" => format!("{HARNESS_API_ROOT}/harnesses?limit={page}"),
         "agents" => format!("{HARNESS_API_ROOT}/agents?limit={page}"),
         "tools" => format!("{HARNESS_API_ROOT}/tools?limit={page}"),

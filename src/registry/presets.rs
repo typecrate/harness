@@ -37,7 +37,7 @@ pub const SHARED_TOOL_NAMES: [&str; 15] = [
     "read",
     "write",
     "edit",
-    "fileList",
+    "files",
     "glob",
     "grep",
     "shell",
@@ -67,11 +67,11 @@ pub const ENVIRONMENT_TOOL_NAMES: [&str; 2] = ["search", "fetch"];
 /// The harness-owned core names that are declared on every request
 /// (`toolbox.ts:188-190` `CORE_TOOL_NAMES`, pinned by `frontend/contract.test.ts:126` and by the
 /// configured-card assertion in `presets.test.ts:479-492`).
-pub const CORE_TOOL_NAMES: [&str; 2] = ["toolRequest", "task"];
+pub const CORE_TOOL_NAMES: [&str; 2] = ["toolRequest", "tasks"];
 
 /// The package presets declared up front (`toolbox.ts:197-201` `CORE_PRESET_TOOL_NAMES`, i.e. the
 /// PRESET_DESCRIPTORS with `visibility: 'core'`; visibilities pinned by `presets.test.ts:394-412`).
-/// `fileList` and `download` are deliberately absent - they stay discoverable.
+/// `files` and `download` are deliberately absent - they stay discoverable.
 pub const CORE_PRESET_TOOL_NAMES: [&str; 5] = ["read", "write", "edit", "glob", "grep"];
 
 /// `delegate` is declared to a primary only when the harness has subagents
@@ -172,7 +172,7 @@ pub fn shipped_presets() -> Vec<HarnessDescriptor> {
         live_preset(
             "instruct",
             "Instruct",
-            "General instruction-following agent with the full shared toolbox and every other role as a direct subagent. File read/write/edit/glob and a configured search are always available; call toolRequest for fileList, commands, diffs, syntax checks, time, text, or notes. Only the agents differ between live presets, never the tools.",
+            "General instruction-following agent with the full shared toolbox and every other role as a direct subagent. File read/write/edit/glob and a configured search are always available; call toolRequest for files, commands, diffs, syntax checks, time, text, or notes. Only the agents differ between live presets, never the tools.",
         ),
         live_preset(
             "research",
@@ -182,7 +182,7 @@ pub fn shipped_presets() -> Vec<HarnessDescriptor> {
         live_preset(
             "workspace",
             "Coder",
-            "Coding agent with the full shared toolbox and the other roles as direct subagents: file read/write/edit/glob are always available, and fileList, syntax checks, diffs, and commands are discovered by tag. Web search is available when a key is configured. Everything runs on the server host.",
+            "Coding agent with the full shared toolbox and the other roles as direct subagents: file read/write/edit/glob are always available, and files, syntax checks, diffs, and commands are discovered by tag. Web search is available when a key is configured. Everything runs on the server host.",
         ),
         live_preset(
             "reviewer",
@@ -351,7 +351,7 @@ pub fn legacy_preset_definitions() -> BTreeMap<&'static str, LegacyPresetDefinit
             "instruct",
             LegacyPresetDefinition {
                 title: "Instruct".to_string(),
-                description: "A general instruction-following agent with the full shared toolbox. File read/write/edit/glob and a configured search are always available; call toolRequest with capability tags for fileList, commands, diffs, syntax checks, time, text, or notes. The live presets differ only in their agents, not their tools.".to_string(),
+                description: "A general instruction-following agent with the full shared toolbox. File read/write/edit/glob and a configured search are always available; call toolRequest with capability tags for files, commands, diffs, syntax checks, time, text, or notes. The live presets differ only in their agents, not their tools.".to_string(),
                 requires_endpoint: true,
                 primary: "instruct".to_string(),
                 subagents: Vec::new(),
@@ -379,7 +379,7 @@ pub fn legacy_preset_definitions() -> BTreeMap<&'static str, LegacyPresetDefinit
             "workspace",
             LegacyPresetDefinition {
                 title: "Workspace (coding)".to_string(),
-                description: "A coding agent with the full shared toolbox: file read/write/edit/glob are always available, and fileList, syntax checks, diffs, and commands are discovered by tag. Web search is available when a key is configured. It has the same registered tools as every live harness and differs only in its agent profile and routing. Everything runs on the server host.".to_string(),
+                description: "A coding agent with the full shared toolbox: file read/write/edit/glob are always available, and files, syntax checks, diffs, and commands are discovered by tag. Web search is available when a key is configured. It has the same registered tools as every live harness and differs only in its agent profile and routing. Everything runs on the server host.".to_string(),
                 requires_endpoint: true,
                 primary: "workspace".to_string(),
                 subagents: Vec::new(),

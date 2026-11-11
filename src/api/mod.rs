@@ -54,6 +54,8 @@ pub mod harnesses;
 pub mod models;
 pub mod plugins;
 pub mod queue;
+/// Wave 1: the record-store bootstrap read (`getSessionRecords`, `api.ts:2736`).
+pub mod records;
 pub mod root;
 pub mod session_agents;
 pub mod session_tools;
@@ -585,6 +587,8 @@ pub enum Operation {
     GetTools,
     GetTool,
     PostToolExecution,
+    // Wave 1: the harness-wide enable switch (`patchTool`, `api.ts:2228`).
+    PatchTool,
     // ---- host: built-in plugin catalogue --------------------------------------
     GetPlugins,
     PatchPlugin,
@@ -600,6 +604,8 @@ pub enum Operation {
     GetSessionUsage,
     GetSessionCommands,
     GetSessionQueue,
+    // Wave 1: the record-store bootstrap read (`api.ts:2736`), keyed by session.
+    GetSessionRecords,
     PostSessionTask,
     PostSessionReset,
     PostSessionCancel,
@@ -628,6 +634,8 @@ pub enum Operation {
     GetSessionThread,
     DeleteSessionThread,
     PostThreadCancel,
+    // Wave 1: re-queues the thread's stopped turn (`postThreadResume`, `api.ts:2867`).
+    PostThreadResume,
     // ---- transcripts ----------------------------------------------------------
     GetTranscriptMetadata,
     PutTranscript,
@@ -640,6 +648,8 @@ pub enum Operation {
     GetSessionTurnEvents,
     GetSessionTurnStep,
     GetSessionTurnBlock,
+    // Wave 1: the segment inclusion write (`patchSessionTurnBlock`, `api.ts:4597`).
+    PatchSessionTurnBlock,
     GetSessionTurnAttachment,
     // ---- stream ---------------------------------------------------------------
     StreamRoute,
@@ -653,12 +663,12 @@ const fn operations(
     items
 }
 
-/// The route table: all 47 generated templates and all 66 declared operations.
+/// The route table: all 49 generated templates and all 70 declared operations.
 ///
 /// ORDER IS LOAD-BEARING: `matchRoute` (`api.ts:657-687`) returns the FIRST pattern whose segment
 /// count and literal segments fit, in template-table order, so an ambiguous pair resolves the way
 /// the generated table lists it. The table below is in that exact order.
-pub static ROUTES: [Route; 47] = [
+pub static ROUTES: [Route; 49] = [
     Route {
         id: "root",
         template: contract::HARNESS_API_ROOT,
@@ -726,7 +736,11 @@ pub static ROUTES: [Route; 47] = [
     Route {
         id: "toolsByToolId",
         template: "/v1/harness/tools/{tool_id}",
-        operations: operations(&[("GET", Operation::GetTool)]),
+        operations: operations(&[
+            ("GET", Operation::GetTool),
+            // Wave 1: the harness-wide enable switch (`api.ts:4785`).
+            ("PATCH", Operation::PatchTool),
+        ]),
     },
     Route {
         id: "toolsByToolIdExecutions",
@@ -782,6 +796,11 @@ pub static ROUTES: [Route; 47] = [
         id: "sessionsBySessionIdCommands",
         template: "/v1/harness/sessions/{session_id}/commands",
         operations: operations(&[("GET", Operation::GetSessionCommands)]),
+    },
+    Route {
+        id: "sessionsBySessionIdRecords",
+        template: "/v1/harness/sessions/{session_id}/records",
+        operations: operations(&[("GET", Operation::GetSessionRecords)]),
     },
     Route {
         id: "sessionsBySessionIdQueue",
@@ -887,6 +906,11 @@ pub static ROUTES: [Route; 47] = [
         operations: operations(&[("POST", Operation::PostThreadCancel)]),
     },
     Route {
+        id: "sessionsBySessionIdThreadsByThreadIdResume",
+        template: "/v1/harness/sessions/{session_id}/threads/{thread_id}/resume",
+        operations: operations(&[("POST", Operation::PostThreadResume)]),
+    },
+    Route {
         id: "sessionsBySessionIdThreadsByThreadIdTranscript",
         template: "/v1/harness/sessions/{session_id}/threads/{thread_id}/transcript",
         operations: operations(&[
@@ -932,7 +956,11 @@ pub static ROUTES: [Route; 47] = [
     Route {
         id: "sessionsBySessionIdTurnsByTurnIdBlocksByBlockId",
         template: "/v1/harness/sessions/{session_id}/turns/{turn_id}/blocks/{block_id}",
-        operations: operations(&[("GET", Operation::GetSessionTurnBlock)]),
+        operations: operations(&[
+            ("GET", Operation::GetSessionTurnBlock),
+            // Wave 1: the segment inclusion write (`api.ts:4829`).
+            ("PATCH", Operation::PatchSessionTurnBlock),
+        ]),
     },
     Route {
         id: "sessionsBySessionIdTurnsByTurnIdAttachmentsByAttachmentId",
@@ -1164,16 +1192,24 @@ pub fn page_response<T: Serialize>(
 /// Turns a response header map into the wire response: `content-type: application/json`,
 /// `cache-control: no-store`, and the epoch/revision headers `withHeaders` stamps
 /// (`api.ts:1224-1230`; `handler.ts:86` is where the content type is set).
+///
+/// `epoch` is `Option` because the contract stamps the epoch ONLY on a success: an error goes out
+/// through a bare `Response.json` in TS (`api.ts:4030-4064`, `handler.ts:284-286`), so it carries
+/// neither `X-Harness-Epoch` nor `X-Harness-Revision`. [`write_error`] passes `None` for that
+/// reason; every success path passes the runtime's epoch.
 #[must_use]
-fn write_response(response: &ApiResponse, epoch: &str) -> Response {
+fn write_response(response: &ApiResponse, epoch: Option<&str>) -> Response {
     let mut builder = Response::builder()
         .status(StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
         .header(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json; charset=utf-8"),
         )
-        .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))
-        .header(contract::HARNESS_EPOCH_HEADER, epoch);
+        .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+
+    if let Some(epoch) = epoch {
+        builder = builder.header(contract::HARNESS_EPOCH_HEADER, epoch);
+    }
 
     if let Some(revision) = response.revision {
         builder = builder.header(contract::HARNESS_REVISION_HEADER, revision.to_string());
@@ -1191,22 +1227,26 @@ fn write_response(response: &ApiResponse, epoch: &str) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-/// The single error envelope, with the same headers as a success (`api.ts:4030-4064` +
+/// The single error envelope, WITHOUT the contract headers (`api.ts:4030-4064` +
 /// `handler.ts:284-286`).
 ///
-/// TS's adapter sends an error body WITHOUT the contract headers, because `withHeaders` is applied
-/// by the dispatcher's `json()` and the catch arm returns a bare result. This port stamps the epoch
-/// on every JSON response, error included (the stage contract): the value is the process epoch
-/// either way, since `EventHub::new()` takes `events::process_epoch()` and two hubs in one process
-/// therefore share it (`knowledge.md` "Event hub").
+/// TS's adapter answers a failure with a bare `Response.json`: `withHeaders` is applied by the
+/// dispatcher's `json()` helper, and the catch arm never reaches it. So an error body carries
+/// `content-type`, `cache-control` and `content-length` only - no `X-Harness-Epoch` and no
+/// `X-Harness-Revision`. Wave 1 closed this port's old deviation (the epoch used to ride on every
+/// JSON response, error included), which is what lets a client treat "the header is absent" as
+/// "this answer is a refusal" rather than as a second protocol.
+///
+/// `_epoch` stays in the signature because every call site already holds the value it stamps on
+/// the success arm of the same route; the error arm simply does not send it.
 #[must_use]
-fn write_error(error: &ApiError, epoch: &str) -> Response {
+fn write_error(error: &ApiError, _epoch: &str) -> Response {
     let response = json(
         error.status,
         serde_json::json!({ "error": { "message": error.message } }),
     );
 
-    write_response(&response, epoch)
+    write_response(&response, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -1346,7 +1386,7 @@ pub async fn handle_request(root: PathBuf, request: Request) -> Response {
     drain_unread_body(&mut ctx.body).await;
 
     outcome
-        .map(|response| write_response(&response, &ctx_epoch(&ctx)))
+        .map(|response| write_response(&response, Some(&ctx_epoch(&ctx))))
         .unwrap_or_else(|error| write_error(&error, &ctx_epoch(&ctx)))
 }
 
@@ -1415,6 +1455,7 @@ async fn dispatch_operation(operation: Operation, ctx: &mut Ctx) -> ApiResult {
 
         Operation::GetTools => self::tools::get_tools(ctx).await,
         Operation::GetTool => self::tools::get_tool(ctx).await,
+        Operation::PatchTool => self::tools::patch_tool(ctx).await,
         Operation::PostToolExecution => self::tools::post_tool_execution(ctx).await,
 
         Operation::GetPlugins => self::plugins::get_plugins(ctx).await,
@@ -1431,6 +1472,7 @@ async fn dispatch_operation(operation: Operation, ctx: &mut Ctx) -> ApiResult {
         Operation::GetSessionUsage => self::sessions::get_session_usage(ctx).await,
         Operation::GetSessionCommands => self::sessions::get_session_commands(ctx).await,
         Operation::GetSessionQueue => self::sessions::get_session_queue(ctx).await,
+        Operation::GetSessionRecords => self::records::get_session_records(ctx).await,
         Operation::PostSessionTask => self::sessions::post_session_task(ctx).await,
         Operation::PostSessionReset => self::sessions::post_session_reset(ctx).await,
         Operation::PostSessionCancel => self::sessions::post_session_cancel(ctx).await,
@@ -1465,6 +1507,9 @@ async fn dispatch_operation(operation: Operation, ctx: &mut Ctx) -> ApiResult {
         Operation::GetSessionThread => self::threads::get_session_thread(ctx).await,
         Operation::DeleteSessionThread => self::threads::delete_session_thread(ctx).await,
         Operation::PostThreadCancel => self::threads::post_thread_cancel(ctx).await,
+        // Wave 1: `postThreadResume` is a thread-lane write like its sibling above, but it lives
+        // in `turns.rs` because that is the file this wave owns (see the note at its top).
+        Operation::PostThreadResume => self::turns::post_thread_resume(ctx).await,
 
         Operation::GetTranscriptMetadata => self::transcript::get_transcript_metadata(ctx).await,
         Operation::PutTranscript => self::transcript::put_transcript(ctx).await,
@@ -1477,6 +1522,7 @@ async fn dispatch_operation(operation: Operation, ctx: &mut Ctx) -> ApiResult {
         Operation::GetSessionTurnEvents => self::turns::get_session_turn_events(ctx).await,
         Operation::GetSessionTurnStep => self::turns::get_session_turn_step(ctx).await,
         Operation::GetSessionTurnBlock => self::turns::get_session_turn_block(ctx).await,
+        Operation::PatchSessionTurnBlock => self::turns::patch_session_turn_block(ctx).await,
         Operation::GetSessionTurnAttachment => self::turns::get_session_turn_attachment(ctx).await,
 
         Operation::StreamRoute => self::root::stream_route(ctx).await,

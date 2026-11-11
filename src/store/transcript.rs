@@ -68,6 +68,8 @@ impl SessionState {
     pub fn unreadable_transcript(error: &str) -> Vec<HarnessMessage> {
         vec![HarnessMessage::System {
             content: format!("{}{error}]", TRANSCRIPT_UNREADABLE_MARKER),
+            included: None,
+            message_id: None,
         }]
     }
 
@@ -78,7 +80,7 @@ impl SessionState {
     /// of what the user wrote).
     #[must_use]
     pub fn is_unreadable_transcript(messages: &[HarnessMessage]) -> bool {
-        let Some(HarnessMessage::System { content }) = messages.first() else {
+        let Some(HarnessMessage::System { content, .. }) = messages.first() else {
             return false;
         };
         messages.len() == 1 && content.starts_with(TRANSCRIPT_UNREADABLE_MARKER)

@@ -197,6 +197,12 @@ async fn run_turn(mut input: TurnInput) -> TurnOutcome {
     run.history.push(HarnessMessage::User {
         content: prompt,
         attachments,
+        // P0 added the three context keys to the contract and left them UNWIRED on purpose:
+        // minting `messageId` (`core/snapshot.ts:300-332`) and running the request projection
+        // that strips it (`core/agent.ts:203-230 withIncluded`) belong to the store/turn wave,
+        // so a runtime-created entry here starts unflagged and id-less.
+        included: None,
+        message_id: None,
     });
 
     // The tool-loop budget: TS validates `maxIterations` at construction and never clamps;
@@ -296,6 +302,8 @@ impl Run<'_> {
                 self.history.push(HarnessMessage::User {
                     content: guidance,
                     attachments: Vec::new(),
+                    included: None,
+                    message_id: None,
                 });
                 self.emit_commit();
             }
@@ -321,6 +329,11 @@ impl Run<'_> {
                 content: response.text.clone(),
                 tool_calls: to_harness_calls(&response.tool_calls),
                 reasoning: (!response.reasoning.is_empty()).then(|| response.reasoning.clone()),
+                // Neither context axis is written at creation: `false` is the ONLY stored
+                // value (`api.ts:919-920`, `:944-945`), so an unflagged turn prints no key.
+                included: None,
+                reasoning_included: None,
+                message_id: None,
             });
 
             if response.tool_calls.is_empty() {
@@ -333,6 +346,8 @@ impl Run<'_> {
                         self.history.push(HarnessMessage::User {
                             content: text,
                             attachments: Vec::new(),
+                            included: None,
+                            message_id: None,
                         });
                     }
 
@@ -549,6 +564,11 @@ impl Run<'_> {
         {
             messages.push(HarnessMessage::System {
                 content: self.input.system_instruction.clone(),
+                // A REQUEST projection copy, and TS's `withIncluded` (`core/agent.ts:213-229`)
+                // strips the id and any non-`false` flag from every one of these - which is
+                // exactly the shape an unflagged entry projects to.
+                included: None,
+                message_id: None,
             });
         }
 
@@ -662,12 +682,17 @@ impl Run<'_> {
 
         // The tool message answers the call in the transcript. Media rides as descriptors on
         // the message's attachments only when the tool supplied real attachments; the event
-        // never carries base64.
+        // never carries base64. The `outcome` key follows `core/tool-outcome.ts`
+        // `storedOutcomeEntry` (compaction T1.4, `types/index.ts:276-298`): only a NON-`completed`
+        // classification is stored, so a healthy result keeps its exact pre-outcome shape.
         self.history.push(HarnessMessage::Tool {
             content: outcome.content,
             tool_call_id: call.id.clone(),
             name: call.name.clone(),
             attachments: Vec::new(),
+            outcome: crate::contract::stored_outcome_entry(outcome_kind),
+            included: None,
+            message_id: None,
         });
 
         Ok(())

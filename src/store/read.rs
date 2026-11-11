@@ -895,7 +895,7 @@ pub fn turn_error_of(turn: &TurnState) -> Option<HarnessErrorInfo> {
         .events
         .iter()
         .rev()
-        .find_map(|event| match event {
+        .find_map(|entry| match &entry.event {
             HarnessEvent::Error { error, .. } => Some(error.clone()),
             _ => None,
         })
@@ -921,8 +921,8 @@ pub fn turn_event_rows_of(
     let mut served = 0u64;
     let mut collected = 0u64;
 
-    for (index, event) in turn.record.events.iter().enumerate() {
-        if !matching(event) {
+    for (index, entry) in turn.record.events.iter().enumerate() {
+        if !matching(&entry.event) {
             continue;
         }
 
@@ -940,7 +940,7 @@ pub fn turn_event_rows_of(
         rows.push(TurnEventRow {
             index: ordinal,
             at: times.get(index).copied(),
-            event: event.clone(),
+            event: entry.clone(),
         });
 
         served += 1;
@@ -951,7 +951,7 @@ pub fn turn_event_rows_of(
         turn.record
             .events
             .iter()
-            .filter(|event| matching(event))
+            .filter(|entry| matching(&entry.event))
             .count(),
     )
     .unwrap_or(u64::MAX);
@@ -1268,7 +1268,7 @@ pub fn entry_count(messages: &[HarnessMessage]) -> u64 {
 #[must_use]
 pub fn message_content(message: &HarnessMessage) -> &str {
     match message {
-        HarnessMessage::System { content }
+        HarnessMessage::System { content, .. }
         | HarnessMessage::User { content, .. }
         | HarnessMessage::Assistant { content, .. }
         | HarnessMessage::Tool { content, .. } => content,

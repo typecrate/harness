@@ -75,7 +75,7 @@ pub const WEBFETCH_UNCONFIGURED_HINT: &str = "Web fetch is not enabled on this s
 /// per-session record store, the agent roster, or another conversation - none of which
 /// the tool-runtime seam reaches. A created tool's body is the same story (`T3` registers
 /// declarations, it cannot compile a body).
-const MISSING_CAPABILITY: [(&str, &str); 14] = [
+const MISSING_CAPABILITY: [(&str, &str); 15] = [
     (
         "toolRegistry",
         "compiling and registering a tool from editable source (the runtime compiler)",
@@ -88,9 +88,10 @@ const MISSING_CAPABILITY: [(&str, &str); 14] = [
         "toolCreate",
         "authoring a new tool body at runtime (the runtime compiler)",
     ),
-    ("profileManage", "the session profile record store"),
-    ("chapterManage", "the session chapter record store"),
-    ("locationManage", "the session location record store"),
+    ("records", "the session record store"),
+    ("profiles", "the session profile record store"),
+    ("chapters", "the session chapter record store"),
+    ("locations", "the session location record store"),
     (
         "agentManage",
         "the live agent roster this session runs against",
@@ -486,7 +487,7 @@ async fn dispatch(
         "read" => files::read(&arguments, &cwd).map_err(ToolFailure::Failed),
         "write" => files::write(&arguments, &cwd).map_err(ToolFailure::Failed),
         "edit" => files::edit(&arguments, &cwd).map_err(ToolFailure::Failed),
-        "fileList" => files::file_list(&arguments, &cwd).map_err(ToolFailure::Failed),
+        "files" => files::file_list(&arguments, &cwd).map_err(ToolFailure::Failed),
         "glob" => files::glob(&arguments, &cwd).map_err(ToolFailure::Failed),
         "grep" => files::grep(&arguments, &cwd).map_err(ToolFailure::Failed),
 
@@ -498,7 +499,11 @@ async fn dispatch(
             .await
             .map_err(ToolFailure::Failed),
 
-        "syntax" => syntax::check(&arguments).map_err(ToolFailure::Failed),
+        // The Python half runs a child process, so it takes the turn's cancellation token like the
+        // command and network tools do; the other halves never yield.
+        "syntax" => syntax::check(&arguments, &signal)
+            .await
+            .map_err(ToolFailure::Failed),
 
         // The app tools.
         "timeNow" => text::time_now(&arguments).map_err(ToolFailure::Failed),
@@ -514,7 +519,7 @@ async fn dispatch(
         // The network tools.
         "fetch" => {
             if options.fetch_enabled {
-                web::fetch(client, &arguments, &signal)
+                web::fetch(client, &arguments, &options.web_keys, &signal)
                     .await
                     .map_err(ToolFailure::Failed)
             } else {
@@ -529,7 +534,7 @@ async fn dispatch(
             .map_err(ToolFailure::Failed),
 
         // The session-shared todo list: a pass-through of the host's own JSON answer.
-        "task" => {
+        "tasks" => {
             let Some(host) = ctx.task_host.as_ref() else {
                 return Err(ToolFailure::Failed(
                     "task needs this session's task board, and this run has none.".to_owned(),
@@ -878,12 +883,43 @@ mod tests {
         });
         let summaries = registry.summaries();
 
-        // The LISTED set is the TS page: 35 rows minus the four the manifest marks
+        // The LISTED set is the TS page: 36 rows minus the four the manifest marks
         // `listed: false` (`tool-manifest.ts:1002, 1046, 1692, 1811`).
         assert_eq!(summaries.len(), ENTRIES.len() - UNLISTED_EXPECTED.len());
-        assert_eq!(ENTRIES.len(), 35);
+        assert_eq!(ENTRIES.len(), 36);
         assert_eq!(summaries[0].name, "toolRegistry");
         assert_eq!(summaries[0].group, "Core tools");
+
+        // Wave 1: the manifest's renamed rows are the ONLY spelling this catalogue carries, and the
+        // record-store row (`records`, `tool-manifest.ts` between `toolCreate` and `toolPatch`) is
+        // listed like every other read-side row.
+        for name in [
+            "files",
+            "tasks",
+            "profiles",
+            "chapters",
+            "locations",
+            "records",
+        ] {
+            assert!(
+                summaries.iter().any(|row| row.name == name),
+                "`{name}` is a current manifest row name and must be listed by GET /tools"
+            );
+        }
+
+        for stale in [
+            "fileList",
+            "task",
+            "profileManage",
+            "chapterManage",
+            "locationManage",
+        ] {
+            assert!(
+                !summaries.iter().any(|row| row.name == stale),
+                "`{stale}` was renamed in the manifest; a row still calling it that would advertise \
+                 a name no preset, context pack or client sends anymore"
+            );
+        }
         assert_eq!(
             summaries[0].availability,
             Some(ToolAvailability {
@@ -997,6 +1033,8 @@ mod tests {
                 exa: Some("secret".to_owned()),
                 tavily: None,
                 linkup: None,
+                // The published provider endpoints; only the keys are under test here.
+                endpoint_base: None,
             },
             fetch_enabled: true,
         });
@@ -1033,7 +1071,7 @@ mod tests {
         assert_eq!(schema["properties"]["timezone"]["maxLength"], json!(64));
         assert_eq!(schema["required"], json!(["timezone"]));
 
-        let core = registry.detail("task").expect("a catalogued row");
+        let core = registry.detail("tasks").expect("a catalogued row");
         assert_eq!(
             core.execution.scope,
             ToolExecutionScopeKind::SessionRequired
@@ -1060,7 +1098,7 @@ mod tests {
         assert!(names.contains(&"shell".to_owned()));
         assert!(names.contains(&"read".to_owned()));
         assert!(names.contains(&"toolRequest".to_owned()));
-        assert!(names.contains(&"task".to_owned()));
+        assert!(names.contains(&"tasks".to_owned()));
 
         // T7b: `delegate` is catalogued-only in this build (no nested-run runtime), so it is NOT
         // offered even when the harness has subagents. The same rule covers every name in
@@ -1072,7 +1110,7 @@ mod tests {
         );
 
         let enabled_only = ToolPolicy {
-            enabled: vec!["profileManage".to_owned(), "threadRead".to_owned()],
+            enabled: vec!["profiles".to_owned(), "threadRead".to_owned()],
             ..ToolPolicy::default()
         };
         let offered: Vec<String> = registry
@@ -1084,7 +1122,7 @@ mod tests {
         assert!(
             !offered
                 .iter()
-                .any(|name| name == "profileManage" || name == "threadRead"),
+                .any(|name| name == "profiles" || name == "threadRead"),
             "an enabled-but-unexecutable tool is offered to neither the model nor toolRequest: {offered:?}"
         );
         // The genuinely executable core pair is still offered, so the filter removed the two
@@ -1094,7 +1132,7 @@ mod tests {
         // Catalogue order, not policy order.
         let position = |name: &str| names.iter().position(|row| row == name).expect("declared");
         assert!(position("read") < position("shell"));
-        assert!(position("toolRequest") < position("task"));
+        assert!(position("toolRequest") < position("tasks"));
 
         // Every declaration carries its schema.
         assert!(
@@ -1109,7 +1147,7 @@ mod tests {
         assert!(
             !alone
                 .iter()
-                .any(|decl| decl.name == "delegate" || decl.name == "fileList")
+                .any(|decl| decl.name == "delegate" || decl.name == "files")
         );
         assert!(alone.iter().any(|decl| decl.name == "toolRequest"));
     }

@@ -1,6 +1,6 @@
 //! The route table, pinned against the TypeScript contract (T9).
 //!
-//! `crate::api::ROUTES` is the whole HTTP surface of this build: 47 generated templates and the 66
+//! `crate::api::ROUTES` is the whole HTTP surface of this build: 49 generated templates and the 70
 //! operations `packages/underload/harness/src/server/api.ts` declares for them. Every number and
 //! every path below is copied from the TypeScript source of record
 //! (`packages/underload/harness/src/shared/harness-api.ts:54-102`, the `HARNESS_PATH_TEMPLATES`
@@ -19,13 +19,13 @@ use std::collections::BTreeSet;
 use typecrate_harness::api::ROUTES;
 use typecrate_harness::contract;
 
-/// The 47 `(route id, template)` pairs of `HARNESS_PATH_TEMPLATES`
+/// The 49 `(route id, template)` pairs of `HARNESS_PATH_TEMPLATES`
 /// (`shared/harness-api.ts:54-102`), in the order the generated table lists them. The order is part
 /// of the contract, so the expected value is an ORDERED list and the comparison is positional.
 ///
 /// `plugins` and `pluginsByPluginId` are the T10 uplift: the Harness Plugin System's two routes,
 /// which the contract places between `toolsByToolIdExecutions` and `models`.
-const EXPECTED_TEMPLATES: [(&str, &str); 47] = [
+const EXPECTED_TEMPLATES: [(&str, &str); 49] = [
     ("root", "/v1/harness"),
     ("health", "/v1/harness/health"),
     ("config", "/v1/harness/config"),
@@ -66,6 +66,10 @@ const EXPECTED_TEMPLATES: [(&str, &str); 47] = [
     (
         "sessionsBySessionIdCommands",
         "/v1/harness/sessions/{session_id}/commands",
+    ),
+    (
+        "sessionsBySessionIdRecords",
+        "/v1/harness/sessions/{session_id}/records",
     ),
     (
         "sessionsBySessionIdQueue",
@@ -132,6 +136,10 @@ const EXPECTED_TEMPLATES: [(&str, &str); 47] = [
         "/v1/harness/sessions/{session_id}/threads/{thread_id}/cancel",
     ),
     (
+        "sessionsBySessionIdThreadsByThreadIdResume",
+        "/v1/harness/sessions/{session_id}/threads/{thread_id}/resume",
+    ),
+    (
         "sessionsBySessionIdThreadsByThreadIdTranscript",
         "/v1/harness/sessions/{session_id}/threads/{thread_id}/transcript",
     ),
@@ -174,27 +182,29 @@ const EXPECTED_TEMPLATES: [(&str, &str); 47] = [
     ("stream", "/v1/harness/stream"),
 ];
 
-/// The 66 operations counted BY VERB, i.e. the row a reader should be able to check against the
+/// The 70 operations counted BY VERB, i.e. the row a reader should be able to check against the
 /// TypeScript table without re-deriving it: `Object.keys(table)` of every route is what the 405
 /// sentence prints (`api.ts:4007`), so the per-verb totals are wire-visible facts. The plugin pair
-/// is the T10 uplift: one more GET (the catalogue) and one more PATCH (the settings write).
+/// is the T10 uplift: one more GET (the catalogue) and one more PATCH (the settings write). The
+/// Wave 1 uplift adds `GET .../records` (one more GET), `POST .../resume` (one more POST) and the
+/// `PATCH /tools/{tool_id}` plus `PATCH .../blocks/{block_id}` writes (two more PATCHes).
 const OPERATIONS_BY_METHOD: [(&str, usize); 5] = [
-    ("GET", 38),
-    ("POST", 13),
-    ("PATCH", 8),
+    ("GET", 39),
+    ("POST", 14),
+    ("PATCH", 10),
     ("DELETE", 6),
     ("PUT", 1),
 ];
 
 /// 1. Every generated template is present, with the contract's id, at the contract's position.
 #[test]
-fn the_table_carries_the_47_contract_templates_in_the_contracts_order() {
+fn the_table_carries_the_49_contract_templates_in_the_contracts_order() {
     let actual: Vec<(&str, &str)> = ROUTES
         .iter()
         .map(|route| (route.id, route.template))
         .collect();
 
-    assert_eq!(ROUTES.len(), 47, "the contract has 47 path templates");
+    assert_eq!(ROUTES.len(), 49, "the contract has 49 path templates");
     assert_eq!(actual.len(), EXPECTED_TEMPLATES.len());
 
     // Positional: a reordered table is a different router, not an equivalent one.
@@ -209,7 +219,7 @@ fn the_table_carries_the_47_contract_templates_in_the_contracts_order() {
 
 /// 2. The operation count and its per-verb split, exactly as the TypeScript table adds up.
 #[test]
-fn the_table_declares_sixty_six_operations_with_the_contracts_verb_split() {
+fn the_table_declares_seventy_operations_with_the_contracts_verb_split() {
     let mut per_method: BTreeMap<&str, usize> = BTreeMap::new();
 
     for route in ROUTES.iter() {
@@ -220,7 +230,7 @@ fn the_table_declares_sixty_six_operations_with_the_contracts_verb_split() {
 
     let total: usize = per_method.values().sum();
 
-    assert_eq!(total, 66, "the contract declares 66 operations");
+    assert_eq!(total, 70, "the contract declares 70 operations");
 
     // Exactly the five verbs the contract's `MethodTable` allows (`api.ts:3923`).
     let verbs: Vec<&&str> = per_method.keys().collect();
@@ -242,10 +252,10 @@ fn the_table_declares_sixty_six_operations_with_the_contracts_verb_split() {
     // the table without this line moving too.
     let declared: usize = ROUTES.iter().map(|route| route.operations.len()).sum();
 
-    assert_eq!(declared, 66);
+    assert_eq!(declared, 70);
 }
 
-/// 3. All 66 operations are reachable from the table, each exactly once: no variant is dead, no
+/// 3. All 70 operations are reachable from the table, each exactly once: no variant is dead, no
 ///    variant is mounted twice, and no `(path, method)` pair is declared twice.
 #[test]
 fn every_operation_is_reachable_from_the_table_exactly_once() {
@@ -280,15 +290,15 @@ fn every_operation_is_reachable_from_the_table_exactly_once() {
 
     assert_eq!(
         names.len(),
-        66,
-        "the table must reach 66 distinct operations"
+        70,
+        "the table must reach 70 distinct operations"
     );
-    assert_eq!(mentions, 66, "and reach each of them exactly once");
-    assert_eq!(mounts.len(), 66, "no path is mounted twice for one verb");
+    assert_eq!(mentions, 70, "and reach each of them exactly once");
+    assert_eq!(mounts.len(), 70, "no path is mounted twice for one verb");
     assert_eq!(
         ids.len(),
-        47,
-        "and the 47 template ids are all different (a duplicate id would shadow a route)"
+        49,
+        "and the 49 template ids are all different (a duplicate id would shadow a route)"
     );
 }
 
@@ -371,10 +381,10 @@ fn every_template_is_mount_relative_with_snake_case_parameters() {
     }
 }
 
-/// 6. The operation enum's variant names are pinned as a set, so "66 variants" is a checkable
+/// 6. The operation enum's variant names are pinned as a set, so "70 variants" is a checkable
 ///    statement rather than a comment. One variant per operation, and no variant without an operation.
 #[test]
-fn the_sixty_six_operation_names_are_the_ones_the_contract_describes() {
+fn the_seventy_operation_names_are_the_ones_the_contract_describes() {
     let expected: BTreeSet<String> = [
         // host: root / health / config
         "GetRoot",
@@ -397,6 +407,7 @@ fn the_sixty_six_operation_names_are_the_ones_the_contract_describes() {
         // host: tool catalogue
         "GetTools",
         "GetTool",
+        "PatchTool",
         "PostToolExecution",
         // host: built-in plugin catalogue
         "GetPlugins",
@@ -412,6 +423,7 @@ fn the_sixty_six_operation_names_are_the_ones_the_contract_describes() {
         "GetSessionDefinition",
         "GetSessionUsage",
         "GetSessionCommands",
+        "GetSessionRecords",
         "GetSessionQueue",
         "PostSessionTask",
         "PostSessionReset",
@@ -441,6 +453,7 @@ fn the_sixty_six_operation_names_are_the_ones_the_contract_describes() {
         "GetSessionThread",
         "DeleteSessionThread",
         "PostThreadCancel",
+        "PostThreadResume",
         // transcripts
         "GetTranscriptMetadata",
         "PutTranscript",
@@ -453,6 +466,7 @@ fn the_sixty_six_operation_names_are_the_ones_the_contract_describes() {
         "GetSessionTurnEvents",
         "GetSessionTurnStep",
         "GetSessionTurnBlock",
+        "PatchSessionTurnBlock",
         "GetSessionTurnAttachment",
         // stream
         "StreamRoute",
@@ -467,7 +481,7 @@ fn the_sixty_six_operation_names_are_the_ones_the_contract_describes() {
         .map(|(_, operation)| format!("{operation:?}"))
         .collect();
 
-    assert_eq!(expected.len(), 66);
+    assert_eq!(expected.len(), 70);
     assert_eq!(
         mounted, expected,
         "the table must reach exactly the operations the contract describes"
@@ -480,5 +494,5 @@ fn the_sixty_six_operation_names_are_the_ones_the_contract_describes() {
         .flat_map(|route| route.operations.iter())
         .count();
 
-    assert_eq!(one_operation_per_name, 66);
+    assert_eq!(one_operation_per_name, 70);
 }

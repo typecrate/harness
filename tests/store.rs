@@ -302,11 +302,18 @@ impl TurnExecutor for MockExecutor {
                     HarnessMessage::User {
                         content: prompt,
                         attachments,
+
+                        included: None,
+                        message_id: None,
                     },
                     HarnessMessage::Assistant {
                         content: answer.text.clone(),
                         tool_calls: Vec::new(),
                         reasoning: None,
+
+                        included: None,
+                        reasoning_included: None,
+                        message_id: None,
                     },
                 ],
                 stop_reason: Some("stop".to_owned()),
@@ -468,7 +475,13 @@ struct MockProjector {
 }
 
 impl Projector for MockProjector {
-    fn apply(&mut self, event: &HarnessEvent, at: u64, index: u64) -> Vec<Value> {
+    fn apply(
+        &mut self,
+        event: &HarnessEvent,
+        _lane: Option<u64>,
+        at: u64,
+        index: u64,
+    ) -> Vec<Value> {
         let kind = store::read::event_type_name(event).to_owned();
         self.events.push(kind.clone());
 
@@ -498,7 +511,7 @@ impl Projector for MockProjector {
 struct MockProjectorFactory;
 
 impl ProjectorFactory for MockProjectorFactory {
-    fn create(&self) -> Box<dyn Projector> {
+    fn create(&self, _seed: &typecrate_harness::ports::ProjectorSeed) -> Box<dyn Projector> {
         Box::new(MockProjector::default())
     }
 }
@@ -1212,7 +1225,7 @@ async fn a_queued_submit_runs_the_turn_and_the_record_keeps_every_event() {
         record
             .events
             .iter()
-            .map(store::read::event_type_name)
+            .map(|entry| store::read::event_type_name(&entry.event))
             .collect::<Vec<_>>(),
         vec!["start", "text", "usage", "done"]
     );
@@ -1271,11 +1284,18 @@ async fn a_queued_submit_runs_the_turn_and_the_record_keeps_every_event() {
             HarnessMessage::User {
                 content: "do the thing".to_owned(),
                 attachments: Vec::new(),
+
+                included: None,
+                message_id: None,
             },
             HarnessMessage::Assistant {
                 content: "the answer".to_owned(),
                 tool_calls: Vec::new(),
                 reasoning: None,
+
+                included: None,
+                reasoning_included: None,
+                message_id: None,
             },
         ]
     );
@@ -1403,7 +1423,7 @@ async fn a_failed_run_is_an_error_turn_and_raises_the_session_banner() {
         record
             .events
             .iter()
-            .map(store::read::event_type_name)
+            .map(|entry| store::read::event_type_name(&entry.event))
             .collect::<Vec<_>>(),
         vec!["start", "error"]
     );
@@ -2068,11 +2088,18 @@ async fn a_transcript_write_pages_the_document_and_refuses_a_stale_edit() {
         HarnessMessage::User {
             content: "draft one".to_owned(),
             attachments: Vec::new(),
+
+            included: None,
+            message_id: None,
         },
         HarnessMessage::Assistant {
             content: "answer one".to_owned(),
             tool_calls: Vec::new(),
             reasoning: None,
+
+            included: None,
+            reasoning_included: None,
+            message_id: None,
         },
     ];
 
@@ -2358,7 +2385,7 @@ async fn a_broken_transcript_is_accepted_as_raw_and_the_live_view_keeps_a_placeh
     };
     assert_eq!(placeholder.len(), 1);
     match &placeholder[0] {
-        HarnessMessage::System { content } => {
+        HarnessMessage::System { content, .. } => {
             assert!(
                 content.starts_with("[transcript unreadable: "),
                 "the placeholder states why ({content})"
@@ -2442,6 +2469,9 @@ async fn a_broken_transcript_is_accepted_as_raw_and_the_live_view_keeps_a_placeh
         vec![HarnessMessage::User {
             content: "repaired".to_owned(),
             attachments: Vec::new(),
+
+            included: None,
+            message_id: None,
         }]
     );
     assert!(state.transcript_invalid(&thread).is_none());
@@ -2673,6 +2703,9 @@ async fn attachment_refusals_happen_before_any_turn_exists() {
                 "[Image 1]",
                 8,
             )],
+
+            included: None,
+            message_id: None,
         }
     });
 
@@ -2799,7 +2832,7 @@ async fn a_command_turn_is_terminal_in_its_own_receipt_and_never_reaches_the_mod
         record
             .events
             .iter()
-            .map(store::read::event_type_name)
+            .map(|entry| store::read::event_type_name(&entry.event))
             .collect::<Vec<_>>(),
         vec!["start", "tool_call", "tool_result"],
         "the command is recorded as one synthesized tool round"
@@ -2807,7 +2840,7 @@ async fn a_command_turn_is_terminal_in_its_own_receipt_and_never_reaches_the_mod
 
     // `HarnessToolCall.arguments` is a raw JSON STRING, so the command line rides INSIDE it
     // (`sessions.ts:6210-6214`), and the call name is the reserved `command` tool.
-    let call = match &record.events[1] {
+    let call = match &record.events[1].event {
         HarnessEvent::ToolCall { call, agent, .. } => {
             assert_eq!(agent, "instruct");
             call
@@ -2819,7 +2852,7 @@ async fn a_command_turn_is_terminal_in_its_own_receipt_and_never_reaches_the_mod
         serde_json::from_str::<Value>(&call.arguments).expect("the arguments are JSON"),
         json!({"input": "/task add buy milk"})
     );
-    let (content, is_error, outcome) = match &record.events[2] {
+    let (content, is_error, outcome) = match &record.events[2].event {
         HarnessEvent::ToolResult {
             content,
             is_error,
@@ -2877,7 +2910,7 @@ async fn a_command_turn_is_terminal_in_its_own_receipt_and_never_reaches_the_mod
     assert_eq!(unknown.status, SessionTurnStatus::Error);
     let unknown = fixture.turn(&id, &unknown.turn_id);
     assert_eq!(unknown.status, "error");
-    match &unknown.events[2] {
+    match &unknown.events[2].event {
         HarnessEvent::ToolResult {
             content,
             is_error,
@@ -2899,7 +2932,7 @@ async fn a_command_turn_is_terminal_in_its_own_receipt_and_never_reaches_the_mod
 
     // `/help` is the live registry in TS's column form.
     let help = fixture.task(&id, "/help", None).await.expect("help");
-    let help = match &fixture.turn(&id, &help.turn_id).events[2] {
+    let help = match &fixture.turn(&id, &help.turn_id).events[2].event {
         HarnessEvent::ToolResult { content, .. } => content.clone(),
         other => panic!("expected a tool result, got {other:?}"),
     };
@@ -2923,7 +2956,7 @@ async fn a_command_turn_is_terminal_in_its_own_receipt_and_never_reaches_the_mod
 
     // A bare `/name` is that command's usage card (`command-builtins.ts:26-34`).
     let card = fixture.task(&id, "/tools", None).await.expect("the card");
-    let card = match &fixture.turn(&id, &card.turn_id).events[2] {
+    let card = match &fixture.turn(&id, &card.turn_id).events[2].event {
         HarnessEvent::ToolResult { content, .. } => content.clone(),
         other => panic!("expected a tool result, got {other:?}"),
     };
@@ -2938,7 +2971,7 @@ async fn a_command_turn_is_terminal_in_its_own_receipt_and_never_reaches_the_mod
         .task(&id, "/websearch rust lifetimes", None)
         .await
         .expect("the note is an answer");
-    let web = match &fixture.turn(&id, &web.turn_id).events[2] {
+    let web = match &fixture.turn(&id, &web.turn_id).events[2].event {
         HarnessEvent::ToolResult { content, .. } => content.clone(),
         other => panic!("expected a tool result, got {other:?}"),
     };
@@ -3595,7 +3628,7 @@ async fn a_created_tool_is_listed_reported_and_removed_with_the_budget() {
     // The harness's own control tools can never be switched off, and the frozen definition's tools
     // are protected with them (`api-reads.ts:104-106`).
     assert!(store::read::is_protected_tool_name("toolRequest"));
-    assert!(store::read::is_protected_tool_name("task"));
+    assert!(store::read::is_protected_tool_name("tasks"));
     assert!(!store::read::is_protected_tool_name("probe"));
     let protected = {
         let inner = store.lock();

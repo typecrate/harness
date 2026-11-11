@@ -69,7 +69,8 @@ fn assistant(
 /// number a reader can recompute from the event's position. The event's ordinal is passed as the
 /// display index, because a step's id IS that ordinal (`harness-api.ts:1792`).
 fn fold(events: &[HarnessEvent], settle: Option<(&str, u64)>) -> (Vec<Vec<Value>>, Value, Value) {
-    let mut projector = TurnProjectorFactory::new().create();
+    let mut projector =
+        TurnProjectorFactory::new().create(&typecrate_harness::ports::ProjectorSeed::default());
 
     fold_with(projector.as_mut(), events, settle)
 }
@@ -86,7 +87,7 @@ fn fold_with(
     for (index, event) in events.iter().enumerate() {
         let position = u64::try_from(index).expect("a small script");
 
-        ops.push(projector.apply(event, 1_000 + position, position));
+        ops.push(projector.apply(event, None, 1_000 + position, position));
     }
 
     if let Some((status, at)) = settle {
@@ -552,7 +553,7 @@ fn a_tool_round_becomes_one_step_row_with_its_result() {
                 // The key is the OPENING event's index, the same derivation as the step id, so
                 // the step row and the segment name the same round by construction.
                 "kind": "tool",
-                "id": "1-tool-1",
+                "id": "0-tool-1",
                 "turnId": "",
                 "sectionId": "s0",
                 "name": "read",
@@ -578,7 +579,7 @@ fn a_tool_round_becomes_one_step_row_with_its_result() {
             "op": "context:set",
             "turnId": "",
             "sectionId": "s0",
-            "blockId": "1-tool-1",
+            "blockId": "0-tool-1",
             "patch": {
                 // 16 argument code units + 8 result code units, counted exactly (invariant 5).
                 "chars": 24,
@@ -637,7 +638,7 @@ fn a_tool_round_becomes_one_step_row_with_its_result() {
         display["sections"][0]["context"],
         json!([{
             "kind": "tool",
-            "id": "1-tool-1",
+            "id": "0-tool-1",
             "turnId": "",
             "sectionId": "s0",
             "name": "read",

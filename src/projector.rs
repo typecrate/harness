@@ -68,7 +68,7 @@ use crate::contract::{
     BranchTerminalStatus, HarnessActionChoice, HarnessEvent, HarnessToolOutcome, HarnessUsage,
     ToolMediaDescriptor, ToolUiBlock, ToolUiPanel,
 };
-use crate::ports::{Projector, ProjectorFactory};
+use crate::ports::{Projector, ProjectorFactory, ProjectorSeed};
 
 /// `DISPLAY_PREVIEW_CHARS` (`turn-display.ts:102`): a settled step's result line.
 pub const PREVIEW_CHARS: usize = 280;
@@ -393,13 +393,208 @@ pub struct TurnProjector {
     /// (`pendingToolBlocks`, `turn-projector.ts:3378`). The pairing is by call, in order, exactly
     /// as the step pairing is, so an out-of-order result settles the right segment or none.
     pending_block: Option<(usize, String)>,
+    /// What the store seeded this fold with (`ports::ProjectorSeed`).
+    ///
+    /// It is the fold's answer to the seam's one honest limitation: `createTurnProjector` is handed a
+    /// `DisplayProjectContext`, not just an event stream (`sessions.ts:4160-4240`), and three context-bar
+    /// segments (the system block, the prompt block, and the steer blocks) plus every block id's section
+    /// prefix come from THAT, not from the events. A fold created without a seed still compiles a
+    /// document — it simply states nothing it was never told.
+    seed: ProjectorSeed,
+    /// The lane stamped on the event being folded right now, already normalized (`None` means lane 0).
+    ///
+    /// It is per-EVENT state, deliberately not per-turn: the recorder stamps each event with the lane the
+    /// conversation was on when the event arrived, so a turn that spans a compaction mints segments on two
+    /// rows and the fold reproduces that from the durable records alone (`turn-projector.ts:1435`).
+    event_lane: Option<u64>,
 }
 
 impl TurnProjector {
-    /// A fold over an empty turn.
+    /// A fold over an empty turn, with nothing to seed it.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A fold opened with the turn's context (`createTurnProjector(ctx)`, `turn-projector.ts:620-700`).
+    #[must_use]
+    pub fn seeded(seed: ProjectorSeed) -> Self {
+        Self {
+            seed,
+            ..Self::default()
+        }
+    }
+
+    /// The `{ordinal}-` prefix every block id carries (`blockIdOf`, `turn-projector.ts:1407`).
+    ///
+    /// This is the CONVERSATION'S section ordinal — the fixture's seed turn states `0-system-instructions`
+    /// and `0-tool-80` because its thread's section is ordinal 0. It is NOT the number of sections this
+    /// fold has opened: a fold that counted its own rows would renumber every segment the moment a
+    /// delegation opened a second flow, and a captured block id would stop resolving after a restart
+    /// (invariant 4).
+    #[must_use]
+    fn block_ordinal(&self) -> u64 {
+        self.seed.section_ordinal
+    }
+
+    /// Stamps the lane `block` was minted on, LAST, and only when there is one.
+    ///
+    /// The value is `self.event_lane`, which has exactly two suppliers: [`Self::apply`] sets it from the
+    /// event being folded (`turn-projector.ts:1435 laneOfEvent`) and [`Self::add_block_with_lane`] swaps
+    /// in the TURN's starting lane for a segment that is not an event (`:1441 laneOfTurn`). Both feed the
+    /// same writer because there is one mint point, [`Self::add_block`].
+    ///
+    /// Absence means lane 0 and the fold never invents a number (`:1449 laneFieldsOf`): a lane-0 segment
+    /// writes no key, which is what keeps a session that never compacted byte-identical to the document
+    /// this crate wrote before lanes existed.
+    fn with_lane(&self, block: Value) -> Value {
+        let Some(lane) = self.event_lane else {
+            return block;
+        };
+
+        match block.as_object() {
+            Some(entries) if lane != 0 => {
+                let mut entries = entries.clone();
+                entries.insert("lane".to_owned(), json!(lane));
+                Value::Object(entries)
+            }
+            _ => block,
+        }
+    }
+
+    /// The context-bar segments that are NOT events, minted once when the root flow opens
+    /// (`syncRecordBlocks`, `turn-projector.ts:1543-1600`, and `syncSteerBlocks`, `:1609-1660`).
+    ///
+    /// All three take the lane the TURN started on (`seed.lane`, `:1441 laneOfTurn`) — the pairing that
+    /// puts a post-compaction turn's prompt and answer on the same row — and each is metadata only, like
+    /// every other segment.
+    fn seed_root_segments(&mut self, section: usize, ops: &mut Vec<Value>) {
+        let (turn_id, section_id) = {
+            let section = &self.sections[section];
+            (self.seed.turn_id.clone(), section.id.clone())
+        };
+
+        if turn_id.is_empty() {
+            // Nothing was seeded, so nothing can be stated: the fold mints no segment with an empty
+            // identity rather than one the block route could never resolve.
+            return;
+        }
+
+        let at = self.seed.started_at.unwrap_or(0);
+        let ordinal = self.block_ordinal();
+
+        // The ONE system block, from the instruction sources recorded for THIS turn. No recorded source
+        // means no segment at all (`:1544-1552`), and the call id is `instructions-${sectionId}` so the
+        // block route can answer "what was the agent told".
+        if !self.seed.instruction_sources.is_empty() {
+            let chars: usize = self
+                .seed
+                .instruction_sources
+                .iter()
+                .map(|source| {
+                    source
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(display_chars)
+                        .unwrap_or(0)
+                })
+                .sum();
+
+            let block = json!({
+                "kind": "system",
+                "id": format!("{ordinal}-system-instructions"),
+                "turnId": turn_id,
+                "sectionId": section_id,
+                "name": "instructions",
+                "at": at,
+                "chars": chars,
+                "inPrompt": true,
+                "callId": format!("instructions-{section_id}"),
+                "stepId": "instructions-system",
+            });
+
+            self.add_block_with_lane(section, block, self.seed.lane, ops);
+        }
+
+        // The prompt block. Its call id resolves to the conversation's first user transcript entry, which
+        // is what lets the block detail route show the operator's own bytes (`:1578-1590`).
+        let prompt_chars: usize = display_chars(&self.seed.prompt);
+
+        if prompt_chars > 0 {
+            let mut block = json!({
+                "kind": "user",
+                "id": format!("{ordinal}-user-prompt"),
+                "turnId": turn_id,
+                "sectionId": section_id,
+                "name": "prompt",
+                "at": at,
+                "chars": prompt_chars,
+                "inPrompt": true,
+            });
+
+            // Let-chains (`rust-toolchain` edition allows them): one binding for the message id and one
+            // for the map it is written into.
+            if let Some(message_id) = self.seed.user_message_id.as_deref()
+                && let Some(entries) = block.as_object_mut()
+            {
+                entries.insert(
+                    "callId".to_owned(),
+                    json!(format!("transcript-{message_id}")),
+                );
+                entries.insert("stepId".to_owned(), json!("transcript-user"));
+            }
+
+            self.add_block_with_lane(section, block, self.seed.lane, ops);
+        }
+
+        // One block per accepted steered submit (`:1609-1660`). The id keys on the SUBMIT id, so the same
+        // submit re-folded after a restart keeps its row and a discarded attempt cannot renumber it.
+        // Cloned because the loop mints through `&mut self`.
+        let steers = self.seed.steers.clone();
+
+        for submit in &steers {
+            let Some(id) = submit.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+
+            let prompt = submit.get("prompt").and_then(Value::as_str).unwrap_or("");
+            let at = submit.get("at").and_then(Value::as_u64).unwrap_or(at);
+
+            let block = json!({
+                "kind": "user",
+                "id": format!("{ordinal}-user-{id}"),
+                "turnId": turn_id,
+                "sectionId": section_id,
+                "name": "steer",
+                "at": at,
+                "chars": display_chars(prompt),
+                "inPrompt": true,
+                "callId": format!("steer-{id}"),
+                "stepId": format!("steer-{id}"),
+            });
+
+            self.add_block_with_lane(section, block, self.seed.lane, ops);
+        }
+    }
+
+    /// [`Self::add_block`] with an explicit lane — the lane a NON-event segment takes is the turn's, never
+    /// the current event's, so the two sources cannot be conflated.
+    ///
+    /// The swap stays in scope for the whole `add_block` call, because that call is where the lane is
+    /// actually written (`add_block` stamps through [`Self::with_lane`], the single mint point). The
+    /// remembered value is then put back so the NEXT event-driven segment still sees the lane of the
+    /// event that opened it (`turn-projector.ts:1441 laneOfTurn` vs `:1435 laneOfEvent`).
+    fn add_block_with_lane(
+        &mut self,
+        section: usize,
+        block: Value,
+        lane: Option<u64>,
+        ops: &mut Vec<Value>,
+    ) {
+        let remembered = self.event_lane;
+        self.event_lane = crate::persistence::LaneStamp::of(lane);
+        self.add_block(section, block, ops);
+        self.event_lane = remembered;
     }
 
     /// The status the row reports: the settled one once the store settled the fold, else
@@ -448,7 +643,14 @@ impl TurnProjector {
         Section {
             key: key.to_owned(),
             ordinal,
-            id: format!("s{ordinal}"),
+            // The wire id is `${turnId}:${ordinal}` (`turn-projector.ts:698`). A seeded fold can mint it
+            // directly; an unseeded one keeps the `s{ordinal}` placeholder the store rewrites on the way
+            // out (`projector::section_wire_id`), which is the same fact stated later instead of now.
+            id: if self.seed.turn_id.is_empty() {
+                format!("s{ordinal}")
+            } else {
+                format!("{}:{ordinal}", self.seed.turn_id)
+            },
             // The root flow is `primary`; every other row this fold mints is a subagent
             // (`turn-display.ts:896`).
             role: if key == ROOT_KEY {
@@ -516,6 +718,11 @@ impl TurnProjector {
                 let index = self.sections.len() - 1;
 
                 open_section(&self.sections[index], ops);
+
+                // The non-event segments are minted with the flow that owns them, BEFORE anything this
+                // event adds, which is the ordering contract `context:add` honors: the bar arrives in
+                // conversation order, so a client appends.
+                self.seed_root_segments(index, ops);
 
                 return index;
             }
@@ -752,6 +959,14 @@ impl TurnProjector {
     /// it is still minted once and never renumbered, so an id captured before a restart resolves
     /// after it (invariant 4).
     fn add_block(&mut self, section: usize, block: Value, ops: &mut Vec<Value>) {
+        // THE ONE MINT POINT, so the lane is stamped the same way for every segment: an event-driven
+        // segment takes `self.event_lane`, which `apply` set from the event's own recorded stamp
+        // (`turn-projector.ts:1435 laneOfEvent`, applied at every `context:add` mint site — `:1564`,
+        // `:1588`, `:1662`, `:2163`, `:2219`, `:2313`, `:2490`, `:2603`). The non-event seam
+        // ([`Self::add_block_with_lane`]) swaps that value for the TURN's starting lane before
+        // delegating here, so no caller can mint an unlaned segment and no caller can patch a lane.
+        let block = self.with_lane(block);
+
         self.sections[section].context.push(block);
 
         ops.push(json!({
@@ -1037,8 +1252,19 @@ impl TurnProjector {
 
 impl Projector for TurnProjector {
     /// Folds one recorded event into the bounded display ops it produced.
-    fn apply(&mut self, event: &HarnessEvent, at: u64, index: u64) -> Vec<Value> {
+    fn apply(
+        &mut self,
+        event: &HarnessEvent,
+        lane: Option<u64>,
+        at: u64,
+        index: u64,
+    ) -> Vec<Value> {
         let mut ops: Vec<Value> = Vec::new();
+
+        // Every segment this event mints takes THIS event's recorded lane, and nothing else can
+        // (`turn-projector.ts:1435 laneOfEvent`). Normalized once, here, so a stamped 0 and an absent
+        // lane mint the same bytes.
+        self.event_lane = crate::persistence::LaneStamp::of(lane);
         let section = self.route(event, &mut ops);
 
         self.last_applied_at = Some(at);
@@ -1112,7 +1338,7 @@ impl Projector for TurnProjector {
                 // and the payload route reads `[eventFrom..=eventTo]` out of the record on a click.
                 let args_chars = display_chars(&call.arguments);
                 let section_id = self.sections[section].id.clone();
-                let block_id = format!("{}-tool-{index}", self.sections.len().max(1));
+                let block_id = format!("{}-tool-{index}", self.block_ordinal());
 
                 self.add_block(
                     section,
@@ -1368,7 +1594,7 @@ impl Projector for TurnProjector {
                         section,
                         json!({
                             "kind": "assistant",
-                            "id": format!("{}-assistant-{index}", self.sections.len().max(1)),
+                            "id": format!("{}-assistant-{index}", self.block_ordinal()),
                             "turnId": "",
                             "sectionId": section_id,
                             "name": "answer",
@@ -2262,8 +2488,8 @@ impl TurnProjectorFactory {
 }
 
 impl ProjectorFactory for TurnProjectorFactory {
-    fn create(&self) -> Box<dyn Projector> {
-        Box::new(TurnProjector::new())
+    fn create(&self, seed: &ProjectorSeed) -> Box<dyn Projector> {
+        Box::new(TurnProjector::seeded(seed.clone()))
     }
 }
 

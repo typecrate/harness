@@ -1,0 +1,247 @@
+{
+    "sessionId": "d8aa98d7-1886-4d3f-a6db-f4869a6623d4",
+    "seedTurnId": "af7b4021-15e9-4199-ad1f-4b537d7aa050",
+    "turns": [
+        {
+            "id": "af7b4021-15e9-4199-ad1f-4b537d7aa050",
+            "status": "done"
+        },
+        {
+            "id": "ed1e7c3f-7ce5-496a-a428-986606904267",
+            "status": "error",
+            "lane": 1
+        }
+    ],
+    "threadRecords": [
+        {
+            "id": "thread-1",
+            "agent": "general",
+            "status": "idle",
+            "contextLane": 1
+        }
+    ],
+    "pluginDiagnostics": [
+        {
+            "at": 1794327611708,
+            "kind": "policy",
+            "owner": "context-compaction",
+            "message": "context-compaction parked thread thread-1 and asked it to compact itself: ~2028 estimated tokens against an effective limit of 1000 (mode summarize). The next model turn carries the compaction instruction.",
+            "data": {
+                "mode": "summarize",
+                "threadId": "thread-1",
+                "tokens": 2028,
+                "effective": 1000,
+                "entries": 3
+            }
+        },
+        {
+            "at": 1794327614460,
+            "kind": "policy",
+            "owner": "context-compaction",
+            "message": "context-compaction thread thread-1 answered its compaction instruction on turn 3; the conversation is un-parked and the superseded range is withheld at the next boundary (or now, if this was the run's last turn).",
+            "data": {
+                "mode": "summarize",
+                "threadId": "thread-1",
+                "iteration": 3
+            }
+        },
+        {
+            "at": 1794327614464,
+            "kind": "policy",
+            "owner": "context-compaction",
+            "message": "context-compaction compacted thread thread-1 itself: 5 of 8 entry(ies) stop being sent, the retained head is the instruction at #2 and the answer at #7 (finalized at thread.idle).",
+            "data": {
+                "mode": "summarize",
+                "threadId": "thread-1",
+                "path": "thread.idle",
+                "instructionIndex": 2,
+                "answerIndex": 7,
+                "disabled": [
+                    1,
+                    3,
+                    4,
+                    5,
+                    6
+                ],
+                "total": 8
+            }
+        }
+    ],
+    "pluginDiagnosticCount": 3,
+    "journal": {
+        "lines": 338,
+        "events": 337,
+        "eventsWithLane": 336,
+        "laneValuesSeen": [
+            1
+        ],
+        "firstLaneStamp": {
+            "turnId": "af7b4021-15e9-4199-ad1f-4b537d7aa050",
+            "index": 1,
+            "type": "reasoning",
+            "lane": 1
+        },
+        "lastLaneStamp": {
+            "turnId": "ed1e7c3f-7ce5-496a-a428-986606904267",
+            "index": 79,
+            "type": "error",
+            "lane": 1
+        },
+        "lanesByTurn": {
+            "af7b4021-15e9-4199-ad1f-4b537d7aa050": {
+                "count": 256,
+                "lanes": {
+                    "1": 256
+                }
+            },
+            "ed1e7c3f-7ce5-496a-a428-986606904267": {
+                "count": 80,
+                "lanes": {
+                    "1": 80
+                }
+            }
+        },
+        "files": [
+            "events.d8aa98d7-1886-4d3f-a6db-f4869a6623d4.jsonl"
+        ]
+    },
+    "display": [
+        {
+            "turnId": "af7b4021-15e9-4199-ad1f-4b537d7aa050",
+            "sections": [
+                {
+                    "sectionKeys": [
+                        "id",
+                        "role",
+                        "agent",
+                        "agentLabel",
+                        "threadId",
+                        "nodes",
+                        "context",
+                        "state",
+                        "invocationId",
+                        "threadLabel",
+                        "startedAt",
+                        "model",
+                        "tail",
+                        "latestInput",
+                        "cachedInput",
+                        "answerNodeId",
+                        "endedAt"
+                    ],
+                    "blocks": [
+                        {
+                            "kind": "system",
+                            "id": "0-system-instructions",
+                            "laneReadAs": 0,
+                            "laneWritten": null
+                        },
+                        {
+                            "kind": "user",
+                            "id": "0-user-prompt",
+                            "laneReadAs": 0,
+                            "laneWritten": null
+                        },
+                        {
+                            "kind": "reasoning",
+                            "id": "0-reasoning-1",
+                            "laneReadAs": 1,
+                            "laneWritten": 1
+                        },
+                        {
+                            "kind": "assistant",
+                            "id": "0-assistant-56",
+                            "laneReadAs": 1,
+                            "laneWritten": 1
+                        },
+                        {
+                            "kind": "tool",
+                            "id": "0-tool-80",
+                            "laneReadAs": 1,
+                            "laneWritten": 1
+                        },
+                        {
+                            "kind": "reasoning",
+                            "id": "0-reasoning-83",
+                            "laneReadAs": 1,
+                            "laneWritten": 1
+                        },
+                        {
+                            "kind": "tool",
+                            "id": "0-tool-93",
+                            "laneReadAs": 1,
+                            "laneWritten": 1
+                        },
+                        {
+                            "kind": "assistant",
+                            "id": "0-assistant-96",
+                            "laneReadAs": 1,
+                            "laneWritten": 1
+                        },
+                        {
+                            "kind": "reasoning",
+                            "id": "0-reasoning-178",
+                            "laneReadAs": 1,
+                            "laneWritten": 1
+                        },
+                        {
+                            "kind": "assistant",
+                            "id": "0-assistant-233",
+                            "laneReadAs": 1,
+                            "laneWritten": 1
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "turnId": "ed1e7c3f-7ce5-496a-a428-986606904267",
+            "sections": [
+                {
+                    "sectionKeys": [
+                        "id",
+                        "role",
+                        "agent",
+                        "agentLabel",
+                        "threadId",
+                        "nodes",
+                        "context",
+                        "state",
+                        "invocationId",
+                        "threadLabel",
+                        "startedAt",
+                        "model",
+                        "tail",
+                        "endedAt"
+                    ],
+                    "blocks": [
+                        {
+                            "kind": "system",
+                            "id": "0-system-instructions",
+                            "laneReadAs": 1,
+                            "laneWritten": 1
+                        },
+                        {
+                            "kind": "user",
+                            "id": "0-user-prompt",
+                            "laneReadAs": 1,
+                            "laneWritten": 1
+                        },
+                        {
+                            "kind": "reasoning",
+                            "id": "0-reasoning-1",
+                            "laneReadAs": 1,
+                            "laneWritten": 1
+                        },
+                        {
+                            "kind": "assistant",
+                            "id": "0-assistant-56",
+                            "laneReadAs": 1,
+                            "laneWritten": 1
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}

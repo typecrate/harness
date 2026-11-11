@@ -83,6 +83,7 @@ pub mod api;
 pub mod attachments;
 pub mod config;
 pub mod contract;
+pub mod core_pruning;
 pub mod environment;
 pub mod error;
 pub mod events;

@@ -1,0 +1,14 @@
+[
+    {
+        "id": "thread-1",
+        "agent": "general",
+        "origin": "host",
+        "status": "idle",
+        "sequence": 2,
+        "label": "GL1",
+        "transcript_state": "ok",
+        "message_count": 8,
+        "chars": 11520,
+        "has_transcript": true
+    }
+]

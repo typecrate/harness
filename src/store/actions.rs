@@ -1093,6 +1093,14 @@ impl Store {
 
         // The durable record first (`sessions.ts:2760-2790`).
         let mut outcome = CommitOutcome::touch(session_id);
+        // The lane the recorder stamps on this event, read LIVE from the conversation
+        // (`sessions.ts:7925-7936`), before the mutable borrow of the turn below.
+        let lane = state
+            .turns
+            .get(&turn_id)
+            .and_then(|turn| turn.record.thread_id.as_deref())
+            .and_then(|thread_id| state.context_lane_of(Some(thread_id)));
+
         if let Some(turn) = state.turns.get_mut(&turn_id) {
             let event = HarnessEvent::ActionAnswer {
                 agent: agent.clone(),
@@ -1100,7 +1108,7 @@ impl Store {
                 answer: answer.clone(),
                 thread: None,
             };
-            let ops = turn.record_event(&event, at);
+            let ops = turn.record_event(&event, at, lane);
             outcome = outcome.event_with_ops(
                 "turn.upsert",
                 &[

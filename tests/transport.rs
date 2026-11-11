@@ -214,10 +214,16 @@ fn transcript() -> Vec<HarnessMessage> {
     vec![
         HarnessMessage::System {
             content: "Answer briefly.".to_owned(),
+
+            included: None,
+            message_id: None,
         },
         HarnessMessage::User {
             content: "What is 2 + 2?".to_owned(),
             attachments: vec![],
+
+            included: None,
+            message_id: None,
         },
     ]
 }
@@ -693,6 +699,9 @@ async fn an_unsupported_attachment_fails_before_the_provider_is_called() {
                     "text/plain",
                     TEXT,
                 )],
+
+                included: None,
+                message_id: None,
             }],
             &[],
             &signal,
@@ -892,6 +901,9 @@ fn an_attached_user_message_is_split_around_its_marker() {
             "image/png",
             PNG,
         )],
+
+        included: None,
+        message_id: None,
     }];
 
     let wire = transport::wire_messages(&messages, false).expect("an image wires on any host");
@@ -917,6 +929,9 @@ fn an_attached_user_message_is_split_around_its_marker() {
             "application/pdf",
             PDF,
         )],
+
+        included: None,
+        message_id: None,
     }];
     let appended = transport::wire_messages(&unmentioned, false).expect("a pdf wires");
 
@@ -939,6 +954,9 @@ fn an_attached_user_message_is_split_around_its_marker() {
             "image/png",
             PNG,
         )],
+
+        included: None,
+        message_id: None,
     }];
     let error = transport::wire_messages(&ambiguous, false)
         .expect_err("one marker, twice, is not a position");
@@ -962,6 +980,9 @@ fn video_needs_the_openrouter_host_and_audio_takes_the_documented_format() {
             "video/mp4",
             MP4,
         )],
+
+        included: None,
+        message_id: None,
     }];
 
     let refused = transport::wire_messages(&video, false).expect_err("only OpenRouter takes video");
@@ -990,6 +1011,9 @@ fn video_needs_the_openrouter_host_and_audio_takes_the_documented_format() {
             "audio/wav",
             WAV,
         )],
+
+        included: None,
+        message_id: None,
     }];
     let mp3 = [HarnessMessage::User {
         content: "[Audio 1]".to_owned(),
@@ -1000,6 +1024,9 @@ fn video_needs_the_openrouter_host_and_audio_takes_the_documented_format() {
             "audio/mpeg",
             MP3,
         )],
+
+        included: None,
+        message_id: None,
     }];
 
     assert_eq!(
@@ -1013,7 +1040,7 @@ fn video_needs_the_openrouter_host_and_audio_takes_the_documented_format() {
 }
 
 #[test]
-fn an_assistant_turn_keeps_its_calls_and_drops_its_reasoning() {
+fn an_assistant_turn_echoes_the_reasoning_the_store_projected() {
     let messages = [
         HarnessMessage::Assistant {
             content: String::new(),
@@ -1023,12 +1050,22 @@ fn an_assistant_turn_keeps_its_calls_and_drops_its_reasoning() {
                 arguments: "{\"path\":\"a.txt\"}".to_owned(),
             }],
             reasoning: Some("I should read the file first.".to_owned()),
+
+            included: None,
+            reasoning_included: None,
+            message_id: None,
         },
         HarnessMessage::Tool {
             content: "one\ntwo\n".to_owned(),
             tool_call_id: "call-1".to_owned(),
             name: "read".to_owned(),
             attachments: vec![],
+
+            // Mechanical compile fix (display-state wave): `outcome` is the new tool field, `None` = the unwritten `completed` form (`types/index.ts:293`).
+            outcome: None,
+
+            included: None,
+            message_id: None,
         },
     ];
     let wire = transport::wire_messages(&messages, false).expect("a tool block wires");
@@ -1036,9 +1073,16 @@ fn an_assistant_turn_keeps_its_calls_and_drops_its_reasoning() {
     assert_eq!(
         wire,
         vec![
+            // `transport/openai.ts:350` is the ONE exception to "assistant extras stay local":
+            // a projected entry with non-empty `reasoning` echoes it back as
+            // `reasoning_content` — the DeepSeek-compatible spelling the strict providers
+            // demand (DeepSeek thinking mode, Kimi, GLM, Qwen) — written BEFORE `tool_calls`
+            // because key order is part of the wire contract. A host that wants the other
+            // spelling is the provider-capability surface's job, not a guess here.
             json!({
                 "role": "assistant",
                 "content": "",
+                "reasoning_content": "I should read the file first.",
                 "tool_calls": [{
                     "id": "call-1",
                     "type": "function",
@@ -1047,7 +1091,7 @@ fn an_assistant_turn_keeps_its_calls_and_drops_its_reasoning() {
             }),
             json!({"role": "tool", "tool_call_id": "call-1", "content": "one\ntwo\n"}),
         ],
-        "reasoning is local replay data and never travels back to the provider"
+        "a projected thinking block travels back; every other assistant field does not"
     );
 }
 
@@ -1062,6 +1106,10 @@ fn tool_media_flushes_after_the_block_with_its_provenance() {
                 arguments: "{}".to_owned(),
             }],
             reasoning: None,
+
+            included: None,
+            reasoning_included: None,
+            message_id: None,
         },
         HarnessMessage::Tool {
             content: "saved".to_owned(),
@@ -1074,6 +1122,12 @@ fn tool_media_flushes_after_the_block_with_its_provenance() {
                 "image/png",
                 PNG,
             )],
+
+            // Mechanical compile fix (display-state wave): `outcome` is the new tool field, `None` = the unwritten `completed` form (`types/index.ts:293`).
+            outcome: None,
+
+            included: None,
+            message_id: None,
         },
     ];
     let wire = transport::wire_messages(&messages, false).expect("tool media wires");
@@ -1135,6 +1189,10 @@ fn a_five_file_block_is_grouped_into_numbered_parts() {
         content: String::new(),
         tool_calls: calls,
         reasoning: None,
+
+        included: None,
+        reasoning_included: None,
+        message_id: None,
     };
 
     let mut messages = vec![assistant];
@@ -1148,6 +1206,12 @@ fn a_five_file_block_is_grouped_into_numbered_parts() {
                 marker: "[Image 1]".to_owned(),
                 ..attachment(AttachmentKind::Image, "dl-1", "shot.png", "image/png", PNG)
             }],
+
+            // Mechanical compile fix (display-state wave): `outcome` is the new tool field, `None` = the unwritten `completed` form (`types/index.ts:293`).
+            outcome: None,
+
+            included: None,
+            message_id: None,
         });
     }
 

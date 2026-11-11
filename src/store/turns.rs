@@ -211,7 +211,11 @@ impl SessionStore {
 
         // A fresh turn starts an empty fold and is settled at `queued`, so the row a listener receives
         // before the run starts is the same row a reload rebuilds (`turn-projector.ts`'s settle step).
-        let mut turn_state = TurnState::new(self, turn);
+        // The seed is assembled HERE because the fold's non-event segments — the system block, the
+        // prompt block, the steer blocks — and every block id's section prefix come from the
+        // CONVERSATION, not from the event stream (`sessions.ts:4160-4240`).
+        let seed = state.projector_seed(&turn);
+        let mut turn_state = TurnState::seeded(self, turn, seed);
         turn_state.projector.settle("queued", now);
 
         state.turn_order.push(turn_id.clone());
@@ -346,6 +350,9 @@ impl SessionStore {
                 prompt: input.clone(),
                 thread_id: None,
                 thread_label: None,
+                // A thread-less turn has no conversation whose lane counter could be non-zero, so it
+                // starts on lane 0 and the key is never written (`sessions.ts:8953`).
+                lane: None,
                 references: None,
                 attachments: None,
                 status: "running".to_string(),
@@ -359,7 +366,8 @@ impl SessionStore {
                 extra: serde_json::Map::new(),
             };
 
-            let mut turn_state = TurnState::new(self, turn);
+            let seed = state.projector_seed(&turn);
+            let mut turn_state = TurnState::seeded(self, turn, seed);
             // The command turn is born `running` but its fold opens at `queued`, exactly as a queued
             // turn's does: the projector's settle step is what makes the row terminal, and only the
             // terminal write does that (`sessions.ts:6119-6132`).
@@ -806,6 +814,14 @@ impl SessionStore {
             .unwrap_or_else(|| state.primary_agent());
         let index = state.turns.get(&turn_id).map(|turn| turn.record.index)?;
 
+        // DISPLAY LANE, read at the moment the turn is CLAIMED (`sessions.ts:8871-8874` reads
+        // `contextLaneOf` HERE and `:8953` writes the field, only when it is non-zero). This is the
+        // `startingLane` the projector pairs with every event stamp: a turn that starts on lane 1 — the
+        // continuation after a compaction — paints its prompt and its answer on the SAME row
+        // (`turn-projector.ts:1441 laneOfTurn`), and a turn that starts on lane 0 writes no key at all.
+        let starting_lane =
+            crate::persistence::LaneStamp::of(state.context_lane_of(thread_id.as_deref()));
+
         {
             let turn = state.turns.get_mut(&turn_id)?;
 
@@ -813,6 +829,7 @@ impl SessionStore {
             // and a crash after this write leaves an explicit interrupted turn rather than a prompt that
             // vanished.
             turn.record.status = "running".to_string();
+            turn.record.lane = starting_lane;
             turn.record.started_at = Some(started_at);
             turn.record.updated_at = started_at;
             turn.record
@@ -1414,6 +1431,16 @@ impl SessionStore {
         let checkpoint_due =
             at.saturating_sub(state.checkpoint_at) >= store::CHECKPOINT_INTERVAL_MS;
 
+        // DISPLAY LANE, read LIVE per event (`sessions.ts:7925-7936`): the counter is read from the
+        // CONVERSATION before every event rather than cached at turn start, so a mid-run compaction
+        // takes effect on the very next event and one turn's bar can show both rows. Read here, outside
+        // the `turns` borrow below, because the counter lives in the conversation roster.
+        let lane = state
+            .turns
+            .get(turn_id)
+            .and_then(|turn| turn.record.thread_id.as_deref())
+            .and_then(|thread_id| state.context_lane_of(Some(thread_id)));
+
         let (index, ops, thread_id, usage) = {
             let Some(turn) = state.turns.get_mut(turn_id) else {
                 return;
@@ -1426,7 +1453,7 @@ impl SessionStore {
             // All three happen inside `TurnState::record_event`, which is the ONLY place display ops are
             // minted — that is what makes "live == replay" true by construction.
             let index = u64::try_from(turn.record.events.len()).unwrap_or(u64::MAX);
-            let ops = turn.record_event(&event, at);
+            let ops = turn.record_event(&event, at, lane);
 
             // 4. the token tally, folded from the per-request `usage` event only (`:7139-7144`), so a
             //    client never recomputes it and a `done` event cannot double the last step.
@@ -1758,6 +1785,12 @@ fn build_queued_turn(
         prompt: prompt.to_string(),
         thread_id: thread_id.map(str::to_string),
         thread_label: thread_label.map(str::to_string),
+        // A QUEUED turn carries no lane: the lane is read when the turn STARTS
+        // (`sessions.ts:8871-8874`), so a task that sat in the backlog across a compaction starts on
+        // the lane that is current when it is claimed, not on the one that was current when it was
+        // submitted. A turn refused before it started is the exception and copies the lane it was
+        // handed (`:6727-6774`).
+        lane: None,
         references: (!references.is_empty()).then(|| references.to_vec()),
         attachments: (!attachments.is_empty()).then(|| attachments.to_vec()),
         status: "queued".to_string(),
