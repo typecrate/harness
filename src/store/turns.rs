@@ -1505,12 +1505,15 @@ impl SessionStore {
 
         // 3. journal append, best-effort BY POLICY (`sessions.ts:1121-1131`): a full disk must not change
         //    a run's outcome, and the refusal is retained and reported rather than swallowed.
+        // The position the journal line carries is the TURN's, not the file's: `turn_id` + `index`
+        // are the same address a display step id carries, and `at` is the timestamp step 2 already
+        // stamped the record with (`sessions.ts:7930-7961`, `journal.ts:292-300`).
         if let Some(journal) = journal_of(
             journals,
             journal_problems,
             &self.config.sessions_dir(),
             session_id,
-        ) && let Err(error) = journal.append(&event, false)
+        ) && let Err(error) = journal.append(turn_id, index, at, &event, false)
         {
             journal_problems.push(error.message);
         }

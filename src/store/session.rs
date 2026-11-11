@@ -579,7 +579,7 @@ impl SessionStore {
             // taken above covers it: a rolled-back reset never leaves an empty journal behind a full
             // record.
             if let Some(journal) = inner.journals.get_mut(id)
-                && let Err(error) = journal.rewrite(&[])
+                && let Err(error) = journal.truncate()
             {
                 // The document is what makes the reset real; a log that refuses to restart is
                 // reported, exactly as a journal refusal is anywhere else in this store.

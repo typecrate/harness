@@ -908,7 +908,7 @@ fn scan_file(file: &Path) -> JournalReadResult {
                 // line has an expectation, so the first event of a turn never reports a gap even when
                 // the log starts at index 7 (a compaction of a pruned turn keeps the tail's indices).
                 if let Some(next) = expected.get(&record.turn_id)
-                    && record.index != next
+                    && record.index != *next
                 {
                     problems.push(JournalProblem {
                         line: number,
@@ -929,11 +929,15 @@ fn scan_file(file: &Path) -> JournalReadResult {
         }
     }
 
+    // Field order of the initializer matters to the borrow checker: `empty` reads `events`, so it is
+    // computed before `events` moves into the result (`empty: events.length === 0`, `:430`).
+    let empty = events.is_empty();
+
     JournalReadResult {
         events,
         header,
         problems,
-        empty: events.is_empty(),
+        empty,
         missing: false,
         truncated_tail,
     }
