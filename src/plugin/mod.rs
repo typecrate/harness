@@ -45,8 +45,13 @@
 //! `harness.dispose` so the plugin can release its own timers. See
 //! [`hooks::Registration::enabled`] and the pins in `tests/plugin_host.rs`.
 
-// The three shipped policies are written against this layer, not inside it; they are declared
-// here once their modules compile (each one is a `Plugin` impl over the seam).
+pub mod context;
+// The three shipped policies are written against this layer, not inside it; each one is a
+// `Plugin` impl over the seam. async-ping is first because it is the reference example for the
+// reserved `enabled` switch outside the framework (its timers are its own, not the bus's).
+pub mod async_ping;
+// The context policies are declared here once their modules compile (`context_trimmer`,
+// `context_compaction`); see the port plan in this module's header.
 pub mod diagnostics;
 pub mod event;
 pub mod host;

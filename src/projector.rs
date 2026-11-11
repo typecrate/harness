@@ -332,16 +332,20 @@ pub struct Node {
 }
 
 /// One attempt's minted nodes, so a `retry` can name the exact ones to drop
-/// (`turn-projector.ts:1023-1027`).
+/// (`turn-projector.ts:1023-1027`, window shape at `:492-496` and `:1122`).
 ///
-/// `block_ids` is the bar half of the same window (`turn-display.ts:561-577`, `blockIds`): the prose
-/// segments this attempt minted. A retried request produced a thinking strip and an answer strip that
-/// never happened, so a retry removes them too - one `context:remove` op each, in TS's order
-/// (`turn-projector.ts:1216`).
+/// `block_ids` is the bar half of the same window: the prose segments this attempt minted. A retried
+/// request produced a thinking strip and an answer strip that never happened, so a retry removes them
+/// too - one `context:remove` op each, BEFORE the `attempt:discard` frame that names the nodes
+/// (`:1216-1218`).
+///
+/// `text_keys` answers the one question `done` asks: did this attempt stream answer prose, in which case
+/// the `done` message's repeated content must NOT become a second answer segment (`:2581`, `:2604`).
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Attempt {
     node_ids: Vec<String>,
     block_ids: Vec<String>,
+    text_keys: Vec<String>,
 }
 
 /// One agent flow: the turn's root invocation, or one nested invocation/branch
@@ -375,12 +379,14 @@ pub struct Section {
     /// The prose node this request is still streaming into; detached at every boundary.
     text_writer: Option<usize>,
     reasoning_writer: Option<usize>,
-    /// The context-bar segment this window's ANSWER is streaming into, and the same for its
-    /// THINKING (`windowAssistantBlock`/`windowReasoningBlock`, `turn-display.ts:564-577`).
+    /// The context-bar segment this window's ANSWER is streaming into, and the same for its THINKING
+    /// (`textBlockId`/`textOpenedAt` and `reasoningBlockId`/`reasoningOpenedAt`,
+    /// `turn-projector.ts:516-521`).
     ///
     /// They sit beside the node writers because a window has two halves that are minted together and
-    /// patched apart: the node carries the text itself, the segment carries only counts and the event
-    /// window. Both are detached at the same boundaries, in [`Self::close_writers`].
+    /// patched on the same delta: the node carries the text itself, the segment carries only the running
+    /// count and the event window. Both detach at the same boundaries, in [`Self::close_writers`]
+    /// (`:1131-1137`).
     text_window: Option<ProseWindow>,
     reasoning_window: Option<ProseWindow>,
     attempt: Option<Attempt>,
@@ -826,11 +832,19 @@ impl TurnProjector {
 
     /// Detaches the prose writers, so the next request streams into nodes of its OWN and a
     /// retry cannot remove a committed half (`closeWriters`, `:1032-1039`).
+    ///
+    /// The bar windows detach with them: the next window mints its OWN segment, and a delta patch
+    /// aimed at a closed window would rewrite a strip row the reader has already seen finish
+    /// (`record.textBlockId = record.reasoningBlockId = undefined`, `:1131-1137`). No patch is
+    /// emitted here - a segment's running count is published by the delta that grew it, never by the
+    /// boundary that closes it.
     fn close_writers(&mut self, section: usize) {
         let section = &mut self.sections[section];
 
         section.text_writer = None;
         section.reasoning_writer = None;
+        section.text_window = None;
+        section.reasoning_window = None;
     }
 
     /// Opens the attempt window a later `retry` may discard (`beginAttempt`, `:1023-1027`).
@@ -845,6 +859,22 @@ impl TurnProjector {
     fn track_attempt_node(&mut self, section: usize, node_id: &str) {
         if let Some(attempt) = self.sections[section].attempt.as_mut() {
             attempt.node_ids.push(node_id.to_owned());
+        }
+    }
+
+    /// Claims one bar segment for this attempt, so a `retry` takes the strip back with the rows
+    /// (`window.blockIds.push(blockId)`, `:2146`, `:2223`, `:2294`).
+    fn track_attempt_block(&mut self, section: usize, block_id: &str) {
+        if let Some(attempt) = self.sections[section].attempt.as_mut() {
+            attempt.block_ids.push(block_id.to_owned());
+        }
+    }
+
+    /// Claims an ANSWER segment for this attempt. The list is TS's `textKeys` and it is read by
+    /// exactly one caller: `done`, which must not count a streamed answer twice (`:2143`, `:2581`).
+    fn track_attempt_text_key(&mut self, section: usize, block_id: &str) {
+        if let Some(attempt) = self.sections[section].attempt.as_mut() {
+            attempt.text_keys.push(block_id.to_owned());
         }
     }
 
@@ -923,6 +953,14 @@ impl TurnProjector {
 
         let section_id = self.sections[section].id.clone();
 
+        // A retried attempt's segments leave the bar with its rows: they were never committed, so
+        // their bytes were never part of the conversation either (`:1216`). One `context:remove` per
+        // claimed segment, in mint order, BEFORE the `attempt:discard` frame - the order TS emits,
+        // and the order a client's strip repaints in.
+        for block_id in &attempt.block_ids {
+            self.remove_block(section, block_id, ops);
+        }
+
         // The op names the exact nodes to drop, so a retry never depends on the client
         // tracking an attempt window (`turn-display.ts:1068-1069`).
         ops.push(json!({
@@ -935,6 +973,31 @@ impl TurnProjector {
         self.sections[section]
             .nodes
             .retain(|node| !attempt.node_ids.contains(&node.id));
+    }
+
+    /// Takes one context-bar segment out of its flow and publishes the removal
+    /// (`removeBlock`, `:1141-1160`).
+    ///
+    /// A segment this fold never minted is skipped rather than answered with a removal op for a row
+    /// no client holds, which is what keeps a replay of a partially-seeded document from inventing
+    /// traffic.
+    fn remove_block(&mut self, section: usize, block_id: &str, ops: &mut Vec<Value>) {
+        let Some(position) = self.sections[section]
+            .context
+            .iter()
+            .position(|block| block.get("id").and_then(Value::as_str) == Some(block_id))
+        else {
+            return;
+        };
+
+        self.sections[section].context.remove(position);
+
+        ops.push(json!({
+            "op": "context:remove",
+            "turnId": "",
+            "sectionId": self.sections[section].id,
+            "blockId": block_id,
+        }));
     }
 
     /// Inserts one notice node (`noticeNode`, `:1251-1273`). A notice is server status, so it
@@ -1598,30 +1661,23 @@ impl Projector for TurnProjector {
                 // `done` closes one AGENT turn, not the user's: the root keeps streaming until
                 // the turn settles, and a response still waiting on background work has not
                 // finished at all (`:2307-2321`).
+                //
+                // Captured BEFORE the commit clears the window: a `done` frame repeats the response
+                // text, so it counts as an `assistant` segment ONLY when this attempt streamed no
+                // prose (`record.attempt?.textKeys.length > 0`, `:2581`). Otherwise the deltas already
+                // counted those bytes, and counting them twice would inflate the bar.
+                let streamed_prose = self.sections[section]
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|attempt| !attempt.text_keys.is_empty());
+
                 self.commit_attempt(section, &mut ops);
 
-                // The bar's answer segment. TypeScript mints an `assistant` block per WINDOW of
-                // streamed `text` deltas and falls back to the `done` message ONLY when that
-                // window holds no deltas - the two carry the same bytes, and counting both would
-                // double the answer (`turn-display.ts:373-376`). This fold does not open a bar
-                // segment per prose window (the deltas are folded into nodes; a segment per window
-                // would need a window-scoped id and a patch on every delta), so the fallback IS
-                // the answer segment here, keyed by the `done` event's own index exactly as
-                // TypeScript keys that same case.
-                //
-                // Only the ROOT flow gets one: a nested flow's answer is already a row in its
-                // parent's transcript (`:2380`). A pending set is never consulted, because this
-                // engine runs a tool round to completion before the next request - the module
-                // header says why.
-                let streamed = self.sections[section]
-                    .nodes
-                    .iter()
-                    .any(|node| node.kind == "text");
-
-                if self.sections[section].key == ROOT_KEY
-                    && !streamed
-                    && !message.content.is_empty()
-                {
+                // The bar's answer segment, from the `done` message alone. TypeScript applies this
+                // fallback to EVERY flow, root or nested (`:2583-2612`); the earlier fold restricted
+                // it to the root on the theory that a nested answer is already a row in its parent's
+                // transcript, which the recorded projector does not say.
+                if !streamed_prose && !message.content.is_empty() {
                     let answer_chars = display_chars(&message.content);
                     let section_id = self.sections[section].id.clone();
 
@@ -2156,8 +2212,6 @@ impl TurnProjector {
                     section_state.reasoning_writer = Some(position);
                 }
 
-                let _ = at;
-
                 ops.push(json!({
                     "op": "node:insert",
                     "turnId": "",
@@ -2169,6 +2223,64 @@ impl TurnProjector {
 
                 self.track_attempt_node(section, &format!("n{index}"));
 
+                // --- the bar's segment for this window -----------------------------------------
+                // TypeScript mints ONE `assistant`/`reasoning` context segment per prose WINDOW,
+                // on the window's first delta (`turn-projector.ts:2138-2163` for the answer,
+                // `:2188-2222` for the thinking). The id is the window's opening event index under
+                // the flow's section ordinal - `0-assistant-56` is the answer window that opened on
+                // event 56 of section 0 - which is what makes a captured block id survive a restart
+                // (invariant 4) and what the inclusion write addresses.
+                let block_kind = if kind == "text" { "assistant" } else { "reasoning" };
+                let block_id = format!("{}-{block_kind}-{index}", self.block_ordinal());
+
+                self.add_block(
+                    section,
+                    json!({
+                        "kind": block_kind,
+                        "id": block_id.clone(),
+                        "turnId": "",
+                        "sectionId": self.sections[section].id,
+                        // The strip's label; `answer` and `reasoning` are the two TS names
+                        // (`:2152`, `:2201`).
+                        "name": if block_kind == "assistant" {
+                            "answer"
+                        } else {
+                            "reasoning"
+                        },
+                        // Every delta of this window carries a clock in this engine, so `at` is
+                        // always stated; TS omits the key only for a fold with no recorded
+                        // timestamp at all (`stamp === undefined ? {} : { at: stamp }`).
+                        "at": at,
+                        "chars": 0,
+                        // A committed answer IS replayed to the model on later requests; a thinking
+                        // window is NOT. This is the STATIC per-kind verdict, and the block detail
+                        // read is where the trimmer's real `reasoningIncluded` answer appears
+                        // (`:2158-2172`): the bar cannot know whether one window's thinking rides
+                        // in the next request, so it never guesses.
+                        "inPrompt": block_kind == "assistant",
+                        "eventFrom": index,
+                        "eventTo": index,
+                    }),
+                    ops,
+                );
+
+                // The window bookkeeping the per-delta growth patch reads, and the attempt's claim on
+                // the segment: a retried request produced a strip that never happened
+                // (`window.textKeys`/`window.blockIds`, `:2143-2146`, `:2223`).
+                let window = ProseWindow {
+                    block: block_id.clone(),
+                    opened_at: at,
+                };
+
+                if kind == "text" {
+                    self.sections[section].text_window = Some(window);
+                    self.track_attempt_text_key(section, &block_id);
+                } else {
+                    self.sections[section].reasoning_window = Some(window);
+                }
+
+                self.track_attempt_block(section, &block_id);
+
                 position
             }
         };
@@ -2179,6 +2291,7 @@ impl TurnProjector {
         node.chars = display_chars(&node.text);
 
         let node_id = node.id.clone();
+        let chars = node.chars;
 
         // A current answer or thinking window streams in FULL: one append per delta, and the
         // exact running length travels beside it (invariant 5).
@@ -2189,6 +2302,34 @@ impl TurnProjector {
             "nodeId": node_id,
             "delta": delta,
         }));
+
+        // The segment grows on the SAME delta the node does (`flowWindowPatch`, `:319-330`, applied
+        // at `:2175` for the answer and `:2246` for the thinking): the exact running count, the newest
+        // event index the window consumed, and the bracketed span ONLY once a later event proves one -
+        // a one-event window gets no `durationMs` key at all, because a fabricated `0` would read as
+        // "instantaneous" to a client. The patch never rewrites an identity member, so the mint's key
+        // order survives: `chars`/`eventTo` land in place and a first `durationMs` appends last, which
+        // is the byte order the recorded displays show (`... eventFrom, eventTo, lane, durationMs`).
+        let window = if kind == "text" {
+            self.sections[section].text_window.clone()
+        } else {
+            self.sections[section].reasoning_window.clone()
+        };
+
+        let Some(window) = window else {
+            return;
+        };
+
+        let mut patch = Map::new();
+
+        patch.insert("chars".to_owned(), json!(chars));
+        patch.insert("eventTo".to_owned(), json!(index));
+
+        if at > window.opened_at {
+            patch.insert("durationMs".to_owned(), json!(at - window.opened_at));
+        }
+
+        self.patch_block(section, &window.block, patch, ops);
     }
 
     /// Finds the step one `tool_result` settles, pairing by call id and only then by name, and

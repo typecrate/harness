@@ -323,12 +323,20 @@ fn a_root_flow_opens_one_section_and_streams_its_answer() {
         // text: one insert, then one append per delta - the running window streams in FULL - and
         // the section row is re-patched as its designated tail moves. done: the attempt commits,
         // and the row is patched once more with the answer reference.
+        //
+        // R18 (prose context state): each delta ALSO keeps a `context` segment row per window, so the
+        // bar carries the streaming text and its length. The first delta mints the segment
+        // (`context:add`) and every delta patches its `chars` (`context:set`) - exactly the ops
+        // `turn-projector.ts` puts in `live.ops` beside the node appends.
         vec![
             "section:open",
             "section:set",
             "node:insert",
+            "context:add",
             "node:append",
+            "context:set",
             "node:append",
+            "context:set",
             "section:set",
             "attempt:commit",
         ]
@@ -371,12 +379,26 @@ fn a_root_flow_opens_one_section_and_streams_its_answer() {
                 "startedAt": 1_000,
                 "endedAt": 1_004,
                 "tail": {"kind": "assistant", "nodeId": "n1", "chars": 12, "truncated": false},
-                // The context bar is EMPTY here on purpose: TypeScript mints an `assistant`
-                // segment per prose window, and this fold carries a streamed answer in the node
-                // and the tail only - the `done` fallback fires solely when no delta streamed
-                // (`turn-display.ts:373-376`). The member is still PRESENT, because a client maps
-                // over it without a presence check.
-                "context": [],
+                // The streamed answer owns one context row: every prose window mints a segment on its
+                // first delta and its `chars` track the stream (`turn-projector.ts:1891-1925`), and the
+                // recorded TypeScript document says so byte for byte - `fixtures/lane-compaction/turn-displays.json`
+                // carries `0-assistant-1079` with `chars: 32`, which is neither the whole answer (45)
+                // nor absent, so it cannot be the `done` fallback (`turn-display.ts:373-376`) that the
+                // pre-R18 fold produced here. The `done` fallback adds a row only for an answer that
+                // never streamed, and this one streamed, so this array holds exactly the window's row.
+                "context": [{
+                    "kind": "assistant",
+                    "id": "0-assistant-1",
+                    "turnId": "",
+                    "sectionId": "s0",
+                    "name": "answer",
+                    "at": 1_001,
+                    "chars": 12,
+                    "inPrompt": true,
+                    "eventFrom": 1,
+                    "eventTo": 2,
+                    "durationMs": 1,
+                }],
                 "answerNodeId": "n1",
                 "nodes": [{
                     "kind": "text",
@@ -475,10 +497,12 @@ fn a_retry_discards_the_failed_attempt_and_a_commit_keeps_it() {
     );
 
     // A `retry` mints no notice of its own (R16a): the only ops it produces are the discard and
-    // the tail re-resolution.
+    // the tail re-resolution - plus, since R18, the removal of every context segment that attempt
+    // was streaming (`turn-projector.ts:1746-1749` removes the flow's blocks before dropping it).
+    // This attempt streamed one answer delta, so exactly one segment goes.
     let retry_ops = op_names(&ops[2]);
 
-    assert_eq!(retry_ops, vec!["attempt:discard"]);
+    assert_eq!(retry_ops, vec!["context:remove", "attempt:discard"]);
 }
 
 #[test]
@@ -1135,9 +1159,13 @@ fn an_unrouted_agent_gets_its_own_flow() {
             "section:set",
             "section:open",
             "node:insert",
+            "context:add",
             "node:append",
+            "context:set",
             "node:insert",
+            "context:add",
             "node:append",
+            "context:set",
         ],
         "a threadless start from the agent that begins the turn opens the ROOT row (the first flow \
          this fold sees), and the other agent's stream opens a flow of its own so its prose is \

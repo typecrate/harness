@@ -489,6 +489,16 @@ pub fn session_resource_of(
         pending_action_count: u64::try_from(state.pending_actions.len()).unwrap_or(u64::MAX),
         created_tool_count: u64::try_from(state.created_tools.len()).unwrap_or(u64::MAX),
         created_tool_limit: u64::try_from(crate::contract::MAX_CREATED_TOOLS).unwrap_or(u64::MAX),
+        // T1.5's last mile (`api-reads.ts:242-256`): the journal rides the identified session read ONLY
+        // when it is non-empty, so a healthy session keeps its exact pre-T4 key set. The entries are
+        // copied, never aliased, which is what stops a consumer writing through the response into the
+        // stored journal.
+        plugin_diagnostics: state
+            .record
+            .plugin_diagnostics
+            .as_ref()
+            .filter(|entries| !entries.is_empty())
+            .cloned(),
     }
 }
 

@@ -265,6 +265,35 @@ impl Store {
             )));
         }
 
+        // `transcriptSupported` (`sessions.ts:9160-9167`) is a CAPABILITY question, not a code path: the
+        // harness this store runs always exposes the transcript write, so the two fields the boot document
+        // advertises are exactly what a reduced deployment flips to raise this 409 (TS asks the same
+        // question of `threadsSupported` plus the harness's own `setThreadMessages`).
+        let capabilities = crate::contract::service_capabilities();
+
+        if !(capabilities.transcript_editing && capabilities.persistent_threads) {
+            return Err(ApiError::conflict(
+                "This session's harness does not support replacing a thread transcript.".to_owned(),
+            ));
+        }
+
+        // Live work owns the transcript. The row's status PLUS a lane still holding an active run is this
+        // route's own live-work gate, because a stopped-but-still-unwinding run reports `stopped`
+        // (`sessions.ts:9200-9219`). A mid-run flag change would be rewritten by the run itself, so the
+        // honest answer is a refusal - and the single-segment block write reaches it through exactly this
+        // gate, which is why the gate sits in the store operation and not in one route.
+        if thread.status == "running"
+            || state
+                .lanes
+                .get(thread_id)
+                .and_then(|lane| lane.active_turn.as_ref())
+                .is_some()
+        {
+            return Err(ApiError::conflict(format!(
+                "Thread \"{thread_id}\" is running; stop it before replacing its transcript."
+            )));
+        }
+
         // A transcript is validated as data. `serde_json::from_value` is this port's `readHarnessMessages`:
         // the message union's serde impl IS the contract's shape, so a structural failure is exactly the
         // condition TS reports.

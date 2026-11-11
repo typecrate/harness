@@ -451,12 +451,9 @@ impl PluginHostReport {
     /// `pluginMetadata` while the row's `hooks` is the bus's own `live()` surface.
     #[must_use]
     pub fn subscribed(&self, plugin: &str) -> Vec<&'static str> {
-        self.bus
-            .live()
-            .into_iter()
-            .filter(|(_, owners)| owners.iter().any(|owner| owner == plugin))
-            .map(|(event, _)| event)
-            .collect()
+        // The bus owns the ordering rule (registration order, wildcard expanded in place); this is
+        // the one call the row needs.
+        self.bus.live_for(plugin)
     }
 
     /// Whether this plugin has any live subscription at all (the Plugins pane's inert check).
@@ -516,8 +513,15 @@ impl PluginHost {
             // so a host with no settings document still gets a sensible value. `MapSettingsProvider`
             // resolves through the shared store, which is the whole reason a PATCH reaches a running
             // session without a rebuild.
-            let provider: Arc<dyn SettingsProvider> =
-                Arc::new(MapSettingsProvider::new(Arc::clone(&store), name));
+            //
+            // The descriptors come from the PLUGIN, not from the build-time catalogue: a host-supplied
+            // plugin is not in that table, and TS resolves its declared defaults from the loaded
+            // plugin. For a built-in the two are the same list, so this changes nothing there.
+            let provider: Arc<dyn SettingsProvider> = Arc::new(MapSettingsProvider::with_declared(
+                Arc::clone(&store),
+                name,
+                declared.settings,
+            ));
 
             // THE ATTRIBUTED REPORT CHANNEL (`host.ts:202-209`): the base reporter is shared by
             // every plugin and reports as the framework; a policy report has to name the plugin that

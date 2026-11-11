@@ -1404,16 +1404,19 @@ async fn a_queued_submit_runs_the_turn_and_the_record_keeps_every_event() {
             .iter()
             .map(|line| line["at"].as_u64().expect("a stamp"))
             .collect::<Vec<u64>>(),
-        lines[1..]
-            .iter()
-            .map(|line| line["event"]["at"]
-                .as_u64()
-                // The record's `at` is the ONE stamp the line, the record and the published frame
-                // share (`sessions.ts:7930-7961`); an event body carries no `at` of its own, so the
-                // envelope's is the figure every line agrees on.
-                .unwrap_or_else(|| 0))
-            .collect::<Vec<u64>>(),
-        "every line carries the stamp it was written with"
+        record
+            .event_times
+            .as_deref()
+            .expect("the durable record keeps one stamp per event")
+            .to_vec(),
+        "the envelope stamp IS the record's own `eventTimes` figure for that event: one clock, three \
+         surfaces - the journal line, the durable record, and the published frame \
+         (`sessions.ts:7930-7961`)"
+    );
+    assert!(
+        lines[1..].iter().all(|line| line["event"].get("at").is_none()),
+        "an event body carries no `at` of its own, so the envelope's stamp is the single figure every \
+         surface agrees on rather than one of two that could disagree"
     );
     assert!(
         lines[1..].iter().all(|line| line["at"].as_u64().is_some_and(|at| at > 0)),
@@ -1423,14 +1426,11 @@ async fn a_queued_submit_runs_the_turn_and_the_record_keeps_every_event() {
         lines[1..]
             .iter()
             .map(|line| {
-                let mut keys: Vec<String> = line
-                    .as_object()
+                line.as_object()
                     .expect("an event line is an object")
                     .keys()
                     .cloned()
-                    .collect();
-                let _ = keys.pop();
-                keys
+                    .collect::<Vec<String>>()
             })
             .collect::<Vec<Vec<String>>>(),
         vec![
@@ -1440,11 +1440,12 @@ async fn a_queued_submit_runs_the_turn_and_the_record_keeps_every_event() {
                 "turnId".to_owned(),
                 "index".to_owned(),
                 "at".to_owned(),
+                "event".to_owned(),
             ];
             4
         ],
-        "`append` writes `type`/`v` FIRST (`journal.ts:303`), so a TS-written journal and a Rust one \
-         diff to nothing but the payload bytes"
+        "`append` writes `type`/`v` FIRST (`journal.ts:303`) and the payload LAST, so a TS-written \
+         journal and a Rust-written one diff to nothing but the payload bytes"
     );
 }
 

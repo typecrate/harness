@@ -726,7 +726,14 @@ fn the_compaction_fixture_folds_to_the_recorded_display_lanes() {
     let session = document()["sessions"][0].clone();
 
     // THE SEED TURN — the two-row case. The instruction and prompt segments take the turn's starting
-    // lane (0, so no key) while the two tool segments take the events' lane (1), in ONE section.
+    // lane (0, so no key) while the eight event-driven segments - the prose windows AND the tool rows -
+    // take the events' lane (1), in ONE section.
+    //
+    // The prose segments sit here because this fold mints one bar segment PER WINDOW, exactly as the
+    // TypeScript projector does (`turn-projector.ts:2138-2163`, `:2188-2222`): `0-reasoning-1` is the
+    // thinking window that opened on event 1 and `0-assistant-56` the answer that opened on event 56.
+    // The table is the recorded fixture's own row for row, which is the point - the bar the TS server
+    // published is the bar this fold paints.
     assert_eq!(
         lane_table(&fold_recorded_turn(
             &session,
@@ -736,8 +743,14 @@ fn the_compaction_fixture_folds_to_the_recorded_display_lanes() {
         rows(&[
             ("0-system-instructions", "system", Value::Null),
             ("0-user-prompt", "user", Value::Null),
+            ("0-reasoning-1", "reasoning", json!(1)),
+            ("0-assistant-56", "assistant", json!(1)),
             ("0-tool-80", "tool", json!(1)),
+            ("0-reasoning-83", "reasoning", json!(1)),
             ("0-tool-93", "tool", json!(1)),
+            ("0-assistant-96", "assistant", json!(1)),
+            ("0-reasoning-178", "reasoning", json!(1)),
+            ("0-assistant-233", "assistant", json!(1)),
         ]),
         "one turn paints two rows: lane 0 for the non-event segments, lane 1 for the event-driven ones"
     );
@@ -754,6 +767,8 @@ fn the_compaction_fixture_folds_to_the_recorded_display_lanes() {
         rows(&[
             ("0-system-instructions", "system", json!(1)),
             ("0-user-prompt", "user", json!(1)),
+            ("0-reasoning-1", "reasoning", json!(1)),
+            ("0-assistant-56", "assistant", json!(1)),
         ])
     );
 
@@ -830,21 +845,37 @@ fn a_restored_store_replays_the_recorded_lanes() {
         )
     };
 
+    // Prose rows are part of the fold now: every flow window in the recorded journal mints a row on
+    // its first delta (`projector.rs` `fold_prose`), which is what TypeScript's live bar holds. The
+    // interleaving below is journal order — the reasoning and answer windows of each flow sit exactly
+    // where that flow's deltas were recorded, around the `tool:start` rows. (TypeScript prunes a
+    // superseded `tool:start` out of `display.ops`; that pruning is not ported yet, so those two rows
+    // stay here and nowhere else in this fixture.)
     assert_eq!(
         table(SEED_TURN),
         rows(&[
             ("0-system-instructions", "system", Value::Null),
             ("0-user-prompt", "user", Value::Null),
+            ("0-reasoning-1", "reasoning", json!(1)),
+            ("0-assistant-56", "assistant", json!(1)),
             ("0-tool-80", "tool", json!(1)),
+            ("0-reasoning-83", "reasoning", json!(1)),
             ("0-tool-93", "tool", json!(1)),
+            ("0-assistant-96", "assistant", json!(1)),
+            ("0-reasoning-178", "reasoning", json!(1)),
+            ("0-assistant-233", "assistant", json!(1)),
         ])
     );
 
+    // The compaction turn's fold is the recorded bar, row for row: two headers, then the one reasoning
+    // window and the one answer window its six events open.
     assert_eq!(
         table(COMPACTION_TURN),
         rows(&[
             ("0-system-instructions", "system", json!(1)),
             ("0-user-prompt", "user", json!(1)),
+            ("0-reasoning-1", "reasoning", json!(1)),
+            ("0-assistant-56", "assistant", json!(1)),
         ])
     );
 
@@ -933,6 +964,14 @@ fn the_live_ops_carry_the_lane_and_no_patch_ever_does() {
     assert_eq!(added("0-system-instructions").get("lane"), None);
     assert_eq!(added("0-user-prompt").get("lane"), None);
 
+    // Prose mints ride the same rule: the `context:add` that opens an answer or a thinking window
+    // carries the lane of the delta that opened it, and every later patch of that window is lane-free
+    // (asserted by the sweep below, which now walks the prose patches too).
+    assert_eq!(added("0-reasoning-1")["lane"], json!(1));
+    assert_eq!(added("0-assistant-56")["lane"], json!(1));
+    assert_eq!(added("0-reasoning-178")["lane"], json!(1));
+    assert_eq!(added("0-assistant-233")["lane"], json!(1));
+
     // No `context:set` patch in either turn mentions a lane, and no op anywhere writes `lane: 0`.
     for turn_id in [SEED_TURN, COMPACTION_TURN] {
         for op in fold_recorded_turn_ops(&session, &recorded_turn(&session, turn_id)) {
@@ -964,8 +1003,14 @@ fn the_live_ops_carry_the_lane_and_no_patch_ever_does() {
         rows(&[
             ("0-system-instructions", "system", Value::Null),
             ("0-user-prompt", "user", Value::Null),
+            ("0-reasoning-1", "reasoning", json!(1)),
+            ("0-assistant-56", "assistant", json!(1)),
             ("0-tool-80", "tool", json!(1)),
+            ("0-reasoning-83", "reasoning", json!(1)),
             ("0-tool-93", "tool", json!(1)),
+            ("0-assistant-96", "assistant", json!(1)),
+            ("0-reasoning-178", "reasoning", json!(1)),
+            ("0-assistant-233", "assistant", json!(1)),
         ]),
         "the stream and the cold fold must agree lane for lane"
     );

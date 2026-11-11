@@ -40,9 +40,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde_json::{Map, Value};
 
+use crate::contract::PluginSettingType;
 use crate::plugins::{
-    PLUGIN_ENABLED_KEY, PluginSettingsStore, PluginSettingType, SettingValue, effective_descriptor_of,
-    effective_settings_of, number_from_text,
+    PLUGIN_ENABLED_KEY, PluginSettingDescriptor, PluginSettingsStore, SettingValue,
+    effective_descriptor_of, effective_settings_of, number_from_text,
 };
 
 /// Where a plugin's settings come from, and where a write goes.
@@ -53,6 +54,17 @@ pub trait SettingsProvider: Send + Sync {
     /// The plugin this provider is scoped to. `SettingsView` is meaningless without it: it is the
     /// key that selects both the stored values and the declared rules.
     fn owner(&self) -> &str;
+
+    /// The descriptors THIS plugin declared, which for a host-supplied plugin are NOT in the
+    /// build-time catalogue ([`crate::plugins::settings_of`] answers only what this binary ships).
+    ///
+    /// A default of "nothing extra" is honest: the store's own effective list is the whole story for
+    /// a built-in, and the two are identical for every shipped plugin. The host passes the plugin's
+    /// own row here so a declared `enabled: false` default is honoured from the first turn with
+    /// nothing stored (`host.test.ts:415-440`), which is the case a catalogue-only lookup misses.
+    fn declared(&self) -> &'static [PluginSettingDescriptor] {
+        &[]
+    }
 
     /// The durable overrides for this owner, as a JSON object (`settings.ts`'s `resolveStored()`).
     /// A missing plugin answers an empty object, never an error.
@@ -92,6 +104,9 @@ pub trait SettingsProvider: Send + Sync {
 pub struct MapSettingsProvider {
     owner: Arc<str>,
     store: Arc<Mutex<PluginSettingsStore>>,
+    /// The plugin's OWN declared descriptors, empty for a built-in whose row the catalogue already
+    /// holds. See [`SettingsProvider::declared`].
+    declared: &'static [PluginSettingDescriptor],
 }
 
 impl MapSettingsProvider {
@@ -100,6 +115,21 @@ impl MapSettingsProvider {
         Self {
             owner: Arc::from(owner),
             store,
+            declared: &[],
+        }
+    }
+
+    /// The host's constructor: the same store, plus the descriptors of the plugin being set up.
+    #[must_use]
+    pub fn with_declared(
+        store: Arc<Mutex<PluginSettingsStore>>,
+        owner: &str,
+        declared: &'static [PluginSettingDescriptor],
+    ) -> Self {
+        Self {
+            owner: Arc::from(owner),
+            store,
+            declared,
         }
     }
 
@@ -129,8 +159,16 @@ impl SettingsProvider for MapSettingsProvider {
         self.owner_ref()
     }
 
+    fn declared(&self) -> &'static [PluginSettingDescriptor] {
+        self.declared
+    }
+
     fn stored(&self) -> Map<String, Value> {
-        self.lock().values(self.owner_ref())
+        // The RAW overrides, not `values()`: `values` is the declared-only ROW projection, and the
+        // framework gate reads the reserved `enabled` key of a plugin that never declared it
+        // (async-ping). Feeding it the projection would make an operator's switch invisible to the
+        // gate that consults it.
+        self.lock().stored_overrides(self.owner_ref())
     }
 
     fn write(&self, key: &str, value: Option<&Value>) -> Result<Option<Value>, String> {
@@ -145,8 +183,10 @@ impl SettingsProvider for MapSettingsProvider {
         let applied = {
             let mut store = self.lock();
             match store.update(self.owner_ref(), &patch) {
-                Ok(()) => store.get(self.owner_ref(), key).map(SettingValue::to_json),
-                Err(error) => return Err(error.message().to_owned()),
+                Ok(()) => store
+                    .get(self.owner_ref(), key)
+                    .map(|value| value.to_json()),
+                Err(error) => return Err(error.message.clone()),
             }
         };
 
@@ -158,7 +198,7 @@ impl SettingsProvider for MapSettingsProvider {
 ///
 /// `data` is the payload snapshot for THIS turn; the provider is consulted live for everything the
 /// snapshot does not pin.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SettingsView<'a> {
     owner: &'a str,
     /// The per-turn snapshot (`payload.settings`). `None` = "this event carries no snapshot", which
@@ -171,6 +211,21 @@ pub struct SettingsView<'a> {
     estimate: f64,
     /// Entries observed at view creation - the trimmer's `contextEntries` field.
     entries: usize,
+}
+
+/// Manual `Debug` rather than a derive: the provider is a `&'a dyn` reference, and a derive would
+/// demand `'a: 'static` to print it. What an operator debugging a plugin read needs is the scope
+/// and the two live-mode flags, which is exactly what this prints.
+impl std::fmt::Debug for SettingsView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettingsView")
+            .field("owner", &self.owner)
+            .field("has_snapshot", &self.data.is_some())
+            .field("live", &self.provider.is_some())
+            .field("estimate", &self.estimate)
+            .field("entries", &self.entries)
+            .finish()
+    }
 }
 
 impl<'a> SettingsView<'a> {
@@ -350,7 +405,14 @@ impl<'a> SettingsView<'a> {
 
     /// The declared default, already clamped the way the JS `fallbackSettings` builder clamps.
     fn declared_default(&self, key: &str) -> Option<Value> {
-        let descriptor = effective_descriptor_of(self.owner, key)?;
+        // The plugin's OWN descriptor wins: a host-supplied plugin is not in the build-time
+        // catalogue, and TS resolves its defaults from the loaded plugin (`plugin/settings.ts`).
+        let descriptor = self
+            .provider
+            .into_iter()
+            .flat_map(|provider| provider.declared().iter())
+            .find(|descriptor| descriptor.key == key)
+            .or_else(|| effective_descriptor_of(self.owner, key))?;
         let default = match descriptor.default {
             crate::plugins::DeclaredDefault::Number(value) => Value::from(value),
             crate::plugins::DeclaredDefault::Text(text) => Value::String(text.to_owned()),

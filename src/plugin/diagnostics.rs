@@ -409,10 +409,12 @@ pub fn settings_written_data(
     to: Option<Value>,
 ) -> Map<String, Value> {
     let mut data = Map::new();
+    // `Map::insert` takes an owned key, unlike `Value`'s index form - the four keys are the
+    // documented `settings_written` shape and the spelling must not drift per plugin.
     data.insert("plugin".to_owned(), Value::String(plugin.to_owned()));
     data.insert("key".to_owned(), Value::String(key.to_owned()));
-    data.insert("from", from.unwrap_or(Value::Null));
-    data.insert("to", to.unwrap_or(Value::Null));
+    data.insert("from".to_owned(), from.unwrap_or(Value::Null));
+    data.insert("to".to_owned(), to.unwrap_or(Value::Null));
 
     data
 }

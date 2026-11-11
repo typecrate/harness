@@ -1249,10 +1249,11 @@ async fn a_submitted_task_runs_and_every_turn_read_describes_it() {
         format!("Unknown step \"999\" in turn \"{turn_id}\".")
     );
 
-    // THE CONTEXT BAR segment. The fold mints a `tool` segment per call and an `assistant` segment
-    // for an answer that streamed no deltas, and — because the seam is now SEEDED with the turn
-    // (`ports::ProjectorSeed`, `sessions.ts:4160-4240`) — the prompt segment TypeScript mints from the
-    // record (`0-user-prompt`, `turn-projector.ts:1578`) is part of the bar too, so it resolves.
+    // THE CONTEXT BAR segment. The fold mints a `tool` segment per call AND an `assistant` segment for
+    // every prose window the stream opens (R18, `turn-projector.ts:1891-1925`), and — because the seam
+    // is now SEEDED with the turn (`ports::ProjectorSeed`, `sessions.ts:4160-4240`) — the prompt segment
+    // TypeScript mints from the record (`0-user-prompt`, `turn-projector.ts:1578`) is part of the bar
+    // too, so it resolves.
     let block = get(
         &server,
         &format!("/v1/harness/sessions/{id}/turns/{turn_id}/blocks/0-user-prompt"),
@@ -1261,8 +1262,9 @@ async fn a_submitted_task_runs_and_every_turn_read_describes_it() {
 
     assert_eq!(block.status, StatusCode::OK);
 
-    // A kind this fold never mints is still a 404: the projector has no reasoning SEGMENT to offer,
-    // and inventing one for an id the fold never published would answer a question nobody asked.
+    // An id this fold never published is still a 404: the reasoning window this turn opened (if the
+    // provider streamed any thinking) carries its own OPENING-event key, and inventing a segment for a
+    // number the fold never minted would answer a question nobody asked.
     let missing_block = get(
         &server,
         &format!("/v1/harness/sessions/{id}/turns/{turn_id}/blocks/0-reasoning-9"),
@@ -1285,17 +1287,41 @@ async fn a_submitted_task_runs_and_every_turn_read_describes_it() {
         .as_array()
         .expect("every section row carries its context bar");
 
-    // Two segments, in conversation order: the prompt block the SEEDED fold mints from the record
+    // Three segments, in conversation order: the prompt block the SEEDED fold mints from the record
     // (`turn-projector.ts:1578`, and the id is the section ordinal 0 because this conversation's
-    // section is ordinal 0 — `blockIdOf`, `:1407`), then the tool call's own segment. The answer
-    // streamed as deltas, so it opens no third one.
+    // section is ordinal 0 — `blockIdOf`, `:1407`), then the tool call's own segment, then the answer
+    // window the text stream opens on its first delta. The answer segment is NOT the `done` fallback:
+    // it is the streaming window, which is why its `chars` are the streamed length.
     assert_eq!(
         segments
             .iter()
             .map(|segment| segment["kind"].as_str().unwrap_or_default())
             .collect::<Vec<_>>(),
-        vec!["user", "tool"],
-        "the prompt segment comes first, then the call's segment"
+        vec!["user", "tool", "assistant"],
+        "the prompt segment comes first, then the call's segment, then the streamed answer"
+    );
+    assert_eq!(
+        segments[2]["id"].as_str().expect("a minted id"),
+        // `{section ordinal}-{kind}-{key}` again, where the key is the index of the event that OPENED
+        // the window. That is the first `text` delta, pinned above as event index 5 - which is why the
+        // id is stable across the live stream and the cold fold.
+        "0-assistant-5",
+        "a prose window is id'd by the event that opened it"
+    );
+    assert_eq!(segments[2]["name"], json!("answer"));
+    assert_eq!(
+        segments[2]["chars"],
+        json!("the clock reads noon".chars().count()),
+        "the window's `chars` are the streamed answer's length, kept by the per-delta patch"
+    );
+    assert_eq!(
+        segments[2]["inPrompt"],
+        json!(true),
+        "`in_prompt` mirrors `isAssistantSegment` (`turn-projector.ts:1463`): an answer counts, thinking does not"
+    );
+    assert!(
+        segments[2].get("lane").is_none(),
+        "a lane-0 conversation stamps no lane on the prose row either (`laneFieldsOf`)"
     );
     assert_eq!(
         segments[0]["id"].as_str().expect("a minted id"),
@@ -4880,6 +4906,391 @@ async fn a_host_write_is_visible_to_the_next_session_without_a_restart() {
         after_roster.json_at("/agents/0/instruction_chars"),
         before_roster.json_at("/agents/0/instruction_chars"),
         "the override changed the text the member runs"
+    );
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// 16 - the context-segment write: PATCH .../turns/:turn_id/blocks/:block_id (R18/R19)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_context_block_write_switches_the_inclusion_of_the_entry_its_segment_records() {
+    let root = Root::new("block-write");
+    let server = TestServer::start(&root).await;
+
+    // A tool call, then the answer it was leading to: the transcript ends with the assistant entry that
+    // carries the call, the tool result, and the final text, so the unit join has something to find.
+    let (base, _script) = provider(vec![
+        tool_turn("call-time", "timeNow", r#"{"timezone":"UTC"}"#, usage(11, 4)),
+        answered("the clock reads noon", usage(7, 3)),
+    ])
+    .await;
+
+    let (id, _) = create_session(&server, &base, Some("block-write")).await;
+    let receipt = submit(&server, &id, "what time is it", None).await;
+    let turn_id = receipt.string_at("/turn_id");
+    let thread = receipt.string_at("/thread_id");
+
+    wait_for_turn(&server, &id, &turn_id, "done").await;
+
+    let block_path =
+        |block: &str| format!("/v1/harness/sessions/{id}/turns/{turn_id}/blocks/{block}");
+    let transcript_path = format!("/v1/harness/sessions/{id}/threads/{thread}/transcript");
+
+    // THE JOIN ON READ. `0-tool-2` is the call's segment - the tool event is index 2 of this turn - and
+    // its recorded `callId` resolves through the transcript to the exclusion unit (`api.ts:4695-4712`
+    // + `transcriptUnitOfCall`). A flag nobody has ever switched answers `true`, which is the ABSENCE of
+    // `included: false` on the transcript message rather than a client's word.
+    let before = get(&server, &block_path("0-tool-2")).await;
+
+    assert_eq!(
+        before.status,
+        StatusCode::OK,
+        "the call's segment resolves: {}",
+        before.body
+    );
+    assert_eq!(
+        before.json_at("/block/included"),
+        Some(&json!(true)),
+        "the block read publishes the verdict: {}",
+        before.body
+    );
+
+    let transcript = get(&server, &transcript_path).await;
+    let revision = transcript.number_at("/transcript/revision");
+    let message_count = transcript.number_at("/transcript/message_count");
+
+    // THE WRITE. One axis, no guard. The receipt is the bare `TurnBlockWriteReceipt` TypeScript answers
+    // (`api.ts:4787-4798`) - no `accepted_as` envelope - and `included` is the PERSISTED verdict, read
+    // back through the same join rather than echoed from the request (`api.ts:4755-4785`).
+    let written = patch_json(&server, &block_path("0-tool-2"), json!({"included": false})).await;
+
+    assert_eq!(
+        written.status,
+        StatusCode::OK,
+        "a unit write is a 200: {}",
+        written.body
+    );
+    assert_eq!(written.string_at("/session_id"), id);
+    assert_eq!(written.string_at("/turn_id"), turn_id);
+    assert_eq!(written.string_at("/block_id"), "0-tool-2");
+    assert_eq!(
+        written.json_at("/included"),
+        Some(&json!(false)),
+        "the receipt states the verdict it installed"
+    );
+    assert!(
+        written.json_at("/reasoning_included").is_none(),
+        "a tool segment has no thinking axis to state: {}",
+        written.body
+    );
+    assert_eq!(written.string_at("/thread_id"), thread);
+    assert_eq!(
+        written.number_at("/revision"),
+        revision + 1,
+        "the transcript counter moved by exactly one"
+    );
+    assert_eq!(
+        written.revision(),
+        revision + 1,
+        "the Etag quotes the transcript revision, the figure `json(200, receipt, revision)` passes"
+    );
+    assert_eq!(
+        written.string_at("/links/block"),
+        block_path("0-tool-2"),
+        "the block link is the route the client re-reads; `encodeURIComponent` of a minted id is a no-op, because the id is `[a-z0-9-]+` by construction"
+    );
+    assert_eq!(
+        written.string_at("/links/transcript"),
+        transcript_path,
+        "and the transcript link is the document the flag now lives in"
+    );
+
+    // READ-BACK AT BOTH ENDS: the block's verdict, and the flag on the transcript message itself. The
+    // exclusion has to live in the document, or the next run would read the call back in.
+    let after = get(&server, &block_path("0-tool-2")).await;
+
+    assert_eq!(after.json_at("/block/included"), Some(&json!(false)));
+
+    let messages = get(&server, &format!("{transcript_path}/messages")).await;
+    let tool_entry = messages
+        .body["items"]
+        .as_array()
+        .expect("a paged transcript")
+        .iter()
+        .find(|entry| entry["role"] == json!("tool"))
+        .expect("the tool message the call wrote");
+
+    assert_eq!(
+        tool_entry["included"],
+        json!(false),
+        "the flag rides the transcript document, not a side table"
+    );
+
+    // SWITCHING IT BACK returns the document to its pre-feature bytes. The verdict the read publishes is
+    // still `true` - the join resolves and finds no `included: false` on the entry (`api.ts:4628-4630`) -
+    // while the durable message carries no flag at all.
+    let restored = patch_json(&server, &block_path("0-tool-2"), json!({"included": true})).await;
+
+    assert_eq!(
+        restored.status,
+        StatusCode::OK,
+        "a restore is a 200: {}",
+        restored.body
+    );
+    assert_eq!(restored.json_at("/included"), Some(&json!(true)));
+    assert_eq!(restored.number_at("/revision"), revision + 2);
+
+    let restored_messages = get(&server, &format!("{transcript_path}/messages")).await;
+
+    assert_eq!(
+        restored_messages
+            .body["items"]
+            .as_array()
+            .expect("a paged transcript")
+            .iter()
+            .find(|entry| entry["role"] == json!("tool"))
+            .expect("the tool message")
+            .get("included"),
+        None,
+        "switching the flag back to INCLUDED removes the key rather than storing `true` \
+         (`api/messages.ts:146-147`: only `false` is durable), which is the exact byte shape a \
+         pre-feature transcript had. The block read still answers `true`, because absence IS inclusion."
+    );
+    assert_eq!(
+        restored_messages.number_at("/total"),
+        message_count,
+        "neither write changed the entry count: a flag switch is an in-place patch of one entry"
+    );
+
+    // THE BODY GATE (`api.ts:4641-4662`), in the order the route runs it: shape before lookup, lookup
+    // before the guard, guard before the joins.
+    let empty = patch_json(&server, &block_path("0-tool-2"), json!({})).await;
+
+    assert_eq!(empty.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        empty.message(),
+        "A context segment write requires at least one of \"included\" and \"reasoningIncluded\"."
+    );
+
+    let not_boolean = patch_json(&server, &block_path("0-tool-2"), json!({"included": "no"})).await;
+
+    assert_eq!(not_boolean.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        not_boolean.message(),
+        "A context segment inclusion write requires a boolean \"included\" value."
+    );
+
+    let not_thinking_boolean = patch_json(
+        &server,
+        &block_path("0-tool-2"),
+        json!({"reasoningIncluded": 1}),
+    )
+    .await;
+
+    assert_eq!(not_thinking_boolean.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        not_thinking_boolean.message(),
+        "A context segment write requires a boolean \"reasoningIncluded\" value."
+    );
+
+    // `if_revision` is NOT a field on this route: `requireKnownFields` names exactly the two axes
+    // (`api.ts:4672`), and the write goes through `store.updateThreadTranscript` with NO guard of its own
+    // (`api.ts:4741`) - unlike the transcript PUT, which is the contract's one optimistic lock
+    // (`api.ts:4375-4400`). The check runs ahead of the axis checks, so a body that carries a valid axis
+    // and a stale guard is still the field refusal, not a 409.
+    let guard_field = patch_json(&server, &block_path("0-tool-2"), json!({"note": "x"})).await;
+
+    assert_eq!(guard_field.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        guard_field.message(),
+        "Unknown field \"note\". Allowed fields: included, reasoningIncluded."
+    );
+
+    let guard_with_axis = patch_json(
+        &server,
+        &block_path("0-tool-2"),
+        json!({"included": true, "if_revision": 0}),
+    )
+    .await;
+
+    assert_eq!(guard_with_axis.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        guard_with_axis.message(),
+        "Unknown field \"if_revision\". Allowed fields: included, reasoningIncluded."
+    );
+
+    // A segment the fold never published is a 404 with the store's own sentence (`sessions.ts:4481`),
+    // and nothing about the body changes that.
+    let missing = patch_json(&server, &block_path("0-nope-1"), json!({"included": false})).await;
+
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        missing.message(),
+        format!("Unknown context block \"0-nope-1\" in turn \"{turn_id}\".")
+    );
+
+    // THE THINKING AXIS ON A SEGMENT THAT RECORDS NO THINKING. The tool segment carries no `reasoning`
+    // bytes, so no entry's `reasoning` equals them (`blockThoughtOf`, `api.ts:4699`), and the refusal is
+    // the sentence that says so rather than a silent no-op.
+    let no_thinking = patch_json(
+        &server,
+        &block_path("0-tool-2"),
+        json!({"reasoningIncluded": false}),
+    )
+    .await;
+
+    assert_eq!(no_thinking.status, StatusCode::CONFLICT);
+    assert_eq!(
+        no_thinking.message(),
+        "Context segment \"0-tool-2\" has no thinking entry to switch: the recorded thinking is not the exact reasoning of one assistant entry in this conversation's transcript."
+    );
+
+    // THE UNIT AXIS ON A PROSE SEGMENT. `0-assistant-5` is the answer window the stream opened (its key
+    // is the first text delta, event 5), and that event carries no call id (`blockCallIdOf`,
+    // `api.ts:334-342`), so the block write cannot address an entry through a segment that never named
+    // a call.
+    let no_unit = patch_json(&server, &block_path("0-assistant-5"), json!({"included": false})).await;
+
+    assert_eq!(no_unit.status, StatusCode::CONFLICT);
+    assert_eq!(
+        no_unit.message(),
+        "Context segment \"0-assistant-5\" has no transcript entry to switch: the call it recorded is not in this conversation's transcript."
+    );
+
+    // Every arm above refused, so the transcript still answers with the figure the last successful write
+    // installed - a refusal writes nothing and mints no revision.
+    let unchanged = get(&server, &transcript_path).await;
+
+    assert_eq!(
+        unchanged.number_at("/transcript/revision"),
+        revision + 2,
+        "the refusals above changed no document"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_running_conversation_refuses_both_transcript_writes_with_one_sentence() {
+    let root = Root::new("block-write-running");
+    let server = TestServer::start(&root).await;
+
+    // A tool call, then the request it leads to held OPEN: the run is mid-flight for the whole test
+    // (the state TypeScript's guard reads, `sessions.ts:9209-9219`) while the call's segment - and the
+    // transcript entry it joins on - already exist.
+    let (base, _script) = provider(vec![
+        tool_turn("call-time", "timeNow", r#"{"timezone":"UTC"}"#, usage(11, 4)),
+        Answer::Delayed(900, answered_body("held open", usage(7, 3))),
+    ])
+    .await;
+
+    let (id, _) = create_session(&server, &base, Some("running-write")).await;
+    let thread = open_thread(&server, &id, "instruct").await;
+    let transcript_path = format!("/v1/harness/sessions/{id}/threads/{thread}/transcript");
+    let block_path = format!("/v1/harness/sessions/{id}/turns/TURN/blocks/0-tool-2");
+
+    // THE SEED THE JOIN CAN REACH MID-RUN. This port's executor hands back the transcript when the run
+    // SETTLES, so while a run is up the live transcript is the one the previous write installed - where
+    // TypeScript's runtime is appending to the history as the call lands. Seeding an entry with the SAME
+    // call id the scripted answer issues is what lets the join resolve during the run, so the refusal this
+    // test asserts is the live-work guard and never the "no transcript entry to switch" arm.
+    let seeded = put_json(
+        &server,
+        &transcript_path,
+        json!({"messages": [
+            {"role": "user", "content": "seed the transcript"},
+            {"role": "assistant", "content": "", "toolCalls": [
+                {"id": "call-time", "name": "timeNow", "arguments": "{}"}
+            ]},
+            {"role": "tool", "content": "the clock reads noon", "toolCallId": "call-time", "name": "timeNow"}
+        ]}),
+    )
+    .await;
+
+    assert_eq!(seeded.status, StatusCode::OK, "the seed writes: {}", seeded.body);
+
+    let running = submit(&server, &id, "the first ask", Some(&thread)).await;
+    let turn_id = running.string_at("/turn_id");
+
+    wait_for_turn(&server, &id, &turn_id, "running").await;
+
+    let block_path = block_path.replace("TURN", &turn_id);
+
+    // Both halves of the precondition, stated rather than assumed: the segment exists, and the run is
+    // still up when the write lands. If the delayed answer ever settles early, this is where the test
+    // says so instead of passing on the wrong refusal.
+    wait_for(
+        &server,
+        &block_path,
+        |body| body.pointer("/block/id").is_some(),
+        "the call's segment while the run is still up",
+    )
+    .await;
+
+    let status = get(
+        &server,
+        &format!("/v1/harness/sessions/{id}/turns/{turn_id}"),
+    )
+    .await;
+
+    assert_eq!(status.string_at("/turn/status"), "running", "the run is still up");
+
+    let expected = format!("Thread \"{thread}\" is running; stop it before replacing its transcript.");
+
+    // THE WHOLE-DOCUMENT WRITE, which would otherwise answer 200 and rewrite the transcript under a run
+    // that is appending to it.
+    let put = put_json(
+        &server,
+        &transcript_path,
+        json!({"messages": [{"role": "user", "content": "over the run"}]}),
+    )
+    .await;
+
+    assert_eq!(
+        put.status,
+        StatusCode::CONFLICT,
+        "a running thread refuses a PUT: {}",
+        put.body
+    );
+    assert_eq!(put.message(), expected);
+
+    // THE BLOCK WRITE, which reaches the same store operation (`api.ts:4737-4743` notes it refuses "from
+    // inside" `updateThreadTranscript`). The join resolved - the seed named this call - so the 409 that
+    // answers is the live-work guard, and its sentence is the one the PUT printed.
+    let patch = patch_json(&server, &block_path, json!({"included": false})).await;
+
+    assert_eq!(
+        patch.status,
+        StatusCode::CONFLICT,
+        "a running thread refuses a PATCH: {}",
+        patch.body
+    );
+    assert_eq!(
+        patch.message(),
+        expected,
+        "one sentence for one condition, whichever route hit it"
+    );
+
+    // The transcript is exactly what the seed installed: the run still owns it, and neither refusal
+    // touched it or minted a revision.
+    let after = get(&server, &transcript_path).await;
+
+    assert_eq!(
+        after.number_at("/transcript/revision"),
+        1,
+        "a refused write minted no revision"
+    );
+
+    let cancelled = post_json(&server, &format!("/v1/harness/sessions/{id}/cancel"), None).await;
+
+    assert_eq!(
+        cancelled.status,
+        StatusCode::OK,
+        "the cancel settles the thread so the run cannot outlive the assertions: {}",
+        cancelled.body
     );
 
     server.stop().await;

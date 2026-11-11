@@ -459,7 +459,8 @@ pub fn decision_of_value(value: &serde_json::Value) -> Option<TurnDecision> {
         action @ ("pause" | "stop") => {
             let reason = decision
                 .get("reason")
-                .filter(serde_json::Value::is_string)
+                // A non-string reason is DROPPED, never stringified (`hooks.ts:468-472`).
+                .filter(|value| value.is_string())
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
 
@@ -588,7 +589,7 @@ mod tests {
             transcript: replacement.clone(),
         });
 
-        assert_eq!(contribution.transcript, Some(replacement));
+        assert_eq!(contribution.transcript, Some(replacement.clone()));
         assert_eq!(
             contribution.decision,
             Some(TurnDecision::Replace { transcript: replacement })

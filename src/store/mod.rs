@@ -2074,6 +2074,104 @@ impl SessionState {
         self.tasks.clone()
     }
 
+    /// Appends one plugin diagnostic to this session's journal and NOTHING else
+    /// (`notePluginDiagnostic`, `sessions.ts:3252-3290`).
+    ///
+    /// TWO jobs, in TS's order: journal it (bounded, durable, and projected onto the identified session
+    /// read, which is the observable surface a broken plugin was missing), then log the three FRAMEWORK
+    /// kinds to stderr so an operator tailing the server sees the same thing with the plugin NAMED. A
+    /// `policy` report is deliberately not logged: that is a plugin saying what it DECIDED, information a
+    /// reader opens the session for, not a problem to print on every turn (`LOGGED_DIAGNOSTIC_KINDS`,
+    /// `:3222-3230`).
+    ///
+    /// What this does NOT do is schedule a save: the journal rides the NEXT state-change save, exactly like
+    /// `invalid_threads` does, because a diagnostic is an observation rather than a transition - and a
+    /// chatty or failing plugin must not drive the whole-document save rate the persistence layer was built
+    /// around (`:3241-3247`).
+    ///
+    /// It can never fail a run in either direction (the framework's own fail-open rule): every step here is
+    /// total, an unnamed owner stays `''`, and an empty message becomes a stated placeholder instead of
+    /// being dropped.
+    pub fn note_plugin_diagnostic(
+        &mut self,
+        entry: crate::contract::SessionPluginDiagnostic,
+        at: u64,
+    ) {
+        // The writer's own normalization first (`:3253-3255`). The sink, not the reporter, owns the
+        // placeholder: a plugin that failed without a word still has to be readable after the fact.
+        let owner = entry.owner.clone();
+        let message = if entry.message.trim().is_empty() {
+            "no message".to_owned()
+        } else {
+            entry.message.clone()
+        };
+
+        // `at` arrives from the reporter's clock so a persistence sink stays deterministic under test; the
+        // entry's own stamp wins when it carries one, because that is the figure the reporter measured.
+        let stamped = if entry.at == 0 { at } else { entry.at };
+
+        // The entry as the JOURNAL will hold it: same normalized owner, same placeholder message, same
+        // stamp. The log line is composed from this value rather than from the caller's, so the operator
+        // reads exactly what the document says.
+        let stamped_entry = crate::contract::SessionPluginDiagnostic {
+            at: stamped,
+            kind: entry.kind,
+            owner: owner.clone(),
+            event: entry.event.clone(),
+            message: message.clone(),
+            data: entry.data.clone(),
+        };
+
+        // Key order is the WRITE order (`:3256-3264`): `at, kind, owner, [event], message, [data]`. An
+        // absent `event` stays absent - a `policy` report is not tied to one hook, and inventing one would
+        // claim a failure that did not happen. The restore path re-reads these entries in the reader's
+        // order (`persistence::normalize_plugin_diagnostics`), exactly as TS's does, and every save
+        // rewrites the document, so the two orders never mix on disk.
+        let mut value = Map::new();
+
+        value.insert("at".to_owned(), serde_json::json!(stamped));
+        value.insert("kind".to_owned(), serde_json::json!(entry.kind));
+        value.insert("owner".to_owned(), serde_json::json!(owner));
+
+        if let Some(event) = entry.event.as_deref() {
+            value.insert("event".to_owned(), serde_json::json!(event));
+        }
+
+        value.insert("message".to_owned(), serde_json::json!(message));
+
+        if let Some(data) = entry.data.as_ref() {
+            value.insert("data".to_owned(), Value::Object(data.clone()));
+        }
+
+        // The kinds worth printing, decided off the enum rather than off the serialized spelling, and
+        // through the SAME predicate a test pins - so a renamed variant cannot silently stop being logged.
+        let logged = plugin_diagnostic_is_failure(entry.kind);
+
+        let journal = self
+            .record
+            .plugin_diagnostics
+            .get_or_insert_with(Vec::new);
+
+        journal.push(Value::Object(value));
+
+        // Bounded, oldest first (`:3268-3272`): the newest entries are the ones that explain a live
+        // problem, and a plugin that fails every turn must not grow `state.json` without limit.
+        if journal.len() > crate::persistence::MAX_PLUGIN_DIAGNOSTICS {
+            let dropped = journal.len() - crate::persistence::MAX_PLUGIN_DIAGNOSTICS;
+
+            journal.drain(0..dropped);
+        }
+
+        if !logged {
+            return;
+        }
+
+        // The stderr line, TS's shape verbatim (`:3279`); `console.error` is this crate's `eprintln!`. The
+        // text itself is built by `plugin_diagnostic_line` so the sentence is assertable without owning a
+        // process, and so a host that mirrors these lines somewhere else prints the SAME one.
+        eprintln!("{}", plugin_diagnostic_line(&self.record.id, &stamped_entry));
+    }
+
     /// `sessions.ts:2254 touch`: any activity moves `updatedAt` and re-arms the idle expiry, so a busy
     /// session is never collected while an idle one is.
     ///
@@ -2089,6 +2187,60 @@ impl SessionState {
     #[must_use]
     pub fn is_expired(&self, at: u64) -> bool {
         self.expires != 0 && at >= self.expires
+    }
+}
+
+/// The operator-facing line one framework diagnostic prints (`sessions.ts:3279`'s `console.error`), built
+/// as a string so it can be asserted without owning a process and printed identically by any sink.
+///
+/// The two spelled-out placeholders are TypeScript's, not this port's invention: an unnamed owner prints
+/// `(no owner)` and a report that names no hook prints `no event`, because a line missing either figure
+/// is unreadable in a log scrape. The separator is an EM DASH (`\u{2014}`), which is what the TypeScript
+/// line carries. Only the three framework kinds reach this line at all - a `policy` report is the plugin
+/// stating a decision, not a failure, and TS stays silent for it.
+#[must_use]
+pub fn plugin_diagnostic_line(
+    session_id: &str,
+    entry: &crate::contract::SessionPluginDiagnostic,
+) -> String {
+    format!(
+        "[harness] plugin diagnostic on session {session_id}: {} \u{2014} {} {}: {}",
+        if entry.owner.is_empty() {
+            "(no owner)"
+        } else {
+            &entry.owner
+        },
+        entry.event.as_deref().unwrap_or("no event"),
+        diagnostic_kind_str(entry.kind),
+        entry.message,
+    )
+}
+
+/// The kinds the OPERATOR has to hear about: the three the framework raises about a plugin. A `policy`
+/// report is a plugin stating a decision it made, which is durable but not a failure, so TypeScript keeps
+/// it out of the console (`sessions.ts:3277-3281`) and this port keeps it out for the same reason.
+#[must_use]
+pub const fn plugin_diagnostic_is_failure(
+    kind: crate::contract::SessionPluginDiagnosticKind,
+) -> bool {
+    use crate::contract::SessionPluginDiagnosticKind as Kind;
+
+    matches!(kind, Kind::HandlerThrew | Kind::HandlerTimedOut | Kind::InvalidDecision)
+}
+
+/// The wire spelling of one diagnostic kind (`harness-api.ts:930`), for the log line the sink composes.
+///
+/// The sink keeps the enum until this last step: matching on the serialized string would let a renamed
+/// variant silently stop being logged, which is exactly the observable the operator relies on.
+#[must_use]
+fn diagnostic_kind_str(kind: crate::contract::SessionPluginDiagnosticKind) -> &'static str {
+    use crate::contract::SessionPluginDiagnosticKind as Kind;
+
+    match kind {
+        Kind::HandlerThrew => "handler-threw",
+        Kind::HandlerTimedOut => "handler-timed-out",
+        Kind::InvalidDecision => "invalid-decision",
+        Kind::Policy => "policy",
     }
 }
 

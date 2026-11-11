@@ -874,6 +874,26 @@ impl PluginSettingsStore {
         self.revision
     }
 
+    /// Every RAW override for one plugin, including the reserved `enabled` key of a plugin that
+    /// never DECLARED it.
+    ///
+    /// This is the provider's feed. It is NOT [`Self::values`], which is the row projection and is
+    /// deliberately declared-only: a plugin that does not declare `enabled` (async-ping) would then
+    /// never SEE the operator's switch, and the framework gate that reads
+    /// `settings.boolean('enabled', true)` would arm a heartbeat the operator already stopped.
+    #[must_use]
+    pub fn stored_overrides(&self, plugin: &str) -> Map<String, Value> {
+        self.overrides
+            .get(plugin)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.to_json()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The raw STORED override of one key - `None` when the operator never changed it, which is the
     /// provider's documented "nothing stored" signal.
     #[must_use]
@@ -1168,7 +1188,11 @@ impl PluginSettingsStore {
     }
 
     /// Record one override, creating the plugin's map on first write.
-    fn put(&mut self, plugin: &str, key: &str, value: SettingValue) {
+    ///
+    /// The plugin-facing write path (`plugin::settings::MapSettingsProvider`) goes through
+    /// `update`, which validates; this is the unvalidated primitive that restore and the
+    /// provider's seeding share, so it is crate-visible rather than private.
+    pub(crate) fn put(&mut self, plugin: &str, key: &str, value: SettingValue) {
         self.overrides
             .entry(plugin.to_owned())
             .or_default()

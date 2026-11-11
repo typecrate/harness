@@ -57,6 +57,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use futures_util::FutureExt as _;
 use serde_json::{Map, Value};
 
 use crate::contract::HarnessMessage;
@@ -307,6 +308,28 @@ pub trait PluginRuntime: Send + Sync {
     /// its interval instead of guessing.
     fn async_pending(&self) -> Vec<PendingTool>;
 
+    /// `api.async.pending(agent)` - the same board read THROUGH an identity filter. async-ping
+    /// sweeps by scheduler key, so it needs the filtered answer; the default of "ignore the filter"
+    /// is safe because an unfiltered board is a superset, and every caller treats empty as "stop".
+    fn async_pending_for(&self, agent: Option<&str>) -> Vec<PendingTool> {
+        let _ = agent;
+        self.async_pending()
+    }
+
+    /// `api.async.wake(agent)`: emit the `wakeup` frame for that identity, which the host routes
+    /// through the agent's mailbox (and which also gives the run its inspecting turn). The default
+    /// no-op is the honest answer of a host with no mailbox wired: the heartbeat fires, finds the
+    /// board still pending, and re-arms, exactly as a wake into a host that discards it.
+    fn async_wake(&self, agent: Option<&str>) {
+        let _ = agent;
+    }
+
+    /// `api.config.wakeIntervalMs`: the host-level spelling of the same background-work heartbeat
+    /// policy, consulted only when the plugin's provider stores nothing AND declares nothing.
+    fn wake_interval_ms(&self) -> Option<f64> {
+        None
+    }
+
     /// The context lane a conversation is on: the durable "the next request starts at this
     /// boundary" stamp compaction writes after a range lands (`api.threads.getContextLane`). `None`
     /// = lane 0, which this crate spells as an absent lane (see `contract.rs:3035`, "absent means
@@ -396,15 +419,13 @@ impl PluginRuntime for NullRuntime {
     }
 }
 
-use futures_util::FutureExt as _;
-
 /// The read-only nothing handed to a registration that named no plugin.
 ///
 /// TS's `entry.api` is OPTIONAL (`hooks.ts:165`): a host `on` has no settings view, and a handler
 /// that reads settings through it reads the plugin's declared defaults and nothing stored. This
 /// type is that shape: an empty store scoped to `''`, so every read resolves to whatever the caller
 /// passes as its own fallback.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FallbackControls {
     provider: Arc<dyn SettingsProvider>,
     runtime: Arc<dyn PluginRuntime>,
@@ -417,6 +438,12 @@ impl FallbackControls {
             provider: Arc::new(MapSettingsProvider::with_defaults("")),
             runtime: Arc::new(NullRuntime),
         }
+    }
+}
+
+impl Default for FallbackControls {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -447,6 +474,46 @@ impl PluginControls for FallbackControls {
 #[must_use]
 pub fn fallback_controls() -> Arc<dyn PluginControls> {
     Arc::new(FallbackControls::new())
+}
+
+// ---------------------------------------------------------------------------
+// Debug views for the three erased seams
+// ---------------------------------------------------------------------------
+//
+// The seam traits are implemented OUTSIDE this crate (by the run-loop integrator, over the store),
+// so requiring `Debug` on them would push a logging obligation onto types that may hold sockets and
+// store handles. Printing the identity each one already carries is enough to debug a dispatch, and
+// it keeps `Arc<dyn ..>` usable inside a `#[derive(Debug)]` container - the same shape
+// `diagnostics.rs` uses for `dyn DiagnosticReporter`.
+
+impl std::fmt::Debug for dyn PluginControls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginControls")
+            .field("owner", &self.owner())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for dyn TurnControls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnControls")
+            .field("thread_id", &self.thread_id())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for dyn PluginRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginRuntime").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for dyn SettingsProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettingsProvider")
+            .field("owner", &self.owner())
+            .finish_non_exhaustive()
+    }
 }
 
 // ---------------------------------------------------------------------------

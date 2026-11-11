@@ -1991,7 +1991,7 @@ pub struct SessionSummary {
 /// The identified read of one session (`harness-api.ts:832`): everything a row carries plus
 /// the live model map, the key-free endpoint view, the created-tool and pending-action
 /// counts, and where turns actually execute.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionResource {
     #[serde(flatten)]
     pub session: SessionSummary,
@@ -2002,10 +2002,19 @@ pub struct SessionResource {
     pub pending_action_count: u64,
     pub created_tool_count: u64,
     pub created_tool_limit: u64,
+    /// T1.5's last mile (ADDITIVE, and ABSENT when empty): the plugin diagnostics this session reported,
+    /// each naming its OWNING plugin (`api-reads.ts:242-256`). This is the surface that makes "the
+    /// compactor is broken" answerable from the identified session read instead of only from stderr.
+    ///
+    /// The entries travel as raw JSON VALUES, in the order the sink wrote them - the same "stored by value,
+    /// copied on the way out" rule the unreadable-transcript records follow, and what keeps a consumer from
+    /// mutating the stored journal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_diagnostics: Option<Vec<serde_json::Value>>,
 }
 
 /// Envelope of a session read, create, or patch (`harness-api.ts:851`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionResponse {
     pub session: SessionResource,
 }

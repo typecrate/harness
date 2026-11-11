@@ -76,7 +76,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use futures_util::FutureExt as _;
@@ -86,7 +86,7 @@ use tokio::time::{Duration, timeout};
 use super::context::{PluginControls, TurnControls, fallback_controls};
 use super::diagnostics::{DiagnosticEvent, DiagnosticKind, DiagnosticReporter};
 use super::event::{
-    ALWAYS_DELIVERED, Contribution, LifecycleEvent, Payload, SubscriptionTarget, WILDCARD,
+    ALWAYS_DELIVERED, Contribution, LifecycleEvent, Payload, SubscriptionTarget,
     is_wildcard_deliverable,
 };
 
@@ -109,7 +109,6 @@ pub type RoundFuture = Pin<Box<dyn Future<Output = Contribution> + Send>>;
 /// two because only `turn.before` has a control surface: [`PluginControls`] is the per-plugin
 /// api (always present) and [`TurnControls`] is the round-scoped transcript/park surface
 /// (`Some` for `turn.before` only).
-#[derive(Debug)]
 pub struct HandlerCall {
     /// The event being delivered. For a `'*'` registration this is the event inside the
     /// envelope (rule 7): the gate is applied with THIS event, which is why a disabled wildcard
@@ -144,6 +143,27 @@ impl HandlerCall {
             _ => None,
         }
     }
+
+    /// The plugin this call belongs to (`''` for a host-level subscription).
+    #[must_use]
+    pub fn owner(&self) -> &str {
+        self.controls.owner()
+    }
+}
+
+/// Manual `Debug`: the two seam fields are trait objects the integrator implements, and the seam
+/// must not force `Debug` on a store-backed context. What a reader of a log line needs is the
+/// identity and the payload, which is exactly what this prints.
+impl std::fmt::Debug for HandlerCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandlerCall")
+            .field("event", &self.event.as_str())
+            .field("wildcard", &self.wildcard)
+            .field("payload", &self.payload)
+            .field("owner", &self.controls.owner())
+            .field("has_turn", &self.turn.is_some())
+            .finish()
+    }
 }
 
 /// A handler that failed - the Rust spelling of a JS `throw`/`reject` (`hooks.ts:746-761`).
@@ -155,6 +175,10 @@ impl HandlerCall {
 pub struct HandlerFailure {
     pub message: String,
     pub data: Option<Map<String, Value>>,
+    /// Which diagnostic kind this failure becomes. A plugin's own failure is `handler-threw` -
+    /// TS's `throw` - and only the BUS may produce the other two, because a budget breach and an
+    /// unparseable decision are facts about the contract, not about what the handler raised.
+    pub kind: DiagnosticKind,
 }
 
 impl HandlerFailure {
@@ -164,6 +188,7 @@ impl HandlerFailure {
         Self {
             message: message.into(),
             data: None,
+            kind: DiagnosticKind::HandlerThrew,
         }
     }
 
@@ -173,6 +198,18 @@ impl HandlerFailure {
         Self {
             message: message.into(),
             data: Some(data),
+            kind: DiagnosticKind::HandlerThrew,
+        }
+    }
+
+    /// The bus's own failure: the handler lost its budget race, so the report says WHICH of the
+    /// two contract reasons dropped it (`hooks.ts:119-124` splits the kinds, and an operator
+    /// reading "timed out after 250ms" knows to fix the budget rather than the plugin).
+    pub fn timed_out(event: LifecycleEvent, owner: &str, timeout_ms: u64) -> Self {
+        Self {
+            message: budget_error_of(event, owner, timeout_ms),
+            data: None,
+            kind: DiagnosticKind::HandlerTimedOut,
         }
     }
 }
@@ -210,7 +247,6 @@ impl std::fmt::Debug for HandlerBody {
 // ---------------------------------------------------------------------------
 
 /// One subscription (`HookEntry`, `hooks.ts:164-182`).
-#[derive(Debug)]
 pub struct Registration {
     /// The bus's monotonic registration stamp: rule 1's tie-break, and the handle `off()`
     /// removes by.
@@ -246,6 +282,24 @@ pub struct Registration {
     /// is never reported as a handler error (`hooks.test.ts:1016-1042`).
     pub enabled: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     pub body: HandlerBody,
+}
+
+/// Manual `Debug`: the gate is a `dyn Fn`, which Rust cannot print, so this reports whether a gate
+/// exists rather than pretending to show it.
+impl std::fmt::Debug for Registration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Registration")
+            .field("id", &self.id)
+            .field("owner", &self.owner)
+            .field("target", &self.target)
+            .field("priority", &self.priority)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("wildcard", &self.wildcard)
+            .field("controls", &self.controls)
+            .field("gated", &self.enabled.is_some())
+            .field("body", &self.body)
+            .finish()
+    }
 }
 
 impl Clone for Registration {
@@ -668,6 +722,59 @@ impl HookBus {
             .collect()
     }
 
+    /// The events ONE owner is live on, in the order it SUBSCRIBED (`host.ts`'s per-plugin hook
+    /// surface, and the REST row's `hooks` field).
+    ///
+    /// Registration order, not catalogue order: a plugin's own list is the order its setup ran in,
+    /// which is what an operator comparing it against `metadata.hooks` expects to read. A `'*'`
+    /// registration contributes the events it will actually receive AT ITS OWN POSITION, in the
+    /// catalogue's order, and an event already claimed by a named registration is not repeated.
+    #[must_use]
+    pub fn live_for(&self, owner: &str) -> Vec<&'static str> {
+        let state = self.lock();
+
+        // (registration id, events that registration is live on) - `id` is monotonic, so sorting by
+        // it reproduces the order `on(...)` ran in, across both the named and the wildcard lists.
+        let mut ordered: Vec<(u64, Vec<&'static str>)> = Vec::new();
+
+        for list in state.by_event.values() {
+            for entry in list {
+                // A named registration is live on exactly the event it was pointed at.
+                if entry.owner == owner {
+                    if let SubscriptionTarget::Event(event) = entry.target {
+                        ordered.push((entry.id, vec![event.as_str()]));
+                    }
+                }
+            }
+        }
+
+        for entry in &state.wildcard {
+            if entry.owner == owner {
+                let events = LifecycleEvent::ALL
+                    .iter()
+                    .filter(|event| is_wildcard_deliverable(**event))
+                    .map(|event| event.as_str())
+                    .collect();
+
+                ordered.push((entry.id, events));
+            }
+        }
+
+        ordered.sort_by_key(|(id, _)| *id);
+
+        let mut events: Vec<&'static str> = Vec::new();
+
+        for (_, list) in ordered {
+            for event in list {
+                if !events.contains(&event) {
+                    events.push(event);
+                }
+            }
+        }
+
+        events
+    }
+
     /// The owners subscribed to one event, registration order, wildcard expansions included.
     /// The REST row's `hooks` list for a plugin is `live()` filtered to that owner.
     #[must_use]
@@ -768,7 +875,11 @@ impl HookBus {
 
                         let outcome = match &registration.body {
                             HandlerBody::Async(handler) => {
-                                run_async(handler, Arc::clone(&call), registration).await
+                                // `&**`, not `&`: the field is an `Arc` around a `dyn Fn`, and the
+                                // helper wants the bare `&dyn Fn`. Written explicitly so the
+                                // deref coercion is not left to inference at a trait-object
+                                // boundary (where the return type is itself a boxed future).
+                                run_async(&**handler, Arc::clone(&call), registration).await
                             }
                             // A SYNC registration after the first async one still runs inline,
                             // inside the tail: the tail differs from the prefix only in that the
@@ -827,7 +938,9 @@ impl HookBus {
                     let reporter = self.on_handler_error.clone();
 
                     handle.spawn(async move {
-                        let outcome = run_async(&handler, Arc::clone(&call), &registration).await;
+                        // `&*`, not `&`: `handler` is the owned `Arc`, and the helper takes the
+                        // bare `&dyn Fn` (see the sync-prefix call site for the same cast).
+                        let outcome = run_async(&*handler, Arc::clone(&call), &registration).await;
                         apply_result(
                             event,
                             &registration,
@@ -992,9 +1105,11 @@ async fn run_async(
         // `timeout` answers the same way: the handler loses the race on the first poll.
         Some(ms) => match timeout(Duration::from_millis(ms), future).await {
             Ok(result) => result,
-            Err(_elapsed) => {
-                Err(HandlerFailure::new(budget_error_of(call.event, &registration.owner, ms)))
-            }
+            Err(_elapsed) => Err(HandlerFailure::timed_out(
+                call.event,
+                &registration.owner,
+                ms,
+            )),
         },
     }
 }
@@ -1017,7 +1132,10 @@ fn apply_result(
             report_drop(
                 reporter,
                 DiagnosticEvent {
-                    kind: DiagnosticKind::HandlerThrew,
+                    // The failure names its own kind: a throw is `handler-threw` and a budget
+                    // breach is `handler-timed-out`, and conflating them tells an operator the
+                    // plugin is broken when the real fix is a bigger budget.
+                    kind: failure.kind,
                     owner: registration.owner.clone(),
                     event: Some(event.as_str().to_owned()),
                     message: failure.message,

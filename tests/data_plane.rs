@@ -824,7 +824,7 @@ fn journal_appends_reads_and_reports_problems() {
     assert_eq!(
         lines[1..].to_vec(),
         appended,
-        "`append` writes `{type,v,turnId,index,at,event}` with `type`/`v` FIRST and never rewrites the header"
+        "`append` writes `{{type,v,turnId,index,at,event}}` with `type`/`v` FIRST and never rewrites the header"
     );
     assert_eq!(
         lines.len(),
@@ -970,7 +970,7 @@ fn journal_appends_reads_and_reports_problems() {
     assert_eq!(
         (junk.events.as_slice(), junk.header.as_ref(), junk.empty, junk.missing),
         (&[] as &[JournalEventRecord], None, true, false),
-        "`{events: [], problems: [...], empty: true, missing: false}` with no header"
+        "`{{events: [], problems: [...], empty: true, missing: false}}` with no header"
     );
 
     // THE OLD RUST ENVELOPE IS REFUSED, EXACTLY AS TS REFUSES IT (`journal.ts:175-180`): a legacy
@@ -1044,7 +1044,7 @@ fn journal_appends_reads_and_reports_problems() {
             "{\"turnId\":\"turn-a\",\"index\":0,\"at\":1,\"event\":{\"type\":\"text\",\"agent\":\"instruct\",\"delta\":\"one\"},\"type\":\"event\",\"v\":1}",
             "{\"turnId\":\"turn-a\",\"index\":2,\"at\":3,\"event\":{\"type\":\"text\",\"agent\":\"instruct\",\"delta\":\"three\"},\"type\":\"event\",\"v\":1}",
         ],
-        "`rewrite` writes `{...record,type,v}` with `type`/`v` LAST (fixture `rewriteOrderLine`)"
+        "`rewrite` writes `{{...record,type,v}}` with `type`/`v` LAST (fixture `rewriteOrderLine`)"
     );
     assert_eq!(
         rewritten_lines.len(),
@@ -1157,7 +1157,7 @@ fn journal_appends_reads_and_reports_problems() {
             missing: true,
             truncated_tail: false,
         },
-        "`{events: [], problems: [], empty: true, missing: true, truncatedTail: false}`, with NO header key"
+        "`{{events: [], problems: [], empty: true, missing: true, truncatedTail: false}}`, with NO header key"
     );
 }
 
@@ -1202,7 +1202,7 @@ fn journal_write_path_matches_the_typescript_bytes() {
             "sessionId": "write-path",
             "createdAt": fixture_created_at,
         }),
-        "the fixture header is `{type,v,sessionId,createdAt}` in that order"
+        "the fixture header is `{{type,v,sessionId,createdAt}}` in that order"
     );
 
     let fixture = Fixture::new("journal-write-path");
@@ -1229,7 +1229,7 @@ fn journal_write_path_matches_the_typescript_bytes() {
     assert_eq!(
         journal::journal_line(&journal::journal_appended_line(&fixture_records[0])),
         format!("{}\n", observations["appendOrderLine"].as_str().expect("the append-order line")),
-        "`append`'s envelope is `{type,v,turnId,index,at,event}`"
+        "`append`'s envelope is `{{type,v,turnId,index,at,event}}`"
     );
     assert_eq!(
         journal::journal_line(&journal::journal_compacted_line(&fixture_records[0])),
@@ -1237,7 +1237,7 @@ fn journal_write_path_matches_the_typescript_bytes() {
             "{}\n",
             observations["rewriteOrderLine"].as_str().expect("the rewrite-order line")
         ),
-        "`rewrite`'s envelope is `{turnId,index,at,event,type,v}`"
+        "`rewrite`'s envelope is `{{turnId,index,at,event,type,v}}`"
     );
 
     // APPEND (`observations.append.bytes`): the header plus the three canonical lines. This crate's
@@ -1264,7 +1264,7 @@ fn journal_write_path_matches_the_typescript_bytes() {
     assert_eq!(
         appended,
         fixture_appended,
-        "every appended line equals `journalLine({type,v,...record})` byte for byte"
+        "every appended line equals `journalLine({{type,v,...record}})` byte for byte"
     );
 
     // REWRITE (`observations.rewrite.bytes`): the kept records (indices 0 and 2 - the fixture keeps
@@ -1285,10 +1285,23 @@ fn journal_write_path_matches_the_typescript_bytes() {
 
         header["createdAt"].as_u64().expect("a numeric createdAt")
     };
-    let fixture_rewrite_bytes = seen["rewrite"]["bytes"]
+    // The stamp one CAPTURE's own header carries. TS stamps a fresh `createdAt` on every header it
+    // writes, so the rewrite and truncate captures name a different number from the open/append captures
+    // - and this crate stamps its own wall clock at the same moment. Substituting the capture's own stamp
+    // with the stamp this build wrote is the only honest comparison; every other byte must match exactly.
+    let fixture_stamp = |bytes: &str| -> String {
+        serde_json::from_str::<Value>(bytes.lines().next().unwrap_or_default())
+            .ok()
+            .and_then(|header| header.get("createdAt").and_then(Value::as_u64))
+            .map(|stamp| stamp.to_string())
+            .unwrap_or_default()
+    };
+
+    let fixture_rewrite_source = seen["rewrite"]["bytes"]
         .as_str()
-        .expect("the rewrite bytes")
-        .replace(&fixture_created_at.to_string(), &rewrite_at.to_string());
+        .expect("the rewrite bytes");
+    let fixture_rewrite_bytes = fixture_rewrite_source
+        .replace(&fixture_stamp(fixture_rewrite_source), &rewrite_at.to_string());
 
     assert_eq!(
         rewritten, fixture_rewrite_bytes,

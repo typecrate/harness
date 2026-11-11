@@ -1202,6 +1202,14 @@ impl SessionStore {
             && let Some(thread) = state.thread_mut(conversation)
         {
             thread.messages = outcome.messages.clone();
+
+            // The transcript counter moves with EVERY replacement, a run's own included. The thread row
+            // carries the durable mirror (`set_transcript` bumps it for a route write, and the checkpoint
+            // persists it), while the hub counter is what every read quotes; TypeScript has one figure for
+            // the document read, the `if_revision` guard and the receipt (`api.ts:4361`, `:4390`, `:4765`),
+            // so a run that left the mirror behind would make the next block write guard against a revision
+            // nobody ever read.
+            thread.transcript_revision = Some(thread.transcript_revision.unwrap_or(0) + 1);
         }
 
         // Release the slot exactly once, in this run's settle (`sessions.ts:7357-7375`).

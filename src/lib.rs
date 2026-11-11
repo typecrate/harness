@@ -94,6 +94,9 @@ pub mod origin;
 pub mod package_root;
 pub mod paging;
 pub mod persistence;
+// The plugin LAYER (bus + host + seam), distinct from `plugins` below, which is the generated
+// catalogue metadata the host publishes. `plugin` owns behaviour, `plugins` owns the table.
+pub mod plugin;
 pub mod plugins;
 pub mod ports;
 pub mod projector;

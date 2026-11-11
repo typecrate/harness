@@ -45,7 +45,26 @@ const LIMIT_MESSAGE: &str = "Query parameter \"limit\" must be an integer betwee
 
 /// The two built-ins this build ships, in scan order: the list the 404 sentence prints, and the order
 /// `GET /plugins` answers in.
-const CATALOGUE: [&str; 2] = ["async-ping", "context-compaction"];
+/// The shipped catalogue, in the TypeScript manifest's scan order (path ascending from
+/// `src/plugins`): `async-ping.plugin.ts`, `context-compaction.plugin.ts`, then
+/// `context-trimmer.plugin.ts`. The order is contract-visible - `GET /plugins` answers in
+/// it, the pane renders it as-is, and the 404 sentence joins these names with `", "`.
+const CATALOGUE: [&str; 3] = ["async-ping", "context-compaction", "context-trimmer"];
+
+/// The EFFECTIVE values of a compaction plugin nobody has touched, except the limit: the
+/// row projects every DECLARED key (`plugins.ts valuesOf`), and the compactor declares six.
+/// The five that no test patches stay at their declared defaults, so writing them once here
+/// keeps each assertion about `contextLimit` honest about the whole map.
+fn compaction_values(limit: Value) -> Value {
+    json!({
+        "contextLimit": limit,
+        "modelLimits": "{}",
+        "enabled": true,
+        "minTokens": 200,
+        "safetyTurns": 6,
+        "mode": "summarize",
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures and the test listener
@@ -357,7 +376,7 @@ async fn the_catalogue_answers_both_builtins_with_their_declared_metadata_and_va
 
     // A two-entry catalogue fits one default page, so `limit` echoes the EFFECTIVE size and the
     // cursor ends the collection.
-    assert_eq!(page.body["limit"], 2);
+    assert_eq!(page.body["limit"], 3);
     assert_eq!(page.body["next_cursor"], Value::Null);
     assert!(page.body["observed_at"].is_u64());
 
@@ -383,6 +402,7 @@ async fn the_catalogue_answers_both_builtins_with_their_declared_metadata_and_va
         vec![
             "builtin",
             "description",
+            "enabled",
             "hooks",
             "name",
             "settings",
@@ -662,11 +682,11 @@ async fn a_patched_context_limit_answers_the_row_bumps_the_counter_and_is_durabl
     assert_eq!(patched.body["plugin"]["name"], "context-compaction");
     assert_eq!(
         patched.body["plugin"]["values"],
-        json!({ "contextLimit": 200000 })
+        compaction_values(json!(200000))
     );
 
     // The DECLARED descriptor is unchanged by a write: the row still carries the reset target.
-    assert_eq!(patched.body["plugin"]["settings"][0]["default"], 100000);
+    assert_eq!(patched.body["plugin"]["settings"][0]["default"], 200000);
     assert_eq!(
         patched.body["plugin"]["settings"][0]["min"], 1000,
         "and the bounds the plugin published"
@@ -684,7 +704,7 @@ async fn a_patched_context_limit_answers_the_row_bumps_the_counter_and_is_durabl
     assert_eq!(reload.body["revision"], 1);
     assert_eq!(
         reload.body["items"][1]["values"],
-        json!({ "contextLimit": 200000 })
+        compaction_values(json!(200000))
     );
 
     // The other plugin is untouched: settings are scoped by plugin id.
@@ -754,7 +774,7 @@ async fn submitted_values_are_normalized_to_the_declared_type() {
     assert_eq!(text.status, StatusCode::OK);
     assert_eq!(
         text.body["plugin"]["values"],
-        json!({ "contextLimit": 150000 }),
+        compaction_values(json!(150000)),
         "the stored value is exactly the declared type"
     );
     assert!(text.body["plugin"]["values"]["contextLimit"].is_i64());
@@ -786,7 +806,7 @@ async fn submitted_values_are_normalized_to_the_declared_type() {
     );
     assert_eq!(
         unstepped.body["plugin"]["values"],
-        json!({ "contextLimit": 12345 })
+        compaction_values(json!(12345))
     );
 
     let decimal = patch_settings(
@@ -799,7 +819,7 @@ async fn submitted_values_are_normalized_to_the_declared_type() {
     assert_eq!(decimal.status, StatusCode::OK);
     assert_eq!(
         decimal.body["plugin"]["values"],
-        json!({ "contextLimit": 1500.5 })
+        compaction_values(json!(1500.5))
     );
 
     // `min` is INCLUSIVE: the boundary itself is accepted.
@@ -813,7 +833,7 @@ async fn submitted_values_are_normalized_to_the_declared_type() {
     assert_eq!(boundary.status, StatusCode::OK);
     assert_eq!(
         boundary.body["plugin"]["values"],
-        json!({ "contextLimit": 1000 })
+        compaction_values(json!(1000))
     );
 
     // A padded numeric string is the same value: the runtime's own `asNumber` accepts it, so the
@@ -828,7 +848,7 @@ async fn submitted_values_are_normalized_to_the_declared_type() {
     assert_eq!(padded.status, StatusCode::OK);
     assert_eq!(
         padded.body["plugin"]["values"],
-        json!({ "contextLimit": 2500 })
+        compaction_values(json!(2500))
     );
 
     server.stop().await;
@@ -856,10 +876,10 @@ async fn an_explicit_null_restores_the_declared_default_and_drops_the_override()
     assert_eq!(reset.status, StatusCode::OK);
     assert_eq!(
         reset.body["plugin"]["values"],
-        json!({ "contextLimit": 100000 }),
+        compaction_values(json!(200000)),
         "the declared default applies again"
     );
-    assert_eq!(reset.body["plugin"]["settings"][0]["default"], 100000);
+    assert_eq!(reset.body["plugin"]["settings"][0]["default"], 200000);
 
     // A reset is a MUTATION, so the counter moved again (1 -> 2).
     assert_eq!(reset.header(&REVISION_HEADER).as_deref(), Some("2"));
@@ -877,7 +897,7 @@ async fn an_explicit_null_restores_the_declared_default_and_drops_the_override()
     assert_eq!(page.body["revision"], 2);
     assert_eq!(
         page.body["items"][1]["values"],
-        json!({ "contextLimit": 100000 })
+        compaction_values(json!(200000))
     );
 
     // Resetting a key that was never set is still an accepted write - the operator asked for the
@@ -909,7 +929,7 @@ async fn an_unknown_plugin_is_a_404_naming_the_catalogue_this_build_ships() {
     assert_eq!(refused.status, StatusCode::NOT_FOUND);
     assert_eq!(
         refused.message(),
-        "Unknown plugin \"nope\". This build ships: async-ping, context-compaction."
+        "Unknown plugin \"nope\". This build ships: async-ping, context-compaction, context-trimmer."
     );
     assert!(
         refused.header(&REVISION_HEADER).is_none(),
@@ -933,7 +953,7 @@ async fn an_unknown_plugin_is_a_404_naming_the_catalogue_this_build_ships() {
     assert_eq!(near_miss.status, StatusCode::NOT_FOUND);
     assert_eq!(
         near_miss.message(),
-        "Unknown plugin \"Context-Compaction\". This build ships: async-ping, context-compaction."
+        "Unknown plugin \"Context-Compaction\". This build ships: async-ping, context-compaction, context-trimmer."
     );
 
     // A percent-encoded id arrives decoded, which is what the front-end's
@@ -948,7 +968,7 @@ async fn an_unknown_plugin_is_a_404_naming_the_catalogue_this_build_ships() {
     assert_eq!(encoded.status, StatusCode::NOT_FOUND);
     assert_eq!(
         encoded.message(),
-        "Unknown plugin \"a b\". This build ships: async-ping, context-compaction."
+        "Unknown plugin \"a b\". This build ships: async-ping, context-compaction, context-trimmer."
     );
 
     server.stop().await;
@@ -966,8 +986,8 @@ async fn every_malformed_patch_says_exactly_what_was_wrong_and_changes_nothing()
     assert_eq!(unknown_key.status, StatusCode::BAD_REQUEST);
     assert_eq!(
         unknown_key.message(),
-        "Unknown setting \"context_limit\" for plugin \"context-compaction\". Allowed settings: \
-         contextLimit."
+        "Unknown setting \"context_limit\" for plugin \"context-compaction\". Allowed settings: contextLimit, modelLimits, enabled, \
+         minTokens, safetyTurns, mode."
     );
 
     // `intervalMs` is real, but not for this plugin: settings are scoped by plugin id.
@@ -977,8 +997,8 @@ async fn every_malformed_patch_says_exactly_what_was_wrong_and_changes_nothing()
     assert_eq!(wrong_scope.status, StatusCode::BAD_REQUEST);
     assert_eq!(
         wrong_scope.message(),
-        "Unknown setting \"intervalMs\" for plugin \"context-compaction\". Allowed settings: \
-         contextLimit."
+        "Unknown setting \"intervalMs\" for plugin \"context-compaction\". Allowed settings: contextLimit, modelLimits, enabled, \
+         minTokens, safetyTurns, mode."
     );
 
     // 2. A value outside the declared bounds, quoting the bound and what arrived.
@@ -1053,7 +1073,7 @@ async fn every_malformed_patch_says_exactly_what_was_wrong_and_changes_nothing()
     assert_eq!(first_offender.status, StatusCode::BAD_REQUEST);
     assert_eq!(
         first_offender.message(),
-        "Unknown setting \"zzz\" for plugin \"context-compaction\". Allowed settings: contextLimit.",
+        "Unknown setting \"zzz\" for plugin \"context-compaction\". Allowed settings: contextLimit, modelLimits, enabled, minTokens, safetyTurns, mode.",
         "the unknown key that arrived FIRST is the one named"
     );
 
@@ -1068,12 +1088,12 @@ async fn every_malformed_patch_says_exactly_what_was_wrong_and_changes_nothing()
     assert_eq!(mixed.status, StatusCode::BAD_REQUEST);
     assert_eq!(
         mixed.message(),
-        "Unknown setting \"enabled\" for plugin \"context-compaction\". Allowed settings: \
-         contextLimit."
+        "Unknown setting \"enabled\" for plugin \"context-compaction\". Allowed settings: contextLimit, modelLimits, enabled, \
+         minTokens, safetyTurns, mode."
     );
     assert_eq!(
         list(&server, "").await.body["items"][1]["values"],
-        json!({ "contextLimit": 100000 }),
+        compaction_values(json!(200000)),
         "the VALID half of a rejected patch applied nothing"
     );
 
@@ -1143,7 +1163,7 @@ async fn every_malformed_patch_says_exactly_what_was_wrong_and_changes_nothing()
     );
     assert_eq!(
         untouched.body["items"][1]["values"],
-        json!({ "contextLimit": 100000 })
+        compaction_values(json!(200000))
     );
     assert!(
         !root.state_file().exists(),
@@ -1196,7 +1216,7 @@ async fn a_non_object_settings_block_produces_the_sentence_its_spread_produces()
         assert_eq!(
             refused.message(),
             "Unknown setting \"0\" for plugin \"context-compaction\". Allowed settings: \
-             contextLimit."
+             contextLimit, modelLimits, enabled, minTokens, safetyTurns, mode."
         );
     }
 
@@ -1279,7 +1299,7 @@ async fn plugin_settings_survive_a_restart_without_restarting_the_value() {
     );
     assert_eq!(
         page.body["items"][1]["values"],
-        json!({ "contextLimit": 200000 }),
+        compaction_values(json!(200000)),
         "while the VALUE does survive it"
     );
 
@@ -1310,7 +1330,7 @@ async fn plugin_settings_survive_a_restart_without_restarting_the_value() {
     assert_eq!(restored.body["revision"], 0);
     assert_eq!(
         restored.body["items"][1]["values"],
-        json!({ "contextLimit": 150000 })
+        compaction_values(json!(150000))
     );
 
     third.stop().await;
@@ -1350,7 +1370,7 @@ async fn a_restored_document_drops_what_this_build_no_longer_declares() {
     );
     assert_eq!(
         page.body["items"][1]["values"],
-        json!({ "contextLimit": 4000 }),
+        compaction_values(json!(4000)),
         "a key that belongs to the OTHER plugin is that plugin's own, when it is in range"
     );
 
@@ -1394,7 +1414,7 @@ async fn a_stored_value_outside_the_declared_bounds_is_dropped_not_fatal() {
     assert_eq!(page.status, StatusCode::OK);
     assert_eq!(
         page.body["items"][1]["values"],
-        json!({ "contextLimit": 100000 }),
+        compaction_values(json!(200000)),
         "the dropped override falls back to the declared default"
     );
     assert_eq!(
@@ -1551,7 +1571,7 @@ async fn a_failed_durable_write_answers_500_and_keeps_the_applied_value() {
 
     assert_eq!(
         page.body["items"][1]["values"],
-        json!({ "contextLimit": 300000 }),
+        compaction_values(json!(300000)),
         "a failed write does not undo the live value"
     );
     assert_eq!(
@@ -1581,7 +1601,7 @@ async fn the_store_projects_declared_defaults_until_an_override_lands() {
     // writer omits the member entirely.
     assert_eq!(
         booted.store.plugin_values("context-compaction"),
-        object(json!({ "contextLimit": 100000 }))
+        object(compaction_values(json!(200000)))
     );
     assert!(booted.store.plugin_snapshot().is_empty());
     assert_eq!(booted.store.plugin_revision(), 0);
@@ -1634,7 +1654,7 @@ async fn the_store_projects_declared_defaults_until_an_override_lands() {
     );
     assert_eq!(
         booted.store.plugin_values("context-compaction"),
-        object(json!({ "contextLimit": 4000 }))
+        object(compaction_values(json!(4000)))
     );
 
     // The row's own `values` and the store's projection cannot disagree: both are the same read.
@@ -1643,10 +1663,10 @@ async fn the_store_projects_declared_defaults_until_an_override_lands() {
         .plugin_row("context-compaction")
         .expect("this build ships context-compaction");
 
-    assert_eq!(row.values, object(json!({ "contextLimit": 4000 })));
+    assert_eq!(row.values, object(compaction_values(json!(4000))));
     assert_eq!(
         row.settings[0].default,
-        json!(100000),
+        json!(200000),
         "the reset target stays"
     );
 
