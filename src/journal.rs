@@ -995,21 +995,30 @@ fn parse_line(line: &str) -> Result<ParsedLine, String> {
                 }
             };
 
+            // `at` must be a finite number (`:203`). `as_u64` is the port's reading of that: only an
+            // integral, non-negative value survives, and a fractional timestamp - which `Date.now()`
+            // never produces - is refused rather than rounded.
             let at = match object.get("at").and_then(Value::as_u64) {
                 Some(at) => at,
                 None => return Err("event at is missing".to_string()),
             };
 
-            let event = match object.get("event") {
-                Some(Value::Object(payload)) if payload.contains_key("type") => {
-                    if payload.get("type").is_some_and(Value::is_string) {
-                        parsed.get("event").cloned().unwrap_or(Value::Null)
-                    } else {
-                        return Err("event payload is missing".to_string());
-                    }
-                }
-                _ => return Err("event payload is missing".to_string()),
-            };
+            // `!isRecordObject(candidate.event) || typeof candidate.event.type !== 'string'`
+            // (`:207-210`). A null event would fold into the projector as a phantom step, which is
+            // why this is a refusal and not a default.
+            let event_is_valid = object
+                .get("event")
+                .and_then(Value::as_object)
+                .is_some_and(|payload| payload.get("type").is_some_and(Value::is_string));
+
+            if !event_is_valid {
+                return Err("event payload is missing".to_string());
+            }
+
+            let event = object
+                .get("event")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
             Ok(ParsedLine::Event(JournalEventRecord {
                 turn_id,
