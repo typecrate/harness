@@ -1361,7 +1361,8 @@ async fn a_queued_submit_runs_the_turn_and_the_record_keeps_every_event() {
 
     // The journal behind the turn is durable: `<root>/harness/sessions/<id>/events.jsonl` is the log a
     // restart replays (`mod.rs:220 sessions_dir`, `journal.rs:89-111`). Its first line is the header,
-    // and every event after it carries its own sequence, starting at 1.
+    // and every event line is the TypeScript envelope `{type,v,turnId,index,at,event}` (`journal.ts:303`)
+    // with the TURN's own append position - `index` counts within the turn, not within the file.
     let journal = store.config().sessions_dir().join(&id).join("events.jsonl");
     let text = std::fs::read_to_string(&journal)
         .unwrap_or_else(|error| panic!("{} should exist: {error}", journal.display()));
@@ -1383,16 +1384,67 @@ async fn a_queued_submit_runs_the_turn_and_the_record_keeps_every_event() {
         lines[1..]
             .iter()
             .map(|line| (
-                line["sequence"].as_u64().expect("a sequence"),
+                line["type"].as_str().expect("a record type"),
+                line["v"].as_u64().expect("a format version"),
+                line["turnId"].as_str().expect("a turnId").to_owned(),
+                line["index"].as_u64().expect("an index"),
                 line["event"]["type"].as_str().expect("an event type"),
             ))
             .collect::<Vec<_>>(),
-        vec![(1, "start"), (2, "text"), (3, "usage"), (4, "done"),],
-        "the journal keeps emission order and one monotonic sequence per line"
+        vec![
+            ("event", 1, receipt.turn_id.clone(), 0, "start"),
+            ("event", 1, receipt.turn_id.clone(), 1, "text"),
+            ("event", 1, receipt.turn_id.clone(), 2, "usage"),
+            ("event", 1, receipt.turn_id.clone(), 3, "done"),
+        ],
+        "the journal keeps emission order and the turn's own 0-based index per line"
+    );
+    assert_eq!(
+        lines[1..]
+            .iter()
+            .map(|line| line["at"].as_u64().expect("a stamp"))
+            .collect::<Vec<u64>>(),
+        lines[1..]
+            .iter()
+            .map(|line| line["event"]["at"]
+                .as_u64()
+                // The record's `at` is the ONE stamp the line, the record and the published frame
+                // share (`sessions.ts:7930-7961`); an event body carries no `at` of its own, so the
+                // envelope's is the figure every line agrees on.
+                .unwrap_or_else(|| 0))
+            .collect::<Vec<u64>>(),
+        "every line carries the stamp it was written with"
     );
     assert!(
-        lines[1..].iter().all(|line| line["timestamp"].is_number()),
-        "every line carries the stamp it was written with"
+        lines[1..].iter().all(|line| line["at"].as_u64().is_some_and(|at| at > 0)),
+        "the envelope stamp is a real clock figure on every line"
+    );
+    assert_eq!(
+        lines[1..]
+            .iter()
+            .map(|line| {
+                let mut keys: Vec<String> = line
+                    .as_object()
+                    .expect("an event line is an object")
+                    .keys()
+                    .cloned()
+                    .collect();
+                let _ = keys.pop();
+                keys
+            })
+            .collect::<Vec<Vec<String>>>(),
+        vec![
+            vec![
+                "type".to_owned(),
+                "v".to_owned(),
+                "turnId".to_owned(),
+                "index".to_owned(),
+                "at".to_owned(),
+            ];
+            4
+        ],
+        "`append` writes `type`/`v` FIRST (`journal.ts:303`), so a TS-written journal and a Rust one \
+         diff to nothing but the payload bytes"
     );
 }
 

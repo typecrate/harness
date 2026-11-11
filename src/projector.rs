@@ -333,9 +333,15 @@ pub struct Node {
 
 /// One attempt's minted nodes, so a `retry` can name the exact ones to drop
 /// (`turn-projector.ts:1023-1027`).
+///
+/// `block_ids` is the bar half of the same window (`turn-display.ts:561-577`, `blockIds`): the prose
+/// segments this attempt minted. A retried request produced a thinking strip and an answer strip that
+/// never happened, so a retry removes them too - one `context:remove` op each, in TS's order
+/// (`turn-projector.ts:1216`).
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Attempt {
     node_ids: Vec<String>,
+    block_ids: Vec<String>,
 }
 
 /// One agent flow: the turn's root invocation, or one nested invocation/branch
@@ -369,9 +375,38 @@ pub struct Section {
     /// The prose node this request is still streaming into; detached at every boundary.
     text_writer: Option<usize>,
     reasoning_writer: Option<usize>,
+    /// The context-bar segment this window's ANSWER is streaming into, and the same for its
+    /// THINKING (`windowAssistantBlock`/`windowReasoningBlock`, `turn-display.ts:564-577`).
+    ///
+    /// They sit beside the node writers because a window has two halves that are minted together and
+    /// patched apart: the node carries the text itself, the segment carries only counts and the event
+    /// window. Both are detached at the same boundaries, in [`Self::close_writers`].
+    text_window: Option<ProseWindow>,
+    reasoning_window: Option<ProseWindow>,
     attempt: Option<Attempt>,
     started: bool,
     terminal: bool,
+}
+
+/// The context-bar segment one open prose window is painting, plus the clock its duration is measured
+/// from (`textBlockId`/`textOpenedAt` and the `reasoningBlockId`/`reasoningOpenedAt` pair,
+/// `turn-projector.ts:2138-2145` and `:2218-2225`).
+///
+/// TypeScript keeps the same two figures as flat fields on the projection context; grouping them as one
+/// window is what keeps the answer segment and the thinking segment from being updated half-and-half,
+/// which is the only way this fold could patch a segment with the OTHER window's id.
+///
+/// The running `chars` is deliberately not mirrored here: the segment's count comes off the prose node
+/// the window is streaming into, and a second copy of a length is one more thing that can disagree with
+/// the transcript body it describes.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ProseWindow {
+    /// The segment's id (`0-assistant-56`), so every delta can address its own bar row.
+    block: String,
+    /// The first delta's clock, set once when the segment is minted. `flowWindowPatch` publishes a
+    /// `durationMs` only once a LATER event proves the window bracketed real time, so a one-event window
+    /// states no duration at all instead of a fabricated `0` (`turn-projector.ts:305-330`).
+    opened_at: u64,
 }
 
 /// One turn's compiled DISPLAY state.

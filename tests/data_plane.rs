@@ -19,7 +19,10 @@ use typecrate_harness::{
     config::{self, HarnessRuntimeSettings},
     contract::{self, HarnessEvent, HarnessToolCall, HarnessToolOutcome, UpdateAgentRequest},
     events::EventHub,
-    journal::{self, HarnessJournal},
+    journal::{
+        self, HarnessJournal, JournalEventRecord, JournalHeaderRecord, JournalProblem,
+        JournalProblemKind, JournalReadResult,
+    },
     labels, persistence, read,
     registry::{HarnessRegistry, presets},
 };
@@ -101,6 +104,37 @@ fn settings() -> HarnessRuntimeSettings {
 /// String names, so a `Vec<String>` field compares against a literal list without noise.
 fn names(list: &[&str]) -> Vec<String> {
     list.iter().map(|name| (*name).to_string()).collect()
+}
+
+// ---------------------------------------------------------------------------
+// The vendored TypeScript journal fixtures
+// ---------------------------------------------------------------------------
+
+/// One file under `tests/fixtures/`, read as text. `Temp/` is git-ignored and disposable, so the
+/// TypeScript-authored fixtures this crate compares against are VENDORED here (see
+/// `tests/fixtures/README.md` for provenance) and read fresh, so no test hands the next one a
+/// mutated value.
+fn fixture_text(name: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+
+    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{} is readable: {error}", path.display()))
+}
+
+/// The same file as raw bytes, for a case file a test replays into a session directory.
+fn fixture_bytes(name: &str) -> Vec<u8> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+
+    std::fs::read(&path).unwrap_or_else(|error| panic!("{} is readable: {error}", path.display()))
+}
+
+/// One fixture document parsed as JSON.
+fn read_fixture(name: &str) -> Value {
+    serde_json::from_str(&fixture_text(name))
+        .unwrap_or_else(|error| panic!("the {name} fixture is JSON: {error}"))
 }
 
 /// One minimal-but-valid session record body, as a TS-written document would carry it.
@@ -722,8 +756,14 @@ fn repair_closes_dangling_calls_inside_the_core_snapshot() {
     );
 }
 
-/// 5. The journal: append/read from a sequence, tail tolerance, corruption reporting, truncate,
-///    rewrite, remove.
+/// 5. The journal: BOTH TypeScript line envelopes, tail tolerance, corruption reporting, the
+///    gap-preserving rewrite, truncate, and remove (`journal.rs`, the port of `journal.ts:230-512`).
+///
+/// Every expected byte below is what the TypeScript WRITER produces, taken from the TS-authored
+/// fixture `tests/fixtures/journal-write-path/write-path-observations.json` (captured by calling the
+/// real `HarnessJournal`) and from `journal.ts:280` / `:303` / `:448-455` - not observed from this
+/// Rust build. Key ORDER is part of the assertion, because the two writers differ only there and a
+/// client that diffs a TS journal against a Rust one must see nothing.
 #[test]
 fn journal_appends_reads_and_reports_problems() {
     let fixture = Fixture::new("journal");
@@ -731,161 +771,817 @@ fn journal_appends_reads_and_reports_problems() {
     let mut journal =
         HarnessJournal::open(&sessions, "session-j", None).expect("the journal opens");
 
-    // The header line is TS's, verbatim, so an empty journal is distinguishable from a stray file.
-    let header = std::fs::read_to_string(journal.path())
-        .expect("readable")
-        .lines()
-        .next()
-        .expect("a header line")
-        .to_string();
-    let parsed: Value = serde_json::from_str(&header).expect("the header is JSON");
+    // THE HEADER LINE (`journal.ts:280`): `{type,v,sessionId,createdAt}`, in that order, as line 1.
+    // `createdAt` is the one figure a run cannot reproduce (fixture MANIFEST: "Only `createdAt` inside
+    // a header line is non-reproducible"), so the line is pinned around the stamp it actually holds.
+    let opened = std::fs::read_to_string(journal.path()).expect("readable");
+    let header_line = opened
+        .strip_suffix('\n')
+        .expect("a complete line ends with a newline");
+    let parsed: Value = serde_json::from_str(header_line).expect("the header line is one JSON record");
+    let created_at = parsed["createdAt"]
+        .as_u64()
+        .expect("the header carries a numeric createdAt");
 
     assert_eq!(
-        parsed["type"], "header",
-        "the header line names its record type"
+        header_line,
+        format!(
+            "{{\"type\":\"header\",\"v\":1,\"sessionId\":\"session-j\",\"createdAt\":{created_at}}}"
+        ),
+        "unexpected header line: {header_line}"
     );
-    assert_eq!(parsed["v"], json!(journal::HARNESS_JOURNAL_VERSION));
-    assert_eq!(parsed["sessionId"], "session-j");
-    assert!(parsed["createdAt"].is_number());
+    assert_eq!(
+        opened,
+        journal::journal_line(&journal::journal_header("session-j", created_at)),
+        "the shared builder and the file agree byte for byte"
+    );
+    assert!(journal.exists());
+    assert_eq!(journal.session_id(), "session-j");
 
-    let first = journal.append(&text_event("one"), false).expect("append 1");
-    let second = journal.append(&text_event("two"), false).expect("append 2");
-    let third = journal
-        .append(&text_event("three"), true)
+    // THE APPENDED LINE (`journal.ts:303`: `journalLine({ type:'event', v, ...record })`), so
+    // `type`/`v` come FIRST. `turnId`/`index`/`at` are the TURN's position and the one timestamp the
+    // record, this line and the published frame share (`sessions.ts:7930-7961`), i.e. all three come
+    // from the caller - which is what makes these bytes exact.
+    journal
+        .append("turn-a", 0, 1, &text_event("one"), false)
+        .expect("append 1");
+    journal
+        .append("turn-a", 1, 2, &text_event("two"), false)
+        .expect("append 2");
+    journal
+        .append("turn-a", 2, 3, &text_event("three"), true)
         .expect("append 3 (fenced)");
 
-    assert_eq!((first, second, third), (1, 2, 3));
-    assert_eq!(journal.next_sequence(), 4);
-    assert!(journal.size() > 0);
+    let appended: Vec<&str> = vec![
+        "{\"type\":\"event\",\"v\":1,\"turnId\":\"turn-a\",\"index\":0,\"at\":1,\"event\":{\"type\":\"text\",\"agent\":\"instruct\",\"delta\":\"one\"}}",
+        "{\"type\":\"event\",\"v\":1,\"turnId\":\"turn-a\",\"index\":1,\"at\":2,\"event\":{\"type\":\"text\",\"agent\":\"instruct\",\"delta\":\"two\"}}",
+        "{\"type\":\"event\",\"v\":1,\"turnId\":\"turn-a\",\"index\":2,\"at\":3,\"event\":{\"type\":\"text\",\"agent\":\"instruct\",\"delta\":\"three\"}}",
+    ];
 
-    // One event line, exactly: `{version,sequence,timestamp,event}` in that order.
     let recorded = std::fs::read_to_string(journal.path()).expect("readable");
     let lines: Vec<&str> = recorded.lines().collect();
 
-    assert_eq!(lines.len(), 4);
-    assert!(
-        lines[1].starts_with(&format!(
-            "{{\"version\":{},\"sequence\":1,\"timestamp\":",
-            journal::HARNESS_JOURNAL_VERSION
-        )),
-        "unexpected line: {}",
-        lines[1]
+    assert_eq!(
+        lines[1..].to_vec(),
+        appended,
+        "`append` writes `{type,v,turnId,index,at,event}` with `type`/`v` FIRST and never rewrites the header"
     );
-    assert!(
-        lines[1]
-            .ends_with(",\"event\":{\"type\":\"text\",\"agent\":\"instruct\",\"delta\":\"one\"}}")
+    assert_eq!(
+        lines.len(),
+        4,
+        "the header line plus one line per recorded event, and no more"
     );
+    assert_eq!(
+        journal.size(),
+        u64::try_from(recorded.len()).expect("a byte count fits"),
+        "`size()` tracks the file without a stat"
+    );
+    assert_eq!(journal.failures(), 0, "a clean run reports no write failure");
+    assert!(journal.error().is_none());
 
-    // Replay from a sequence, inclusive, and bounded by a limit.
-    let replay = journal.read(Some(2), None).expect("the journal reads");
+    // THE HEALTHY READ (`journal.ts:328-434`): every record, the header, and nothing reported.
+    let record = |index: u64, at: u64, delta: &str| JournalEventRecord {
+        turn_id: "turn-a".to_owned(),
+        index,
+        at,
+        event: json!({ "type": "text", "agent": "instruct", "delta": delta }),
+    };
 
     assert_eq!(
-        replay
-            .iter()
-            .map(|record| record["sequence"].as_u64().expect("a sequence"))
-            .collect::<Vec<u64>>(),
-        vec![2, 3]
-    );
-    assert_eq!(replay[0]["event"]["delta"], "two");
-    assert!(replay[0]["timestamp"].is_number());
-
-    assert_eq!(
-        journal
-            .read(None, Some(1))
-            .expect("bounded read")
-            .iter()
-            .map(|record| record["sequence"].as_u64().expect("sequence"))
-            .collect::<Vec<u64>>(),
-        vec![1]
+        journal.read(),
+        JournalReadResult {
+            events: vec![record(0, 1, "one"), record(1, 2, "two"), record(2, 3, "three")],
+            header: Some(JournalHeaderRecord {
+                session_id: "session-j".to_owned(),
+                created_at,
+            }),
+            problems: Vec::new(),
+            empty: false,
+            missing: false,
+            truncated_tail: false,
+        },
+        "a healthy journal reads as exactly the three records"
     );
 
     journal.flush().expect("flush succeeds");
 
-    // A reopening recovers the sequence from the file rather than starting over.
-    let reopened = HarnessJournal::open(&sessions, "session-j", None).expect("reopen");
-    assert_eq!(reopened.next_sequence(), 4);
+    // OPENING IS O(1) AND COUNTER-FREE (`journal.ts:271-291`): the format has no per-file sequence, so
+    // a reopening neither rescans nor "recovers" a number - it reads the same records.
+    let mut reopened = HarnessJournal::open(&sessions, "session-j", None).expect("reopen");
 
-    // TAIL TOLERANCE: a last line with no terminating newline is a crash artifact.
-    let torn = {
-        let mut text = std::fs::read_to_string(journal.path()).expect("readable");
-        text.push_str("{\"version\":1,\"sequence\":4,\"timestamp\":1700000000900,\"event\":{\"type\":\"text\",\"agent\":\"instruct\",\"delta\":\"cut");
-        text
-    };
-    std::fs::write(journal.path(), torn).expect("the torn file is written");
-
-    let snapshot = journal.read(None, None).expect("the snapshot fold reads");
     assert_eq!(
-        snapshot
-            .iter()
-            .map(|record| record["sequence"].as_u64().expect("sequence"))
-            .collect::<Vec<u64>>(),
-        vec![1, 2, 3],
-        "the fold drops the incomplete tail silently"
+        reopened.read().events,
+        vec![record(0, 1, "one"), record(1, 2, "two"), record(2, 3, "three")],
+        "a reopen reads the same log"
     );
 
-    let (records, problems) = journal
-        .read_all_with_problems()
-        .expect("the explicit read works");
-    assert_eq!(records.len(), 3);
-    assert_eq!(problems.len(), 1, "an explicit read reports the tail");
+    // TAIL TOLERANCE (`journal.ts:357-392`): the LAST line with no terminating newline is a crash
+    // artifact, so it is dropped AND reported, at its own 1-based line, with the suffixed reason. The
+    // cut below is the fixture's own 30-character `crash-shape` tail.
+    let torn = format!(
+        "{header_line}\n{}\n{}\n{}",
+        appended[0], appended[1], "{\"type\":\"event\",\"v\":1,\"turnId\""
+    );
+
+    std::fs::write(journal.path(), &torn).expect("the torn file is written");
+
+    let snapshot = journal.read();
+
+    assert!(snapshot.truncated_tail, "a line without its newline is a torn tail");
+    assert_eq!(
+        snapshot.events,
+        vec![record(0, 1, "one"), record(1, 2, "two")],
+        "the fold drops exactly the incomplete tail"
+    );
+    assert_eq!(
+        snapshot.problems,
+        vec![JournalProblem {
+            line: 4,
+            kind: JournalProblemKind::Malformed,
+            // The parse wording belongs to the JSON engine, so the two stable halves are what the
+            // port owes TS: the refusal class and the `(truncated tail)` suffix (`:388`).
+            reason: snapshot.problems.first().expect("one problem").reason.clone(),
+            tail: true,
+        }]
+    );
+    let reason = snapshot.problems[0].reason.as_str();
+    assert!(reason.starts_with("not valid JSON:"), "got {reason}");
     assert!(
-        problems[0].ends_with("(truncated tail)"),
-        "got {problems:?}"
+        reason.ends_with(" (truncated tail)"),
+        "the tolerated tail must say so, got {reason}"
+    );
+    assert_eq!(
+        snapshot.header,
+        Some(JournalHeaderRecord {
+            session_id: "session-j".to_owned(),
+            created_at,
+        }),
+        "a torn tail leaves the header standing"
+    );
+    assert!(
+        !snapshot.has_corruption(),
+        "the tail problem is the tolerated kind, so this log is not corrupt"
     );
 
-    // A corrupt MIDDLE line is always a problem, and the records around it still stand. The kept
-    // record is sequence 1, so no spurious gap is reported alongside the corruption.
-    let header_line = std::fs::read_to_string(journal.path())
-        .expect("readable")
-        .lines()
-        .next()
-        .expect("a header line")
-        .to_string();
-
+    // A CORRUPT MIDDLE LINE is the SAME break class and is NEVER tolerated (`:371-392`): it is
+    // reported at its own line, without the tail suffix, and the records around it still stand.
     std::fs::write(
         journal.path(),
-        format!("{header_line}\nnot json at all\n{}\n", lines[1]),
+        format!("{header_line}\nnot json at all\n{}\n", appended[0]),
     )
     .expect("written");
 
-    let (records, problems) = journal
-        .read_all_with_problems()
-        .expect("the read survives corruption");
+    let middle = journal.read();
 
-    assert_eq!(problems.len(), 1, "got {problems:?}");
-    assert!(
-        problems[0].starts_with("line 2: not valid JSON"),
-        "got {problems:?}"
+    assert_eq!(
+        middle
+            .problems
+            .iter()
+            .map(|problem| (problem.line, problem.kind, problem.tail))
+            .collect::<Vec<(u64, JournalProblemKind, bool)>>(),
+        vec![(2, JournalProblemKind::Malformed, false)],
+        "a middle line is corruption, never a tail"
     );
     assert!(
-        !problems[0].contains("truncated tail"),
-        "a middle line is never a tail"
+        middle.problems[0].reason.starts_with("not valid JSON:")
+            && !middle.problems[0].reason.contains("truncated tail"),
+        "got {:?}",
+        middle.problems[0].reason
     );
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["sequence"], json!(1));
+    assert_eq!(middle.events, vec![record(0, 1, "one")]);
+    assert_eq!(
+        (middle.empty, middle.missing, middle.truncated_tail),
+        (false, false, false)
+    );
+    assert!(middle.has_corruption());
 
-    // COMPACTION: rewrite renumbers from 1, truncate_after keeps a prefix.
+    // A WHOLE FILE THAT IS NOT JSON (`observations.junk-file`): fail LOUDLY rather than repair.
+    std::fs::write(journal.path(), "not json at all\n").expect("written");
+
+    let junk = journal.read();
+
+    assert_eq!(
+        junk.problems
+            .iter()
+            .map(|problem| (problem.line, problem.kind, problem.tail))
+            .collect::<Vec<(u64, JournalProblemKind, bool)>>(),
+        vec![(1, JournalProblemKind::Malformed, false)]
+    );
+    assert_eq!(
+        (junk.events.as_slice(), junk.header.as_ref(), junk.empty, junk.missing),
+        (&[] as &[JournalEventRecord], None, true, false),
+        "`{events: [], problems: [...], empty: true, missing: false}` with no header"
+    );
+
+    // THE OLD RUST ENVELOPE IS REFUSED, EXACTLY AS TS REFUSES IT (`journal.ts:175-180`): a legacy
+    // `{version,sequence,timestamp,event}` line has no `v`, so the version gate answers before the
+    // type gate and the report names `undefined`. Accepting it here would be the one divergence that
+    // matters - a Rust journal a TypeScript server cannot read.
+    std::fs::write(
+        journal.path(),
+        format!(
+            "{header_line}\n{}\n",
+            "{\"version\":1,\"sequence\":1,\"timestamp\":1700000000000,\"event\":{\"type\":\"text\",\"agent\":\"instruct\",\"delta\":\"legacy\"}}"
+        ),
+    )
+    .expect("written");
+
+    let legacy = journal.read();
+
+    assert_eq!(
+        legacy.problems,
+        vec![JournalProblem {
+            line: 2,
+            kind: JournalProblemKind::Malformed,
+            reason: "unsupported journal version undefined; this server writes version 1".to_owned(),
+            tail: false,
+        }],
+        "a legacy line is a reported problem, worded exactly as TS words it"
+    );
+    assert_eq!(
+        (legacy.events.as_slice(), legacy.empty, legacy.missing),
+        (&[] as &[JournalEventRecord], true, false)
+    );
+
+    // A COMPACTION OF A PRUNED TURN KEEPS THE TAIL'S INDICES (`:409-411`): only a turn that has
+    // already produced a line has an expectation, so a log that opens at index 7 reports NOTHING.
+    // This is the old port's `expected event sequence 0, found 1` false alarm, seen from the other
+    // side: position belongs to the TURN, and a turn's first recorded line is never a gap.
+    std::fs::write(
+        journal.path(),
+        format!(
+            "{header_line}\n{}\n{}\n",
+            appended[0].replace("\"index\":0", "\"index\":7"),
+            appended[1].replace("\"index\":1", "\"index\":8"),
+        ),
+    )
+    .expect("written");
+
+    let pruned = journal.read();
+
+    assert_eq!(pruned.problems, Vec::new(), "a first line at index 7 is not a gap");
+    assert_eq!(
+        pruned.events
+            .iter()
+            .map(|entry| entry.index)
+            .collect::<Vec<u64>>(),
+        vec![7, 8]
+    );
+
+    // THE REWRITTEN LINE (`journal.ts:455`: `journalLine({ ...record, type:'event', v })`): the same
+    // record, `type`/`v` LAST. Keeping records 0 and 2 is gap-PRESERVING - a compaction does not
+    // renumber events it did not change - and the reader has to say so afterwards.
     journal
-        .rewrite(&[text_event("alpha"), text_event("beta")])
+        .rewrite(&[record(0, 1, "one"), record(2, 3, "three")])
         .expect("rewrite succeeds");
 
-    let rewritten = journal.read(None, None).expect("reads back");
-    assert_eq!(rewritten.len(), 2);
-    assert_eq!(rewritten[0]["sequence"], json!(1));
-    assert_eq!(rewritten[1]["event"]["delta"], "beta");
-    assert_eq!(journal.next_sequence(), 3);
+    let rewritten = std::fs::read_to_string(journal.path()).expect("readable");
+    let rewritten_lines: Vec<&str> = rewritten.lines().collect();
 
-    journal.truncate_after(1).expect("truncate succeeds");
-    let kept = journal.read(None, None).expect("reads back");
-    assert_eq!(kept.len(), 1);
-    assert_eq!(kept[0]["event"]["delta"], "alpha");
+    assert_eq!(
+        rewritten_lines[1..].to_vec(),
+        vec![
+            "{\"turnId\":\"turn-a\",\"index\":0,\"at\":1,\"event\":{\"type\":\"text\",\"agent\":\"instruct\",\"delta\":\"one\"},\"type\":\"event\",\"v\":1}",
+            "{\"turnId\":\"turn-a\",\"index\":2,\"at\":3,\"event\":{\"type\":\"text\",\"agent\":\"instruct\",\"delta\":\"three\"},\"type\":\"event\",\"v\":1}",
+        ],
+        "`rewrite` writes `{...record,type,v}` with `type`/`v` LAST (fixture `rewriteOrderLine`)"
+    );
+    assert_eq!(
+        rewritten_lines.len(),
+        3,
+        "one fresh header line plus the two kept records"
+    );
+    assert_eq!(
+        std::fs::read_dir(journal.directory())
+            .expect("the session directory exists")
+            .map(|entry| {
+                entry
+                    .expect("a readable entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<String>>(),
+        vec!["events.jsonl".to_owned()],
+        "the `<file>.<pid>.<ms>.tmp` staging name is gone after the rename (fixture `directoryAfterRename`)"
+    );
+
+    let after_rewrite = journal.read();
+    let rewritten_at = after_rewrite
+        .header
+        .as_ref()
+        .expect("the rewrite writes a header")
+        .created_at;
+
+    assert!(
+        rewritten_at >= created_at,
+        "a rewrite stamps a FRESH `createdAt` (`:453`), got {rewritten_at} against {created_at}"
+    );
+    assert_eq!(
+        after_rewrite.events,
+        vec![record(0, 1, "one"), record(2, 3, "three")],
+        "the kept records survive verbatim, gap included"
+    );
+    assert_eq!(
+        after_rewrite.problems,
+        vec![JournalProblem {
+            line: 3,
+            kind: JournalProblemKind::Sequence,
+            reason: "turn turn-a expected event index 1, found 2".to_owned(),
+            tail: false,
+        }],
+        "a gap in one turn's index sequence is corruption, worded exactly as TS words it (`:415`)"
+    );
+    assert!(!after_rewrite.truncated_tail, "a gap on the LAST line is still real corruption");
+    assert!(after_rewrite.has_corruption());
+
+    // TRUNCATE IS `rewrite([])` (`:491-493`): header only, and a FRESH stamp, so the header bytes
+    // change even though nothing else did.
+    journal.truncate().expect("truncate succeeds");
+
+    let truncated = std::fs::read_to_string(journal.path()).expect("readable");
+    let truncated_header: Value = serde_json::from_str(
+        truncated.strip_suffix('\n').expect("one complete line"),
+    )
+    .expect("the truncated file holds one JSON header line");
+    let truncated_at = truncated_header["createdAt"]
+        .as_u64()
+        .expect("a numeric createdAt");
+
+    assert_eq!(
+        truncated_header["type"], "header",
+        "a truncate is a reset, not a tail repair"
+    );
+    assert_eq!(
+        truncated,
+        journal::journal_line(&journal::journal_header("session-j", truncated_at)),
+        "`truncate` is exactly `rewrite([])`: a header line and nothing else"
+    );
+    assert!(
+        truncated_at >= rewritten_at,
+        "the reset re-stamps `createdAt` (`:453`), got {truncated_at} against {rewritten_at}"
+    );
+    assert_eq!(
+        journal.read(),
+        JournalReadResult {
+            events: Vec::new(),
+            header: Some(JournalHeaderRecord {
+                session_id: "session-j".to_owned(),
+                created_at: truncated_at,
+            }),
+            problems: Vec::new(),
+            empty: true,
+            missing: false,
+            truncated_tail: false,
+        },
+        "`empty` means a header-only file, which is distinguishable from a stray file exactly because of that header"
+    );
 
     journal.close().expect("close succeeds");
 
-    // REMOVE takes the whole session directory with it.
+    // REMOVE takes the whole session directory, and the read answers the LEGACY-DATABASE shape
+    // (`observations.remove` / `observations.legacy-database`): the caller folds `turns[].events`.
     journal.remove().expect("remove succeeds");
+
     assert!(!journal.directory().exists());
-    assert!(journal.error().is_none());
+    assert!(!journal.exists());
+    assert!(journal.error().is_none(), "a successful removal clears the last error");
+
+    assert_eq!(
+        journal.read(),
+        JournalReadResult {
+            events: Vec::new(),
+            header: None,
+            problems: Vec::new(),
+            empty: true,
+            missing: true,
+            truncated_tail: false,
+        },
+        "`{events: [], problems: [], empty: true, missing: true, truncatedTail: false}`, with NO header key"
+    );
+}
+
+/// The write path, pinned against the bytes the real TypeScript `HarnessJournal` wrote
+/// (`tests/fixtures/journal-write-path/write-path-observations.json`).
+///
+/// Where the unit test above pins the SEMANTICS, this one pins the CAPTURED DOCUMENT: the header line,
+/// both key-order spellings, and the whole rewritten payload of the fixture's gap-preserving
+/// compaction. The fixture's own event payloads are used verbatim, so the check does not go through
+/// this crate's event serializer at all - only through its journal envelope.
+#[test]
+fn journal_write_path_matches_the_typescript_bytes() {
+    let observations: Value =
+        read_fixture("journal-write-path/write-path-observations.json");
+    let seen = &observations["observations"];
+    let records = observations["records"].as_array().expect("three records");
+
+    // The fixture's three records, as THIS crate's records: `turnId`/`index`/`at`/`event` verbatim.
+    let fixture_records = records
+        .iter()
+        .map(|record| JournalEventRecord {
+            turn_id: record["turnId"].as_str().expect("a turnId").to_owned(),
+            index: record["index"].as_u64().expect("an index"),
+            at: record["at"].as_u64().expect("an at"),
+            event: record["event"].clone(),
+        })
+        .collect::<Vec<JournalEventRecord>>();
+
+    // The fixture's header stamp, which is wall clock, so every byte comparison below substitutes it.
+    let open_bytes = seen["open"]["bytes"].as_str().expect("the open bytes");
+    let fixture_header: Value =
+        serde_json::from_str(open_bytes.trim_end_matches('\n')).expect("the header line is JSON");
+    let fixture_created_at = fixture_header["createdAt"]
+        .as_u64()
+        .expect("a numeric createdAt");
+
+    assert_eq!(
+        fixture_header,
+        json!({
+            "type": "header",
+            "v": 1,
+            "sessionId": "write-path",
+            "createdAt": fixture_created_at,
+        }),
+        "the fixture header is `{type,v,sessionId,createdAt}` in that order"
+    );
+
+    let fixture = Fixture::new("journal-write-path");
+    let sessions = persistence::sessions_dir(fixture.root());
+
+    // OPEN (`journal.ts:271-291`): `<root>/harness/sessions/<id>/events.jsonl` and one header line
+    // naming the session, and the directory is created with it.
+    let mut journal = HarnessJournal::open(&sessions, "write-path", None).expect("opens");
+
+    assert!(journal.directory().exists(), "`sessions/<id>/` is created by `open`");
+
+    let opened = std::fs::read_to_string(journal.path()).expect("readable");
+    let opened_header: Value =
+        serde_json::from_str(opened.trim_end_matches('\n')).expect("one header line");
+    let opened_at = opened_header["createdAt"].as_u64().expect("a numeric createdAt");
+
+    assert_eq!(
+        opened,
+        journal::journal_line(&journal::journal_header("write-path", opened_at)),
+        "the only difference from the fixture's open bytes may be the wall-clock stamp"
+    );
+
+    // BOTH KEY ORDERS, built by this crate and compared to the fixture's captured lines.
+    assert_eq!(
+        journal::journal_line(&journal::journal_appended_line(&fixture_records[0])),
+        format!("{}\n", observations["appendOrderLine"].as_str().expect("the append-order line")),
+        "`append`'s envelope is `{type,v,turnId,index,at,event}`"
+    );
+    assert_eq!(
+        journal::journal_line(&journal::journal_compacted_line(&fixture_records[0])),
+        format!(
+            "{}\n",
+            observations["rewriteOrderLine"].as_str().expect("the rewrite-order line")
+        ),
+        "`rewrite`'s envelope is `{turnId,index,at,event,type,v}`"
+    );
+
+    // APPEND (`observations.append.bytes`): the header plus the three canonical lines. This crate's
+    // `append` takes a contract event, so the byte comparison runs on the fixture's own record form,
+    // which is the same envelope `append` writes around a serialized event.
+    let appended: Vec<String> = std::iter::once(opened.trim_end_matches('\n').to_owned())
+        .chain(
+            fixture_records
+                .iter()
+                .map(|record| journal::journal_line(&journal::journal_appended_line(record)).trim_end_matches('\n').to_owned()),
+        )
+        .collect();
+    let fixture_appended: Vec<String> = seen["append"]["lines"]
+        .as_array()
+        .expect("the fixture's captured lines")
+        .iter()
+        .map(|line| {
+            line.as_str()
+                .expect("a captured line")
+                .replace(&fixture_created_at.to_string(), &opened_at.to_string())
+        })
+        .collect();
+
+    assert_eq!(
+        appended,
+        fixture_appended,
+        "every appended line equals `journalLine({type,v,...record})` byte for byte"
+    );
+
+    // REWRITE (`observations.rewrite.bytes`): the kept records (indices 0 and 2 - the fixture keeps
+    // no middle record) in the REWRITE key order under a fresh header, with no renumbering.
+    journal
+        .rewrite(&[fixture_records[0].clone(), fixture_records[2].clone()])
+        .expect("rewrite succeeds");
+
+    let rewritten = std::fs::read_to_string(journal.path()).expect("readable");
+    let rewrite_at = {
+        let header: Value = serde_json::from_str(
+            rewritten
+                .lines()
+                .next()
+                .expect("the rewrite writes a header line"),
+        )
+        .expect("the header is JSON");
+
+        header["createdAt"].as_u64().expect("a numeric createdAt")
+    };
+    let fixture_rewrite_bytes = seen["rewrite"]["bytes"]
+        .as_str()
+        .expect("the rewrite bytes")
+        .replace(&fixture_created_at.to_string(), &rewrite_at.to_string());
+
+    assert_eq!(
+        rewritten, fixture_rewrite_bytes,
+        "a gap-preserving rewrite publishes exactly the fixture's bytes"
+    );
+
+    // TRUNCATE (`observations.truncate.bytes`): a header-only file with a FRESH stamp - the fixture's
+    // own two captures differ by 8 ms, which is the point of pinning the SHAPE rather than the value.
+    journal.truncate().expect("truncate succeeds");
+
+    let truncated = std::fs::read_to_string(journal.path()).expect("readable");
+    let fixture_truncate_bytes = seen["truncate"]["bytes"]
+        .as_str()
+        .expect("the truncate bytes");
+    let truncated_header: Value =
+        serde_json::from_str(truncated.trim_end_matches('\n')).expect("one header line");
+
+    assert_eq!(
+        truncated_header["type"], "header",
+        "a truncate leaves exactly the header record"
+    );
+    assert_eq!(
+        truncated_header
+            .as_object()
+            .expect("a header object")
+            .keys()
+            .cloned()
+            .collect::<Vec<String>>(),
+        serde_json::from_str::<Value>(fixture_truncate_bytes.trim_end_matches('\n'))
+            .expect("the fixture header")
+            .as_object()
+            .expect("a header object")
+            .keys()
+            .cloned()
+            .collect::<Vec<String>>(),
+        "the truncate header carries exactly the fixture's keys, in order"
+    );
+
+    journal.remove().expect("remove succeeds");
+    assert_eq!(
+        journal.read(),
+        JournalReadResult {
+            events: Vec::new(),
+            header: None,
+            problems: Vec::new(),
+            empty: true,
+            missing: true,
+            truncated_tail: false,
+        },
+        "the post-remove read is the fixture's `remove.read`"
+    );
+}
+
+/// The READ model, case by case, against the verdicts the real TypeScript reader recorded
+/// (`tests/fixtures/journal-cases/ts-reader-observations.json`).
+///
+/// Ten mutated files, produced by a real recorder run and mutated structurally (byte truncation, line
+/// splice/removal, re-serialisation through the TS writer itself). For each one this test asserts the
+/// FULL read - every accepted record with its payload, every problem, and the `empty`/`missing`/
+/// `truncatedTail` tri-state - so a Rust server answering the same file cannot disagree with a TS one
+/// in any direction.
+///
+/// The one place the two readers legitimately differ is the WORDING of a JSON parse failure: that
+/// sentence belongs to the engine (V8 vs serde_json), and the fixture's own reader text proves it
+/// (`"Expected ':' after property name in JSON at position 30"`). Those reasons are therefore compared
+/// as the class they are (`not valid JSON: ...`), while every reason TS builds ITSELF - the version
+/// gate, the unknown type, the missing payload, the shape reports, the sequence gaps - is compared
+/// byte for byte.
+#[test]
+fn journal_reader_matches_the_typescript_reader_case_by_case() {
+    let observations: Value = read_fixture("journal-cases/ts-reader-observations.json");
+    let cases = observations["cases"].as_object().expect("the captured cases");
+
+    // The ten cases the fixture's MANIFEST names, in its order.
+    let names: Vec<&str> = vec![
+        "healthy",
+        "truncated-tail",
+        "malformed-middle",
+        "version-mismatch",
+        "sequence-gap",
+        "event-missing-payload",
+        "unknown-type",
+        "shape-header-late",
+        "header-only",
+        "missing",
+    ];
+
+    assert_eq!(
+        cases.keys().map(String::as_str).collect::<Vec<&str>>(),
+        names,
+        "the fixture carries exactly the cases its MANIFEST lists"
+    );
+
+    let fixture = Fixture::new("journal-cases");
+    let sessions = persistence::sessions_dir(fixture.root());
+
+    for name in names {
+        let case = &cases[name];
+        let want = &case["read"];
+        // The case file sits at the path the reader expects, `<sessions>/<case>/events.jsonl`
+        // (journal-cases MANIFEST), so the session id IS the case name here - and the reader takes the
+        // header's `sessionId` from the LINE, never from the directory.
+        let mut journal = HarnessJournal::open(&sessions, name, None)
+            .unwrap_or_else(|error| panic!("case {name} opens: {error}"));
+
+        if want["missing"].as_bool().unwrap_or(false) {
+            // The `missing` case has NO file at all; opening writes a header, so the case is staged by
+            // removing it again, which is also the fixture's own `remove` shape.
+            journal.remove().expect("the case directory is removable");
+        } else {
+            let body = fixture_bytes(&format!("journal-cases/cases/{name}.events.jsonl"));
+
+            std::fs::create_dir_all(journal.directory()).expect("the case directory is creatable");
+            std::fs::write(journal.path(), body).expect("the case file is writable");
+        }
+
+        let got = journal.read();
+
+        // EVERY accepted record, payload included. TS's record carries the two constant envelope keys
+        // this crate models as types rather than fields, so they are dropped from the comparison.
+        let wanted_events = want["events"]
+            .as_array()
+            .expect("the reader's accepted events")
+            .iter()
+            .map(|record| {
+                json!({
+                    "turnId": record["turnId"],
+                    "index": record["index"],
+                    "at": record["at"],
+                    "event": record["event"],
+                })
+            })
+            .collect::<Vec<Value>>();
+
+        assert_eq!(
+            got.events
+                .iter()
+                .map(JournalEventRecord::to_value)
+                .collect::<Vec<Value>>(),
+            wanted_events,
+            "case {name}: the accepted records (and every payload) must match the TypeScript reader"
+        );
+
+        assert_eq!(
+            got.header
+                .as_ref()
+                .map(|header| json!({
+                    "sessionId": header.session_id,
+                    "createdAt": header.created_at,
+                })),
+            want["header"].as_object().map(|header| json!({
+                "sessionId": header["sessionId"],
+                "createdAt": header["createdAt"],
+            })),
+            "case {name}: the header the reader reports (absent means the header was refused)"
+        );
+
+        assert_eq!(
+            got.problems
+                .iter()
+                .map(|problem| json!({
+                    "line": problem.line,
+                    "kind": problem.kind,
+                    // The parse wording is the engine's, so the comparison keys on the class and the
+                    // exact-text assertions below pin every reason TS writes itself.
+                    "reason": if problem.reason.starts_with("not valid JSON:") {
+                        "not valid JSON: <engine wording>".to_owned()
+                    } else {
+                        problem.reason.clone()
+                    },
+                    "tail": problem.tail,
+                }))
+                .collect::<Vec<Value>>(),
+            want["problems"]
+                .as_array()
+                .expect("the reader's problems")
+                .iter()
+                .map(|problem| {
+                    let reason = problem["reason"].as_str().unwrap_or_default();
+
+                    json!({
+                        "line": problem["line"],
+                        "kind": problem["kind"],
+                        "reason": if reason.starts_with("not valid JSON:") {
+                            "not valid JSON: <engine wording>".to_owned()
+                        } else {
+                            reason.to_owned()
+                        },
+                        "tail": problem["tail"],
+                    })
+                })
+                .collect::<Vec<Value>>(),
+            "case {name}: every problem, at its own line, with its own kind and tail flag"
+        );
+
+        assert_eq!(
+            (got.empty, got.missing, got.truncated_tail),
+            (
+                want["empty"].as_bool().expect("empty"),
+                want["missing"].as_bool().expect("missing"),
+                want["truncatedTail"].as_bool().expect("truncatedTail")
+            ),
+            "case {name}: the tri-state the restore path branches on"
+        );
+
+        // The `accepted` digest the fixture extracts (count, first/last row, the index sequence), so a
+        // swapped fixture cannot silently weaken the record comparison above.
+        assert_eq!(
+            got.events.len(),
+            case["accepted"]["count"].as_u64().expect("the accepted count") as usize,
+            "case {name}: the accepted count"
+        );
+        assert_eq!(
+            got.events
+                .iter()
+                .map(|record| record.index)
+                .collect::<Vec<u64>>(),
+            case["accepted"]["indexes"]
+                .as_array()
+                .expect("the accepted index sequence")
+                .iter()
+                .map(|index| index.as_u64().expect("an index"))
+                .collect::<Vec<u64>>(),
+            "case {name}: the accepted index sequence"
+        );
+    }
+
+    // Every reason TypeScript composes ITSELF, pinned as literals so a paraphrase is a failure.
+    let text_of = |name: &str, index: usize| -> String {
+        observations["cases"][name]["read"]["problems"][index]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+
+    let mut journal = HarnessJournal::open(&sessions, "healthy", None).expect("the healthy case opens");
+    assert_eq!(
+        journal.read().problems,
+        Vec::new(),
+        "the recorder's own bytes are clean"
+    );
+
+    journal = HarnessJournal::open(&sessions, "version-mismatch", None).expect("opens");
+    assert_eq!(
+        journal.read().problems[0].reason,
+        text_of("version-mismatch", 0),
+        "the version gate names the version it found (`journal.ts:178`)"
+    );
+
+    journal = HarnessJournal::open(&sessions, "unknown-type", None).expect("opens");
+    assert_eq!(
+        journal.read().problems[0].reason,
+        text_of("unknown-type", 0),
+        "an unknown record type is reported, not repaired (`:224`)"
+    );
+
+    journal = HarnessJournal::open(&sessions, "event-missing-payload", None).expect("opens");
+    assert_eq!(
+        journal.read().problems[0].reason,
+        text_of("event-missing-payload", 0),
+        "an event with no payload is refused (`:207-209`)"
+    );
+
+    journal = HarnessJournal::open(&sessions, "sequence-gap", None).expect("opens");
+    let gap = journal.read();
+    assert_eq!(
+        gap.problems
+            .iter()
+            .map(|problem| (problem.kind, problem.tail))
+            .collect::<Vec<(JournalProblemKind, bool)>>(),
+        vec![(JournalProblemKind::Sequence, false)],
+        "a removed middle line is a sequence problem that is never a tail"
+    );
+    assert_eq!(gap.problems[0].reason, text_of("sequence-gap", 0));
+
+    journal = HarnessJournal::open(&sessions, "shape-header-late", None).expect("opens");
+    let late = journal.read();
+    assert_eq!(
+        late.problems
+            .iter()
+            .map(|problem| problem.reason.as_str())
+            .collect::<Vec<&str>>()
+            .iter()
+            .map(|reason| (*reason).to_owned())
+            .collect::<Vec<String>>(),
+        observations["cases"]["shape-header-late"]["read"]["problems"]
+            .as_array()
+            .expect("the shape problems")
+            .iter()
+            .map(|problem| problem["reason"].as_str().expect("a reason").to_owned())
+            .collect::<Vec<String>>(),
+        "a header off line 1 reports a SHAPE problem on EVERY line, because no header was ever accepted"
+    );
 }
 
 /// 6. The registry: five shipped presets with the symmetric teams, aliases, create/patch/delete,

@@ -418,7 +418,11 @@ impl<'a> SettingsView<'a> {
                 Some(other) => Value::Bool(!other.is_null()), // `Boolean(source)`
                 None => Value::Bool(false),
             },
-            PluginSettingType::Text => match source {
+            // The declared TYPE spelling for a text setting is `String` on the wire
+            // (`contract::PluginSettingType`, mirroring `HarnessPluginSettingType = 'number' |
+            // 'string' | 'boolean'`, types/index.ts:3762) - there is no `Text` variant, and the
+            // trim/length rule below is what `settings.ts:76-83` does for it.
+            PluginSettingType::String => match source {
                 Some(Value::String(text)) => {
                     let mut trimmed = text.trim().to_owned();
                     // `max` is CHARACTER length in JS; a Rust `String` is already a char sequence.

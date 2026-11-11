@@ -1,0 +1,230 @@
+{
+    "note": "Write/repair/teardown behaviour of HarnessJournal, captured from the real TS class. Every quoted event line is byte-equal to journalLine(record) in the key order that operation uses.",
+    "source": "packages/underload/harness/src/server/journal.ts",
+    "root": "/run/media/erosire/Project/Projects/typescript/noobscript/Temp/fixtures/harness/work/journal-write-path",
+    "records": [
+        {
+            "turnId": "turn-a",
+            "index": 0,
+            "at": 1,
+            "event": {
+                "type": "start",
+                "agent": "general"
+            }
+        },
+        {
+            "turnId": "turn-a",
+            "index": 1,
+            "at": 2,
+            "event": {
+                "type": "text",
+                "delta": "first"
+            }
+        },
+        {
+            "turnId": "turn-a",
+            "index": 2,
+            "at": 3,
+            "event": {
+                "type": "done",
+                "stopReason": "stop"
+            }
+        }
+    ],
+    "appendOrderLine": "{\"type\":\"event\",\"v\":1,\"turnId\":\"turn-a\",\"index\":0,\"at\":1,\"event\":{\"type\":\"start\",\"agent\":\"general\"}}",
+    "rewriteOrderLine": "{\"turnId\":\"turn-a\",\"index\":0,\"at\":1,\"event\":{\"type\":\"start\",\"agent\":\"general\"},\"type\":\"event\",\"v\":1}",
+    "observations": {
+        "open": {
+            "file": "work/journal-write-path/sessions/write-path/events.jsonl",
+            "bytes": "{\"type\":\"header\",\"v\":1,\"sessionId\":\"write-path\",\"createdAt\":1794327611390}\n",
+            "directoryCreated": true
+        },
+        "append": {
+            "results": [
+                true,
+                true,
+                true
+            ],
+            "bytes": "{\"type\":\"header\",\"v\":1,\"sessionId\":\"write-path\",\"createdAt\":1794327611390}\n{\"type\":\"event\",\"v\":1,\"turnId\":\"turn-a\",\"index\":0,\"at\":1,\"event\":{\"type\":\"start\",\"agent\":\"general\"}}\n{\"type\":\"event\",\"v\":1,\"turnId\":\"turn-a\",\"index\":1,\"at\":2,\"event\":{\"type\":\"text\",\"delta\":\"first\"}}\n{\"type\":\"event\",\"v\":1,\"turnId\":\"turn-a\",\"index\":2,\"at\":3,\"event\":{\"type\":\"done\",\"stopReason\":\"stop\"}}\n",
+            "lines": [
+                "{\"type\":\"header\",\"v\":1,\"sessionId\":\"write-path\",\"createdAt\":1794327611390}",
+                "{\"type\":\"event\",\"v\":1,\"turnId\":\"turn-a\",\"index\":0,\"at\":1,\"event\":{\"type\":\"start\",\"agent\":\"general\"}}",
+                "{\"type\":\"event\",\"v\":1,\"turnId\":\"turn-a\",\"index\":1,\"at\":2,\"event\":{\"type\":\"text\",\"delta\":\"first\"}}",
+                "{\"type\":\"event\",\"v\":1,\"turnId\":\"turn-a\",\"index\":2,\"at\":3,\"event\":{\"type\":\"done\",\"stopReason\":\"stop\"}}"
+            ],
+            "everyEventLineEqualsAppendOrderJournalLine": true,
+            "appendOrderLine": "{\"type\":\"event\",\"v\":1,\"turnId\":\"turn-a\",\"index\":0,\"at\":1,\"event\":{\"type\":\"start\",\"agent\":\"general\"}}",
+            "rewriteOrderLine": "{\"turnId\":\"turn-a\",\"index\":0,\"at\":1,\"event\":{\"type\":\"start\",\"agent\":\"general\"},\"type\":\"event\",\"v\":1}"
+        },
+        "crash-shape": {
+            "bytes": "{\"type\":\"header\",\"v\":1,\"sessionId\":\"write-path\",\"createdAt\":1794327611390}\n{\"type\":\"event\",\"v\":1,\"turnId\":\"turn-a\",\"index\":0,\"at\":1,\"event\":{\"type\":\"start\",\"agent\":\"general\"}}\n{\"type\":\"event\",\"v\":1,\"turnId\":\"turn-a\",\"index\":1,\"at\":2,\"event\":{\"type\":\"text\",\"delta\":\"first\"}}\n{\"type\":\"event\",\"v\":1,\"turnId\"",
+            "read": {
+                "events": [
+                    {
+                        "type": "event",
+                        "v": 1,
+                        "turnId": "turn-a",
+                        "index": 0,
+                        "at": 1,
+                        "event": {
+                            "type": "start",
+                            "agent": "general"
+                        }
+                    },
+                    {
+                        "type": "event",
+                        "v": 1,
+                        "turnId": "turn-a",
+                        "index": 1,
+                        "at": 2,
+                        "event": {
+                            "type": "text",
+                            "delta": "first"
+                        }
+                    }
+                ],
+                "header": {
+                    "type": "header",
+                    "v": 1,
+                    "sessionId": "write-path",
+                    "createdAt": 1794327611390
+                },
+                "problems": [
+                    {
+                        "line": 4,
+                        "kind": "malformed",
+                        "reason": "not valid JSON: Expected ':' after property name in JSON at position 30 (line 1 column 31) (truncated tail)",
+                        "tail": true
+                    }
+                ],
+                "empty": false,
+                "missing": false,
+                "truncatedTail": true
+            }
+        },
+        "truncate": {
+            "bytes": "{\"type\":\"header\",\"v\":1,\"sessionId\":\"write-path\",\"createdAt\":1794327611398}\n",
+            "originalCreatedAt": 1794327611390,
+            "read": {
+                "events": [],
+                "header": {
+                    "type": "header",
+                    "v": 1,
+                    "sessionId": "write-path",
+                    "createdAt": 1794327611398
+                },
+                "problems": [],
+                "empty": true,
+                "missing": false,
+                "truncatedTail": false
+            }
+        },
+        "rewrite": {
+            "keptRecords": [
+                {
+                    "turnId": "turn-a",
+                    "index": 0,
+                    "at": 1,
+                    "event": {
+                        "type": "start",
+                        "agent": "general"
+                    }
+                },
+                {
+                    "turnId": "turn-a",
+                    "index": 2,
+                    "at": 3,
+                    "event": {
+                        "type": "done",
+                        "stopReason": "stop"
+                    }
+                }
+            ],
+            "bytes": "{\"type\":\"header\",\"v\":1,\"sessionId\":\"write-path\",\"createdAt\":1794327611400}\n{\"turnId\":\"turn-a\",\"index\":0,\"at\":1,\"event\":{\"type\":\"start\",\"agent\":\"general\"},\"type\":\"event\",\"v\":1}\n{\"turnId\":\"turn-a\",\"index\":2,\"at\":3,\"event\":{\"type\":\"done\",\"stopReason\":\"stop\"},\"type\":\"event\",\"v\":1}\n",
+            "read": {
+                "events": [
+                    {
+                        "type": "event",
+                        "v": 1,
+                        "turnId": "turn-a",
+                        "index": 0,
+                        "at": 1,
+                        "event": {
+                            "type": "start",
+                            "agent": "general"
+                        }
+                    },
+                    {
+                        "type": "event",
+                        "v": 1,
+                        "turnId": "turn-a",
+                        "index": 2,
+                        "at": 3,
+                        "event": {
+                            "type": "done",
+                            "stopReason": "stop"
+                        }
+                    }
+                ],
+                "header": {
+                    "type": "header",
+                    "v": 1,
+                    "sessionId": "write-path",
+                    "createdAt": 1794327611400
+                },
+                "problems": [
+                    {
+                        "line": 3,
+                        "kind": "sequence",
+                        "reason": "turn turn-a expected event index 1, found 2",
+                        "tail": false
+                    }
+                ],
+                "empty": false,
+                "missing": false,
+                "truncatedTail": false
+            },
+            "directoryAfterRename": [
+                "events.jsonl"
+            ]
+        },
+        "remove": {
+            "exists": false,
+            "sessionDirectoryExists": false,
+            "read": {
+                "events": [],
+                "problems": [],
+                "empty": true,
+                "missing": true,
+                "truncatedTail": false
+            }
+        },
+        "junk-file": {
+            "bytes": "not json at all\n",
+            "read": {
+                "events": [],
+                "problems": [
+                    {
+                        "line": 1,
+                        "kind": "malformed",
+                        "reason": "not valid JSON: Unexpected token 'o', \"not json at all\" is not valid JSON",
+                        "tail": false
+                    }
+                ],
+                "empty": true,
+                "missing": false,
+                "truncatedTail": false
+            }
+        },
+        "legacy-database": {
+            "note": "No journal file at all: restore folds `turns[].events` out of the checkpoint instead (journal.ts:334).",
+            "read": {
+                "events": [],
+                "problems": [],
+                "empty": true,
+                "missing": true,
+                "truncatedTail": false
+            }
+        }
+    }
+}

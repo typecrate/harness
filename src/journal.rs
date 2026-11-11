@@ -153,6 +153,23 @@ pub fn journal_event_line(turn_id: &str, index: u64, at: u64, event: &HarnessEve
     })
 }
 
+/// The APPENDED line for one already-built record: the same envelope
+/// [`journal_event_line`] produces around a contract event, reached from the record form TS's own
+/// `append(record)` takes (`journal.ts:295`). It exists so a caller (and the fixture test) can pin
+/// the append key order from a record whose `event` payload is verbatim - which is exactly how the
+/// TypeScript byte capture in `tests/fixtures/journal-write-path/` is expressed.
+#[must_use]
+pub fn journal_appended_line(record: &JournalEventRecord) -> Value {
+    json!({
+        "type": "event",
+        "v": HARNESS_JOURNAL_VERSION,
+        "turnId": record.turn_id,
+        "index": record.index,
+        "at": record.at,
+        "event": record.event,
+    })
+}
+
 /// One REWRITTEN event line (`journalLine({ ...record, type: 'event', v })` at `:455`): the
 /// recorded position and payload first, `type`/`v` LAST. This is not a stylistic choice - it is
 /// what `JSON.stringify` produces from the spread order, and a compaction therefore re-emits every
