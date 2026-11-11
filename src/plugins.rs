@@ -903,7 +903,7 @@ impl PluginSettingsStore {
         // fallback side of the chain (`?? true`) is the documented answer for it.
         effective_descriptor_of(plugin, PLUGIN_ENABLED_KEY)
             .filter(|descriptor| descriptor.kind == PluginSettingType::Boolean)
-            .map_or(true, |descriptor| match descriptor.default {
+            .is_none_or(|descriptor| match descriptor.default {
                 DeclaredDefault::Flag(flag) => flag,
                 // Declared `boolean`, defaulted to something else: the framework's own fallback.
                 _ => true,
@@ -1402,8 +1402,19 @@ mod tests {
             400
         );
         assert_eq!(
+            // `values` resolves EVERY DECLARED key through the plugin's own view
+            // (`plugins.ts valuesOf`), so an untouched context-compaction answers all six
+            // descriptors with their declared defaults - and the rejected `contextLimit: 5000`
+            // is not among them.
             store.values("context-compaction"),
-            object(json!({ "contextLimit": 200_000 })),
+            object(json!({
+                "contextLimit": 200_000,
+                "modelLimits": "{}",
+                "enabled": true,
+                "minTokens": 200,
+                "safetyTurns": 6,
+                "mode": "summarize"
+            })),
             "the valid half did not land"
         );
         assert_eq!(store.revision(), 0, "and a refusal is not a write");
@@ -1491,8 +1502,17 @@ mod tests {
             object(json!({ "intervalMs": 9_000 }))
         );
         assert_eq!(
+            // Every declared key resolves again - `contextLimit` through its declared default,
+            // because the restored `1` is below the descriptor's own `min` and is dropped.
             store.values("context-compaction"),
-            object(json!({ "contextLimit": 200_000 })),
+            object(json!({
+                "contextLimit": 200_000,
+                "modelLimits": "{}",
+                "enabled": true,
+                "minTokens": 200,
+                "safetyTurns": 6,
+                "mode": "summarize"
+            })),
             "1 is below the plugin's own `min`, so the override is not restored"
         );
         assert_eq!(
@@ -1593,9 +1613,9 @@ mod tests {
         }
     }
 
-    /// 11. The reserved `enabled` key switches EVERY plugin - including the one that never declares it
-    ///     - through the same write path, the same durable document and the same reset as a declared
-    ///     key, and never leaks into the row's `settings[]` or `values`.
+    /// 11. The reserved `enabled` key switches EVERY plugin - including the one that never declares
+    ///     it - through the same write path, the same durable document and the same reset as a
+    ///     declared key, and never leaks into the row's `settings[]` or `values`.
     #[test]
     fn the_reserved_enabled_key_switches_a_plugin_that_never_declared_it() {
         let mut store = PluginSettingsStore::new();
@@ -1678,9 +1698,14 @@ mod tests {
             .expect("a reset is accepted");
 
         assert!(store.enabled("async-ping"));
-        assert!(
-            store.snapshot().is_empty(),
-            "the only override was `enabled`"
+        assert_eq!(
+            // async-ping's ONLY override was `enabled`, so the reset leaves that plugin with no
+            // entry in the document at all (`plugins.ts update`: a plugin whose map is empty is
+            // deleted, not written as `{}`) - and the one surviving entry is the other plugin's
+            // write from above, in catalogue order.
+            store.snapshot(),
+            object(json!({ "context-trimmer": { "enabled": false } })),
+            "the only async-ping override was `enabled`"
         );
 
         // An unknown plugin still answers the TOTAL `true` (the 404 is the route's decision), and an

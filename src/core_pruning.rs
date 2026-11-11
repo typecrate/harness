@@ -73,13 +73,12 @@ const FINGERPRINT_SEPARATOR: char = '\0';
 /// unparseable text is a fact to preserve, not an error.
 #[must_use]
 pub fn argument_fingerprint(raw: &str) -> String {
-    if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
-        // Only an object has a key order to canonicalize; `null` and arrays are `object` to
-        // `typeof` but have no order, and the TS wire guard excludes them the same way
-        // (`transport/openai.ts:275-279`).
-        if let Value::Object(fields) = parsed {
-            return canonical_object(&fields);
-        }
+    // Only an object has a key order to canonicalize; `null` and arrays are `object` to
+    // `typeof` but have no order, and the TS wire guard excludes them the same way
+    // (`transport/openai.ts:275-279`). A parse failure is the `catch` branch of the TS `try`,
+    // so both fall through to the raw-text answer below.
+    if let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(raw) {
+        return canonical_object(&fields);
     }
 
     // Whitespace is the only thing the fallback normalizes - trimming cannot change meaning,
@@ -327,11 +326,12 @@ fn message_chars(message: &HarnessMessage) -> usize {
 #[must_use]
 pub fn estimate_context_tokens(messages: &[HarnessMessage], instructions: &[String]) -> f64 {
     // `div_ceil` on integers is `Math.ceil(chars / 4)` exactly: no float division, so a huge
-    // transcript cannot land on a value the integer path would round differently.
-    f64::from(
-        u64::try_from(transcript_chars(messages, instructions).div_ceil(CHARS_PER_TOKEN))
-            .unwrap_or(u64::MAX) as f64,
-    )
+    // transcript cannot land on a value the integer path would round differently. The `u64`
+    // hop is only the saturating cast (`as f64` rounds a value above `u64::MAX`, and the
+    // estimator's own ceiling is `u64::MAX` tokens), and the result is the float the TS
+    // `Math.ceil` division returns.
+    u64::try_from(transcript_chars(messages, instructions).div_ceil(CHARS_PER_TOKEN)).unwrap_or(u64::MAX)
+        as f64
 }
 
 // ---------------------------------------------------------------------------
@@ -537,9 +537,11 @@ pub fn group_units(entries: &[ContextEntry]) -> Vec<ContextUnit> {
         let call_ids = call_ids_of(&entry.message);
 
         if !call_ids.is_empty() {
-            // An assistant block is its own leader, even when nothing answers it yet.
-            if !members.contains_key(&entry.index) {
-                members.insert(entry.index, Vec::new());
+            // An assistant block is its own leader, even when nothing answers it yet. The
+            // VACANT test is the "first time we see this index" test, so the leader list stays
+            // in the entries' own order.
+            if let std::collections::hash_map::Entry::Vacant(slot) = members.entry(entry.index) {
+                slot.insert(Vec::new());
                 leaders.push(entry.index);
             }
 
@@ -775,7 +777,10 @@ pub fn plan_context_pruning(entries: &[ContextEntry], options: &PruneOptions) ->
     // last unit rather than in front of all of them).
     let safety = bounded(options.safety_units);
     let considered_units = units.len();
-    let first_protected = considered_units.saturating_sub(safety as usize).max(0);
+    // A `usize` `saturating_sub` IS the TS `Math.max(0, units.length - safety)`: the difference
+    // can never go below zero here, and a `safety` larger than the unit count saturates to 0
+    // ("protect everything"), exactly like the clamp.
+    let first_protected = considered_units.saturating_sub(safety as usize);
 
     let messages: Vec<HarnessMessage> = entries.iter().map(|entry| entry.message.clone()).collect();
 
