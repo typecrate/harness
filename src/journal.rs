@@ -1,6 +1,7 @@
 //! The durable per-session event journal (`<root>/harness/sessions/<sessionId>/events.jsonl`).
 //!
-//! TypeScript origin: `packages/underload/harness/src/server/journal.ts`.
+//! TypeScript origin: `packages/underload/harness/src/server/journal.ts` (545 lines), ported byte for
+//! byte including the line format, the reader's tolerance rules, and the problem texts.
 //!
 //! WHY A JOURNAL BESIDE THE CHECKPOINT (`journal.ts:3-13`)
 //! ------------------------------------------------------
@@ -8,48 +9,82 @@
 //! event is O(every session's every event), so the journal is the other half of durability: an
 //! append-only, one-line-per-event log that is O(1) per event and survives a crash.
 //!
-//! READ MODEL (`journal.ts:15-22`, restated for this envelope)
-//! ----------------------------------------------------------
-//!   * a TRUNCATED LAST LINE is a crash artifact: it was never a proven-complete append, so a
-//!     snapshot fold drops it silently, while an explicit read reports it as a problem - a reader
-//!     must never treat a repaired-by-skipping stream as healthy;
-//!   * corruption ANYWHERE ELSE is EXPLICIT: a malformed middle line, a blank line, an unknown
-//!     version, a sequence gap, or an event recorded before the header produces a problem string
-//!     that is never a tail note.
-//!
-//! LINE FORMAT
-//! -----------
-//! The header line is TS's, verbatim (`journalLine({ type: 'header', ... })`, `:280`):
+//! LINE FORMAT - THE ONE THING THIS FILE MUST GET EXACTLY RIGHT (`journal.ts:85-110`, `:296-300`,
+//! `:439-455`)
+//! -----------------------------------------------------------------------------------------------
+//! The header line:
 //!
 //! ```text
 //! {"type":"header","v":1,"sessionId":"<id>","createdAt":<ms>}
 //! ```
 //!
-//! One event line is the stage brief's envelope - a per-file monotonic sequence rather than TS's
-//! per-turn `(turnId, index)` pair, which is what `read(from_sequence, limit)` replays from:
+//! One APPENDED event line (`append` builds `{ type, v, ...record }`, so `type`/`v` come FIRST):
 //!
 //! ```text
-//! {"version":1,"sequence":<n>,"timestamp":<ms>,"event":{...}}
+//! {"type":"event","v":1,"turnId":"<id>","index":<n>,"at":<ms>,"event":{...}}
 //! ```
+//!
+//! One REWRITTEN event line (`rewrite` builds `{ ...record, type:'event', v:1 }`, so `type`/`v`
+//! come LAST - the spread order is the key order, and `JSON.stringify` follows insertion order):
+//!
+//! ```text
+//! {"turnId":"<id>","index":<n>,"at":<ms>,"event":{...},"type":"event","v":1}
+//! ```
+//!
+//! Both spellings are reproduced here verbatim, because a recorded byte-for-byte fixture (see
+//! `tests/data_plane.rs`) compares these lines as STRINGS: `index.ts`/`serde_json` keep insertion
+//! order (the `preserve_order` feature is on), so `json!`'s key order IS the file's key order. The
+//! two writers differ only in where `type`/`v` sit - a client that diffs a TS-written journal
+//! against a Rust-written one must see nothing.
+//!
+//! THE POSITION IS THE TURN'S, NOT THE FILE'S (`journal.ts:99-106`, `sessions.ts:7930-7961`)
+//! -----------------------------------------------------------------------------------------
+//! `turnId` + `index` are the turn's append-only position - the SAME address a display step id
+//! carries (`DisplayStepDetailRef.stepId`). The recorder computes `index = turn.events.len()` before
+//! the push and passes the ONE `at` it shares with the record and the published frame. There is no
+//! per-file sequence anywhere in this format, which is why the old per-file counter and its
+//! `expected event sequence N` report are gone: they were a second, conflicting notion of position.
+//!
+//! READ MODEL (`journal.ts:15-22`, `:357-433`)
+//! ------------------------------------------
+//!   * a TRUNCATED LAST LINE is a crash artifact: it was never a proven-complete append, so a
+//!     snapshot fold drops it silently, while an explicit read reports it as a problem with
+//!     `tail: true` and the reason suffixed ` (truncated tail)`;
+//!   * corruption ANYWHERE ELSE is EXPLICIT and is never a tail: a blank line, an unparseable line,
+//!     an unknown version, a header that is not line 1, an event before any header, or a gap in one
+//!     turn's index sequence;
+//!   * the newline test decides `truncatedTail` BEFORE the loop, so a shape or sequence problem on
+//!     the last line stays a real corruption report.
 //!
 //! DURABILITY LEVELS (`journal.ts:33-45`)
 //! -------------------------------------
 //!   * `append` writes to a held-open fd: safe across a PROCESS crash, not fenced against a power
 //!     loss. `durable: true` adds the fsync fence the caller asked for;
 //!   * `flush` is that fence on its own;
-//!   * `rewrite` fsyncs BEFORE the rename, so a compaction publishes complete bytes.
+//!   * `rewrite` is fsync-then-rename, so a compaction publishes complete bytes.
 //!
 //! ONE WRITER (`journal.ts:54-66`)
 //! ------------------------------
 //! One instance per live session, holding the append handle. A second writer of the same file is
 //! exactly what the store's serialized commit exists to prevent, so this type is `&mut`-self
-//! throughout rather than internally-synchronized.
+//! throughout rather than internally-synchronized. `rewrite`'s staging name is
+//! `<file>.<pid>.<ms>.tmp` (`:445`), which is also why the one-writer rule matters: a second writer
+//! in the same process would produce two staging names in the same millisecond.
+//!
+//! WHY THE OLD RUST ENVELOPE IS NOT ACCEPTED ON READ
+//! ------------------------------------------------
+//! `{version, sequence, timestamp, event}` (what this file wrote before this uplift) has no `v`, so
+//! TS's reader rejects every line of it as `unsupported journal version undefined`. Accepting it
+//! here anyway would be a divergence in the one direction that matters - a Rust journal a TS server
+//! cannot read. A legacy file is therefore reported exactly the way TS reports it, and the new
+//! writer only ever emits TS bytes.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::contract::HarnessEvent;
@@ -63,6 +98,10 @@ pub const HARNESS_JOURNAL_VERSION: u32 = 1;
 /// The journal file inside one session's directory (`journal.ts:83`).
 pub const HARNESS_JOURNAL_FILE: &str = "events.jsonl";
 
+/// The directory the per-session journals live in (`journal.ts:82`), i.e. the checkpoint's
+/// `sessions` sibling so an operator sees both in one place.
+pub const HARNESS_JOURNAL_DIRECTORY: &str = "sessions";
+
 /// How many times a Windows sharing violation is retried before a removal is reported. Node's
 /// writer never needs this: POSIX unlinks an open file, Windows refuses while a handle exists.
 const REMOVE_ATTEMPTS: usize = 6;
@@ -71,7 +110,7 @@ const REMOVE_ATTEMPTS: usize = 6;
 const REMOVE_BACKOFF_MS: [u64; REMOVE_ATTEMPTS] = [0, 5, 10, 25, 50, 100];
 
 /// A journal failure naming the file, matching `HarnessPersistenceError`'s convention so an
-/// operator finds the file without guessing (`journal.ts:137-147`).
+/// operator finds the file without guessing (`journal.ts:137-147` `HarnessJournalError`).
 fn journal_error(file: &Path, message: &str) -> ApiError {
     ApiError::internal(format!("{}: {message}", file.display()))
 }
@@ -86,8 +125,9 @@ pub fn journal_line(record: &Value) -> String {
     format!("{serialized}\n")
 }
 
-/// The header record every journal starts with, so a reader can tell "an empty journal for a
-/// real session" from "a stray file" and gate a future format change on a version (`:86-94`).
+/// The header record every journal starts with, so a reader can tell "an empty journal for a real
+/// session" from "a stray file" and gate a future format change on a version (`journal.ts:86-92`
+/// `JournalHeaderRecord`).
 #[must_use]
 pub fn journal_header(session_id: &str, created_at: u64) -> Value {
     json!({
@@ -98,20 +138,160 @@ pub fn journal_header(session_id: &str, created_at: u64) -> Value {
     })
 }
 
-/// One event record, in the envelope this port writes (`:99-106` restated for a sequence-based
-/// log): `{ version, sequence, timestamp, event }`.
+/// One APPENDED event line (`journal.ts:96-103` `JournalEventRecord`, emitted by
+/// `journalLine({ type: 'event', v, ...record })` at `:298`): `type` and `v` first, then the
+/// recorded position, then the payload.
 #[must_use]
-pub fn journal_event(sequence: u64, timestamp: u64, event: &HarnessEvent) -> Value {
+pub fn journal_event_line(turn_id: &str, index: u64, at: u64, event: &HarnessEvent) -> Value {
     json!({
-        "version": HARNESS_JOURNAL_VERSION,
-        "sequence": sequence,
-        "timestamp": timestamp,
-        "event": serde_json::to_value(event).unwrap_or(Value::Null),
+        "type": "event",
+        "v": HARNESS_JOURNAL_VERSION,
+        "turnId": turn_id,
+        "index": index,
+        "at": at,
+        "event": event_payload(event),
     })
 }
 
-/// Owns one session's journal file: its directory, its append handle, and the sequence the next
-/// append will use.
+/// One REWRITTEN event line (`journalLine({ ...record, type: 'event', v })` at `:455`): the
+/// recorded position and payload first, `type`/`v` LAST. This is not a stylistic choice - it is
+/// what `JSON.stringify` produces from the spread order, and a compaction therefore re-emits every
+/// retained record with a different key order than the append that first wrote it.
+#[must_use]
+pub fn journal_compacted_line(record: &JournalEventRecord) -> Value {
+    json!({
+        "turnId": record.turn_id,
+        "index": record.index,
+        "at": record.at,
+        "event": record.event,
+        "type": "event",
+        "v": HARNESS_JOURNAL_VERSION,
+    })
+}
+
+/// The wire form of one event: the same object the REST stream publishes, so a journal line and a
+/// `event` frame carry identical bytes.
+fn event_payload(event: &HarnessEvent) -> Value {
+    serde_json::to_value(event).unwrap_or(Value::Null)
+}
+
+/// One recorded event, in the shape the reader hands the caller (`journal.ts:96-103`).
+///
+/// `event` stays an untyped [`Value`]: TS's reader validates only that `event` is an object with a
+/// string `type` (`:207-210`), so an event this build cannot deserialize is still a readable record
+/// (a forward-compatible log), and refusing it here would be a divergence.
+/// [`JournalEventRecord::event_typed`] is the seam that asks for the typed form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalEventRecord {
+    /// The turn this event belongs to (`turnId`).
+    pub turn_id: String,
+    /// The turn's append-only position (`index`), i.e. the display step id.
+    pub index: u64,
+    /// The single timestamp the record, the journal line, and the published frame share (`at`).
+    pub at: u64,
+    /// The event payload, verbatim.
+    pub event: Value,
+}
+
+impl JournalEventRecord {
+    /// The event as the contract type it should be (`event as HarnessEvent`, `:213`).
+    ///
+    /// # Errors
+    ///
+    /// The serde message when this build cannot deserialize the payload.
+    pub fn event_typed(&self) -> Result<HarnessEvent, String> {
+        serde_json::from_value(self.event.clone()).map_err(|error| error.to_string())
+    }
+
+    /// The value form of the record's position - what a test asserts against.
+    #[must_use]
+    pub fn to_value(&self) -> Value {
+        json!({
+            "turnId": self.turn_id,
+            "index": self.index,
+            "at": self.at,
+            "event": self.event,
+        })
+    }
+}
+
+/// One parsed header line (`journal.ts:86-92`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalHeaderRecord {
+    /// The session the journal belongs to; the reader never cross-checks it against the directory
+    /// name (`:184-186` only requires a non-empty string).
+    pub session_id: String,
+    /// When this journal was created (`createdAt`).
+    pub created_at: u64,
+}
+
+/// What kind of structural problem a line produced (`journal.ts:112` `JournalProblemKind`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JournalProblemKind {
+    /// The line is not JSON, is not an object, or is an empty line (`kind: 'malformed'`).
+    Malformed,
+    /// The line's `v` is not this server's version (`kind: 'version'`).
+    Version,
+    /// One turn's index sequence has a hole (`kind: 'sequence'`).
+    Sequence,
+    /// A structurally valid line in an impossible position (`kind: 'shape'`).
+    Shape,
+}
+
+/// One structural problem found while reading (`journal.ts:114-121` `JournalProblem`).
+///
+/// `tail: true` marks the crash-truncated last line (tolerated); every other problem is a real
+/// corruption report.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct JournalProblem {
+    /// 1-based line number; `0` means "the file itself could not be read".
+    pub line: u64,
+    /// The class of problem.
+    pub kind: JournalProblemKind,
+    /// The human report, byte-identical to TS's text.
+    pub reason: String,
+    /// Whether this is the tolerated crash tail.
+    pub tail: bool,
+}
+
+/// The whole read (`journal.ts:123-137` `JournalReadResult`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JournalReadResult {
+    /// Event records in file order; gaps and problems are preserved for the caller to merge.
+    pub events: Vec<JournalEventRecord>,
+    /// The header line, when the file has one (`header?`).
+    pub header: Option<JournalHeaderRecord>,
+    /// Every structural problem, in line order.
+    pub problems: Vec<JournalProblem>,
+    /// True when the file exists but holds nothing but the header (`empty`).
+    pub empty: bool,
+    /// True when there is no journal at all - a database written before the journal existed, whose
+    /// events the caller folds out of `turns[].events` instead (`missing`).
+    pub missing: bool,
+    /// True when the file's LAST line is incomplete (no terminating newline): a crash mid-append.
+    /// That one record is dropped and everything before it stands (`truncatedTail`).
+    pub truncated_tail: bool,
+}
+
+impl JournalReadResult {
+    /// The events of one turn, in recorded order.
+    #[must_use]
+    pub fn events_of(&self, turn_id: &str) -> Vec<&JournalEventRecord> {
+        self.events
+            .iter()
+            .filter(|record| record.turn_id == turn_id)
+            .collect()
+    }
+
+    /// Whether any problem is real corruption rather than the tolerated crash tail.
+    #[must_use]
+    pub fn has_corruption(&self) -> bool {
+        self.problems.iter().any(|problem| !problem.tail)
+    }
+}
+
+/// Owns one session's journal file: its directory, its append handle, and its last error.
 #[derive(Debug)]
 pub struct HarnessJournal {
     /// `<sessions_dir>/<sessionId>` - the whole directory belongs to this journal (`:245`).
@@ -120,15 +300,13 @@ pub struct HarnessJournal {
     file: PathBuf,
     /// The session this journal belongs to, kept because the header line names it.
     session_id: String,
-    /// The held-open append handle. `append` on a fresh fd per event is one syscall pair per
-    /// DELTA; a persistent fd plus `flush` at the boundaries that matter is the durability story
-    /// the checkpoint already tells (`:233-238`).
+    /// The held-open append handle. `append` on a fresh fd per event is one syscall pair per DELTA;
+    /// a persistent fd plus `flush` at the boundaries that matter is the durability story the
+    /// checkpoint already tells (`:233-238`).
     handle: Option<File>,
-    /// The sequence the next appended event will get (1-based, monotonic).
-    next_sequence: u64,
     /// Bytes currently on disk, maintained so `size()` needs no stat.
     size: u64,
-    /// Whether the directory and the header line exist.
+    /// Whether the directory and the header line exist (`opened`).
     opened: bool,
     /// Last journal failure (open/append/flush/rewrite/remove), cleared by the next success
     /// (`:250-254`).
@@ -139,16 +317,18 @@ pub struct HarnessJournal {
 }
 
 impl HarnessJournal {
-    /// Creates the session directory, writes the header once, and recovers the sequence from an
-    /// existing file.
+    /// Creates the session directory and writes the header once (`journal.ts:270-289` `open`).
     ///
-    /// `events_file_name` overrides the file name for a caller that needs a second log in the
-    /// same directory; `None` is the shipped `events.jsonl`.
+    /// `events_file_name` overrides the file name for a caller that needs a second log in the same
+    /// directory; `None` is the shipped `events.jsonl`.
+    ///
+    /// Nothing is scanned: the format carries no per-file counter, so opening is O(1) regardless of
+    /// how large the log already is.
     ///
     /// # Errors
     ///
-    /// [`ApiError::internal`] naming the file when the directory cannot be created, the header
-    /// cannot be written, or the existing log cannot be read.
+    /// [`ApiError::internal`] naming the file when the directory cannot be created or the header
+    /// cannot be written.
     pub fn open(
         sessions_dir: &Path,
         session_id: &str,
@@ -162,14 +342,13 @@ impl HarnessJournal {
             file,
             session_id: session_id.to_string(),
             handle: None,
-            next_sequence: 1,
             size: 0,
             opened: false,
             last_error: None,
             append_failures: 0,
         };
 
-        journal.create_and_scan()?;
+        journal.create()?;
 
         Ok(journal)
     }
@@ -190,12 +369,6 @@ impl HarnessJournal {
     #[must_use]
     pub fn session_id(&self) -> &str {
         &self.session_id
-    }
-
-    /// The sequence the next append will use - i.e. one past the highest durable record.
-    #[must_use]
-    pub fn next_sequence(&self) -> u64 {
-        self.next_sequence
     }
 
     /// Bytes on disk right now.
@@ -222,31 +395,38 @@ impl HarnessJournal {
         self.file.exists()
     }
 
-    /// Appends one event and returns the sequence it was written with.
+    /// Appends one event line at the position the recorder supplies (`journal.ts:292-311` `append`).
     ///
-    /// `durable: true` fsyncs the tail before returning, which is the fence a caller takes when
-    /// it wants "every event of this turn is on stable storage before the response"
-    /// (`journal.ts:38-41`). A plain append is process-crash-safe only.
+    /// `turn_id`/`index` are the turn's append-only position and `at` is the ONE timestamp the
+    /// record, this line, and the published frame share - all three come from the caller
+    /// (`sessions.ts:7930-7961`), which is what keeps a live view and a reload in agreement.
+    /// `durable: true` fsyncs the tail before returning, the fence for "every event of this turn is
+    /// on stable storage before the response" (`:38-41`).
     ///
-    /// A failure does NOT abort the caller's run (`journal.ts:24-29`: a full disk must not change
-    /// a run's outcome) - it is returned so the caller can record it, and is retained in
+    /// A failure does NOT abort the caller's run (`journal.ts:24-29`: a full disk must not change a
+    /// run's outcome) - it is returned so the caller can record it, and is retained in
     /// [`HarnessJournal::error`] either way.
     ///
     /// # Errors
     ///
     /// [`ApiError::internal`] naming the file when the write or the fence fails.
-    pub fn append(&mut self, event: &HarnessEvent, durable: bool) -> Result<u64, ApiError> {
+    pub fn append(
+        &mut self,
+        turn_id: &str,
+        index: u64,
+        at: u64,
+        event: &HarnessEvent,
+        durable: bool,
+    ) -> Result<(), ApiError> {
         self.ensure_open()?;
 
-        let sequence = self.next_sequence;
-        let line = journal_line(&journal_event(sequence, events::now_millis(), event));
+        let line = journal_line(&journal_event_line(turn_id, index, at, event));
 
         match self.write_bytes(line.as_bytes()) {
             Ok(()) => {
-                // The append itself succeeded, so the sequence and the byte count advance whether
-                // or not the fence does: the bytes are in the file, and a counter that disagreed
-                // with the file would mint a duplicate sequence on the next retry.
-                self.next_sequence = sequence + 1;
+                // The append itself succeeded, so the byte count advances whether or not the fence
+                // does: the bytes are in the file, and a size that disagreed with the file would
+                // misreport the log's growth.
                 self.size += u64::try_from(line.len()).unwrap_or(line.len() as u64);
 
                 let fenced = if durable { self.fsync() } else { Ok(()) };
@@ -254,7 +434,7 @@ impl HarnessJournal {
                 match fenced {
                     Ok(()) => {
                         self.last_error = None;
-                        Ok(sequence)
+                        Ok(())
                     }
                     Err(error) => {
                         self.note_failure(&error);
@@ -266,8 +446,8 @@ impl HarnessJournal {
             }
             Err(error) => {
                 self.note_failure(&error);
-                // Drop the handle so the next append reopens: a directory removed under us must
-                // not wedge every later write (`:308-311`).
+                // Drop the handle so the next append reopens: a directory removed under us must not
+                // wedge every later write (`:308-311`).
                 self.close_handle();
 
                 Err(journal_error(&self.file, &error))
@@ -300,78 +480,42 @@ impl HarnessJournal {
         }
     }
 
-    /// Reads the durable events, newest records last.
+    /// Reads the whole journal (`journal.ts:328-434` `read`).
     ///
-    /// `from_sequence` is INCLUSIVE; `None` reads from the beginning. `limit` caps the number of
-    /// records; `None` reads all of them. Each returned value is the whole line record
-    /// (`{ version, sequence, timestamp, event }`), because a reader needs the sequence to
-    /// continue the cursor and the timestamp to stamp the frame it rebuilds.
-    ///
-    /// This is the SNAPSHOT fold: a truncated tail is dropped silently (see the module header).
-    /// Use [`HarnessJournal::read_all_with_problems`] for the explicit read that reports it.
-    ///
-    /// # Errors
-    ///
-    /// [`ApiError::internal`] naming the file when the file exists but cannot be read.
-    pub fn read(
-        &mut self,
-        from_sequence: Option<u64>,
-        limit: Option<u64>,
-    ) -> Result<Vec<Value>, ApiError> {
-        let (records, _problems) = self.scan(false)?;
-
-        let floor = from_sequence.unwrap_or(1);
-        let cap = limit.unwrap_or(u64::MAX);
-
-        let selected = records
-            .into_iter()
-            .filter(|record| record.get("sequence").and_then(Value::as_u64).unwrap_or(0) >= floor)
-            .take(usize::try_from(cap).unwrap_or(usize::MAX))
-            .collect();
-
-        Ok(selected)
+    /// NEVER fails for a data problem: an unreadable file is a `malformed` problem on line 0 and a
+    /// missing file is `missing: true`, because the caller is the restore path, which must degrade to
+    /// the checkpoint rather than refuse to boot. Only a failure to even attempt the read is
+    /// distinguishable, and TS reports that as a problem too.
+    #[must_use]
+    pub fn read(&mut self) -> JournalReadResult {
+        scan_file(&self.file)
     }
 
-    /// Every durable event record plus every structural problem found on the way
-    /// (`journal.ts:328-434` `read`, flattened to strings for this port's reporter channel).
+    /// Replaces the whole log with `records` through an atomic tmp + rename (`journal.ts:439-487`
+    /// `rewrite`, the checkpoint's fsync-then-rename rule).
     ///
-    /// This is the EXPLICIT read: the truncated tail is reported as a problem rather than being
-    /// folded away, and a parseable-but-unterminated tail record is still returned (the record
-    /// itself is complete; only its durability is unproven).
-    ///
-    /// # Errors
-    ///
-    /// As [`HarnessJournal::read`].
-    pub fn read_all_with_problems(&mut self) -> Result<(Vec<Value>, Vec<String>), ApiError> {
-        self.scan(true)
-    }
-
-    /// Replaces the whole log with `events` - header first, sequences renumbered from 1 - through
-    /// an atomic tmp + rename (`journal.ts:439-487` `rewrite`, the checkpoint's rule).
-    ///
-    /// Used after a checkpoint proves the same events are durable in `state.json`, and to repair a
-    /// file whose tail was truncated.
+    /// GAP-PRESERVING: each record keeps its own `turnId`/`index`/`at` verbatim - a compaction must
+    /// not invent new facts about events it did not change, and a hole in the sequence is the caller's
+    /// corruption report to keep (`tests/data_plane.rs` pins the re-read problem
+    /// `turn turn-a expected event index 1, found 2`). The HEADER is fresh (`createdAt` is
+    /// `Date.now()` again), which is what TS's `rewrite` does.
     ///
     /// # Errors
     ///
-    /// [`ApiError::internal`] naming the file when the staging write, the fence, or the rename
-    /// fails.
-    pub fn rewrite(&mut self, events: &[HarnessEvent]) -> Result<(), ApiError> {
+    /// [`ApiError::internal`] naming the file when the staging write, the fence, or the rename fails.
+    pub fn rewrite(&mut self, records: &[JournalEventRecord]) -> Result<(), ApiError> {
         self.ensure_open()?;
 
         // The worker must not hold the file the rename replaces (`:443`).
         self.close_handle();
 
-        let timestamp = events::now_millis();
-        let records: Vec<Value> = events
-            .iter()
-            .map(|event| journal_event(0, timestamp, event))
-            .collect();
+        let payload = rewrite_payload(&self.session_id, records);
 
-        match self.commit_records(&records) {
-            Ok(count) => {
-                self.next_sequence = count + 1;
+        match self.commit_payload(&payload) {
+            Ok(()) => {
+                self.size = u64::try_from(payload.len()).unwrap_or(payload.len() as u64);
                 self.last_error = None;
+
                 Ok(())
             }
             Err(error) => {
@@ -382,43 +526,26 @@ impl HarnessJournal {
         }
     }
 
-    /// Keeps the first `keep_count` events and rewrites the rest away
-    /// (`journal.ts:491-493` `truncate`, generalized to a retained count).
+    /// Drops every recorded event (`journal.ts:491-493` `truncate`): the log starts over, and a
+    /// stale event can never be replayed onto a turn that no longer exists.
     ///
-    /// The retained records are re-emitted VERBATIM (their recorded `timestamp` included) and only
-    /// renumbered, because a compaction must not invent new facts about events it did not change.
+    /// This is `rewrite([])`, which means the file keeps a header with a FRESH `createdAt` - not an
+    /// empty file, and not the original header.
     ///
     /// # Errors
     ///
     /// As [`HarnessJournal::rewrite`].
-    pub fn truncate_after(&mut self, keep_count: usize) -> Result<(), ApiError> {
-        self.ensure_open()?;
-        self.close_handle();
-
-        let (records, _problems) = self.scan(false)?;
-        let kept: Vec<Value> = records.into_iter().take(keep_count).collect();
-
-        match self.commit_records(&kept) {
-            Ok(count) => {
-                self.next_sequence = count + 1;
-                self.last_error = None;
-                Ok(())
-            }
-            Err(error) => {
-                self.note_failure(&error);
-
-                Err(journal_error(&self.file, &error))
-            }
-        }
+    pub fn truncate(&mut self) -> Result<(), ApiError> {
+        self.rewrite(&[])
     }
 
-    /// Closes the handle and removes this session's whole journal directory
-    /// (`journal.ts:496-506` `remove`).
+    /// Closes the handle and removes this session's whole journal directory (`journal.ts:496-506`
+    /// `remove`).
     ///
     /// # Errors
     ///
-    /// [`ApiError::internal`] naming the directory when the removal keeps failing after the
-    /// bounded retry.
+    /// [`ApiError::internal`] naming the directory when the removal keeps failing after the bounded
+    /// retry.
     pub fn remove(&mut self) -> Result<(), ApiError> {
         self.close_handle();
         self.opened = false;
@@ -478,8 +605,8 @@ impl HarnessJournal {
 
     // -- internals ----------------------------------------------------------
 
-    /// Creates the directory, writes the header once, and recovers `next_sequence`/`size`.
-    fn create_and_scan(&mut self) -> Result<(), ApiError> {
+    /// Creates the directory and writes the header if the file is absent (`:272-287`).
+    fn create(&mut self) -> Result<(), ApiError> {
         fs::create_dir_all(&self.directory).map_err(|error| {
             journal_error(
                 &self.file,
@@ -500,13 +627,6 @@ impl HarnessJournal {
             })?;
         }
 
-        let (records, _problems) = self.scan_file(&self.file, false)?;
-
-        self.next_sequence = records
-            .iter()
-            .filter_map(|record| record.get("sequence").and_then(Value::as_u64))
-            .max()
-            .map_or(1, |highest| highest + 1);
         self.size = fs::metadata(&self.file)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
@@ -516,13 +636,14 @@ impl HarnessJournal {
         Ok(())
     }
 
-    /// Re-creates the directory/header if a `remove` or an external cleanup took the file away.
+    /// Re-creates the directory/header if a `remove` or an external cleanup took the file away
+    /// (`:270-289`, which is itself idempotent).
     fn ensure_open(&mut self) -> Result<(), ApiError> {
         if self.opened && self.file.exists() {
             return Ok(());
         }
 
-        self.create_and_scan()
+        self.create()
     }
 
     /// Writes bytes through the held-open append handle, opening it on demand
@@ -566,44 +687,13 @@ impl HarnessJournal {
         let _ = self.handle.take();
     }
 
-    /// Re-emits `records` under a fresh header (sequences renumbered from 1, a recorded
-    /// `timestamp` kept) and commits the result atomically. Returns the number of records written.
-    fn commit_records(&mut self, records: &[Value]) -> Result<u64, String> {
-        let timestamp = events::now_millis();
-        let mut payload = journal_line(&journal_header(&self.session_id, timestamp));
-        let mut sequence = 1_u64;
-
-        for record in records {
-            let mut entry = record.clone();
-
-            if let Some(object) = entry.as_object_mut() {
-                object.insert("version".to_string(), json!(HARNESS_JOURNAL_VERSION));
-                object.insert("sequence".to_string(), json!(sequence));
-
-                let stamped = object.get("timestamp").is_some_and(Value::is_number);
-
-                if !stamped {
-                    object.insert("timestamp".to_string(), json!(timestamp));
-                }
-            }
-
-            payload.push_str(&journal_line(&entry));
-            sequence += 1;
-        }
-
-        match self.commit_payload(&payload) {
-            Ok(()) => {
-                self.size = u64::try_from(payload.len()).unwrap_or(payload.len() as u64);
-
-                Ok(sequence - 1)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
     /// Atomically replaces the file with `payload` (staging + fsync + rename, then a bounded retry
     /// over a Windows sharing violation).
+    ///
+    /// The staging name is `<file>.<pid>.<ms>.tmp` (`journal.ts:445`); the process id is the same
+    /// value Node would use, and the retry replaces only the millisecond.
     fn commit_payload(&mut self, payload: &str) -> Result<(), String> {
+        let pid = std::process::id();
         let mut last_error = String::new();
 
         for (attempt, backoff) in REMOVE_BACKOFF_MS.iter().enumerate() {
@@ -611,10 +701,17 @@ impl HarnessJournal {
                 std::thread::sleep(Duration::from_millis(*backoff));
             }
 
-            let staging = self.directory.join(format!(
-                "{}.{}.{}.tmp",
-                HARNESS_JOURNAL_FILE, self.session_id, attempt
-            ));
+            let name = self
+                .file
+                .file_name()
+                .map_or_else(
+                    || HARNESS_JOURNAL_FILE.to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+
+            let staging = self
+                .directory
+                .join(format!("{name}.{pid}.{}.tmp", events::now_millis() + u64::try_from(attempt).unwrap_or(attempt as u64)));
 
             let staged = (|| -> Result<(), String> {
                 let mut handle = OpenOptions::new()
@@ -628,7 +725,8 @@ impl HarnessJournal {
                         .write_all(payload.as_bytes())
                         .map_err(|error| error.to_string())?;
                     handle.flush().map_err(|error| error.to_string())?;
-                    // fsync BEFORE the rename, the checkpoint's rule (`:458-461`).
+                    // fsync BEFORE the rename, the checkpoint's rule (`:458-461`): a rename can be
+                    // durable while the bytes are not.
                     handle.sync_all().map_err(|error| error.to_string())
                 })();
 
@@ -641,6 +739,7 @@ impl HarnessJournal {
             match staged {
                 Ok(()) => return Ok(()),
                 Err(error) => {
+                    // The staging file is the lesser problem; `error` is the report (`:482-485`).
                     let _ = fs::remove_file(&staging);
                     last_error = error;
                 }
@@ -648,131 +747,6 @@ impl HarnessJournal {
         }
 
         Err(last_error)
-    }
-
-    /// The explicit-read scan.
-    fn scan(&mut self, tail_is_problem: bool) -> Result<(Vec<Value>, Vec<String>), ApiError> {
-        let (records, problems) = self.scan_file(&self.file, tail_is_problem)?;
-
-        Ok((records, problems))
-    }
-
-    /// Reads and validates one journal file.
-    ///
-    /// Tolerance, in the order `journal.ts:357-433` applies it: the newline test decides whether
-    /// the LAST line is the crash tail BEFORE any parsing, a blank line in the middle is
-    /// corruption, an unknown version is corruption, and a sequence gap is never a tail.
-    fn scan_file(
-        &self,
-        file: &Path,
-        tail_is_problem: bool,
-    ) -> Result<(Vec<Value>, Vec<String>), ApiError> {
-        let text = match fs::read_to_string(file) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((Vec::new(), Vec::new()));
-            }
-            Err(error) => {
-                return Err(journal_error(
-                    file,
-                    &format!("Could not read the harness journal: {error}"),
-                ));
-            }
-        };
-
-        let mut records: Vec<Value> = Vec::new();
-        let mut problems: Vec<String> = Vec::new();
-        let mut header_seen = false;
-        let mut expected: u64 = 1;
-
-        // A truncated tail is a record WITHOUT its terminating newline: the writer died
-        // mid-append. `split` cannot see the difference, so the newline check decides - and it
-        // decides BEFORE the loop, because `tail` means "this is the tolerated crash tail", not
-        // "this happened to be the last line" (`:358-363`).
-        let truncated_tail = !text.is_empty() && !text.ends_with('\n');
-
-        let mut segments: Vec<&str> = text.split('\n').collect();
-
-        // Drop only a TRAILING empty segment (every complete line ends with a newline); a blank
-        // line in the middle stays and reports as corruption (`:366-369`).
-        if segments.last().copied() == Some("") {
-            segments.pop();
-        }
-
-        for (position, line) in segments.iter().enumerate() {
-            let number = position + 1;
-            let tail = number == segments.len() && truncated_tail;
-
-            if line.is_empty() {
-                if tail && !tail_is_problem {
-                    continue;
-                }
-
-                problems.push(format!(
-                    "line {number}: empty line{}",
-                    if tail { " (truncated tail)" } else { "" }
-                ));
-                continue;
-            }
-
-            let parsed = match parse_line(line) {
-                Ok(parsed) => parsed,
-                Err(reason) => {
-                    if tail && !tail_is_problem {
-                        // The snapshot fold: an append whose completion is unproven is dropped,
-                        // exactly because the record was never complete.
-                        continue;
-                    }
-
-                    problems.push(format!(
-                        "line {number}: {reason}{}",
-                        if tail { " (truncated tail)" } else { "" }
-                    ));
-                    continue;
-                }
-            };
-
-            if tail && !tail_is_problem {
-                continue;
-            }
-
-            match parsed {
-                ParsedLine::Header => {
-                    if position != 0 {
-                        problems.push(format!("line {number}: header is not the first line"));
-                    } else {
-                        header_seen = true;
-                    }
-                }
-                ParsedLine::Event(record) => {
-                    if !header_seen {
-                        problems.push(format!("line {number}: event before header"));
-                    }
-
-                    let sequence = record.get("sequence").and_then(Value::as_u64).unwrap_or(0);
-
-                    if sequence != expected {
-                        problems.push(format!(
-                            "line {number}: expected event sequence {expected}, found {sequence}"
-                        ));
-                    }
-
-                    expected = sequence + 1;
-                    records.push(record);
-
-                    if tail {
-                        // A tail that PARSES is still returned - the record is complete, only its
-                        // durability is unproven - but the file condition is reported, because a
-                        // reader must never treat a repaired-by-skipping stream as healthy.
-                        problems.push(format!(
-                            "line {number}: record is complete but its terminating newline is missing (truncated tail)"
-                        ));
-                    }
-                }
-            }
-        }
-
-        Ok((records, problems))
     }
 
     /// Records a failure the way `noteWrite` does (`journal.ts:541-544`).
@@ -783,93 +757,282 @@ impl HarnessJournal {
 
     /// Zeroes the recovered counters after a `remove`, so a reopened journal starts over.
     fn reset_counters(&mut self) {
-        self.next_sequence = 1;
         self.size = 0;
     }
 }
 
-/// One parsed journal line.
+/// The whole rewritten payload: one fresh header line plus every record in the compaction's key
+/// order (`journal.ts:448-455`).
+#[must_use]
+fn rewrite_payload(session_id: &str, records: &[JournalEventRecord]) -> String {
+    let mut payload = journal_line(&journal_header(session_id, events::now_millis()));
+
+    for record in records {
+        payload.push_str(&journal_line(&journal_compacted_line(record)));
+    }
+
+    payload
+}
+
+/// One parsed journal line (`journal.ts:162-225` `parseLine`'s discriminated result).
 enum ParsedLine {
-    Header,
-    Event(Value),
+    Header(JournalHeaderRecord),
+    Event(JournalEventRecord),
+}
+
+/// Reads and validates one journal file, implementing `journal.ts:328-434` line for line.
+///
+/// Tolerance, in the order TS applies it: the newline test decides the crash tail BEFORE any
+/// parsing, a blank line in the middle is corruption, a version mismatch is corruption, a header
+/// that is not line 1 is skipped (so every later line reports `event before header`), and a gap in
+/// one turn's index sequence is corruption that is NEVER a tail.
+#[must_use]
+fn scan_file(file: &Path) -> JournalReadResult {
+    let text = match fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // `{ events: [], problems: [], empty: true, missing: true, truncatedTail: false }`.
+            return JournalReadResult {
+                events: Vec::new(),
+                header: None,
+                problems: Vec::new(),
+                empty: true,
+                missing: true,
+                truncated_tail: false,
+            };
+        }
+        Err(error) => {
+            let message = error.to_string();
+
+            return JournalReadResult {
+                events: Vec::new(),
+                header: None,
+                problems: vec![JournalProblem {
+                    line: 0,
+                    kind: JournalProblemKind::Malformed,
+                    reason: message,
+                    tail: false,
+                }],
+                empty: true,
+                missing: false,
+                truncated_tail: false,
+            };
+        }
+    };
+
+    let mut events: Vec<JournalEventRecord> = Vec::new();
+    let mut problems: Vec<JournalProblem> = Vec::new();
+    let mut header: Option<JournalHeaderRecord> = None;
+
+    // Per-turn expected next index (`:392`). A gap is corruption - appends are sequential - so it
+    // is reported rather than silently closed.
+    let mut expected: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+
+    // A truncated tail is a record WITHOUT its terminating newline: the writer died mid-append.
+    // `split` cannot see the difference, so the newline check decides - and it decides BEFORE the
+    // loop, because `tail` means "this is the tolerated crash tail", NOT "this happened to be the
+    // last line" (`:358-363`).
+    let truncated_tail = !text.is_empty() && !text.ends_with('\n');
+
+    let mut segments: Vec<&str> = text.split('\n').collect();
+
+    // Drop only a TRAILING empty segment (every complete line ends with a newline). A blank line in
+    // the middle stays and reports as corruption (`:366-369`).
+    if segments.last().copied() == Some("") {
+        segments.pop();
+    }
+
+    for (position, line) in segments.iter().enumerate() {
+        let number = u64::try_from(position + 1).unwrap_or(position as u64);
+        let last = position + 1 == segments.len();
+
+        if line.is_empty() {
+            problems.push(JournalProblem {
+                line: number,
+                kind: JournalProblemKind::Malformed,
+                reason: "empty line".to_string(),
+                // A blank line is never the crash tail, even at the end (`:375`).
+                tail: false,
+            });
+            continue;
+        }
+
+        let parsed = match parse_line(line) {
+            Ok(parsed) => parsed,
+            Err(reason) => {
+                let tail = last && truncated_tail;
+
+                problems.push(JournalProblem {
+                    line: number,
+                    kind: JournalProblemKind::Malformed,
+                    reason: if tail {
+                        format!("{reason} (truncated tail)")
+                    } else {
+                        reason
+                    },
+                    tail,
+                });
+                continue;
+            }
+        };
+
+        match parsed {
+            ParsedLine::Header(record) => {
+                // A header anywhere but line 1 is corruption, and the line is DROPPED rather than
+                // kept as an event (`:397-402`).
+                if position != 0 {
+                    problems.push(JournalProblem {
+                        line: number,
+                        kind: JournalProblemKind::Shape,
+                        reason: "header is not the first line".to_string(),
+                        tail: false,
+                    });
+                    continue;
+                }
+
+                header = Some(record);
+            }
+            ParsedLine::Event(record) => {
+                // The event still stands - the reader's job is to report, not to repair - but a log
+                // whose first line is an event is a stray file, and that has to be said (`:404-406`).
+                if header.is_none() {
+                    problems.push(JournalProblem {
+                        line: number,
+                        kind: JournalProblemKind::Shape,
+                        reason: "event before header".to_string(),
+                        tail: false,
+                    });
+                }
+
+                // The per-turn sequence gate (`:409-422`). Only a turn that has already produced a
+                // line has an expectation, so the first event of a turn never reports a gap even when
+                // the log starts at index 7 (a compaction of a pruned turn keeps the tail's indices).
+                if let Some(next) = expected.get(&record.turn_id)
+                    && record.index != next
+                {
+                    problems.push(JournalProblem {
+                        line: number,
+                        kind: JournalProblemKind::Sequence,
+                        reason: format!(
+                            "turn {} expected event index {next}, found {}",
+                            record.turn_id, record.index
+                        ),
+                        // A gap is never a crash tail: appends are sequential, so a hole means a lost
+                        // or rewritten line, and a reader must say so (`:416-418`).
+                        tail: false,
+                    });
+                }
+
+                expected.insert(record.turn_id.clone(), record.index + 1);
+                events.push(record);
+            }
+        }
+    }
+
+    JournalReadResult {
+        events,
+        header,
+        problems,
+        empty: events.is_empty(),
+        missing: false,
+        truncated_tail,
+    }
 }
 
 /// Validates one line (`journal.ts:162-225` `parseLine`): anything that is not a journal record of
-/// the supported version is REPORTED, not repaired.
-///
-/// Both envelopes are accepted on read - this port's `{ version, sequence, timestamp, event }`
-/// and TS's `{ type: 'event', v, turnId, index, at, event }` - so a database written by the TS
-/// server still replays. An event recorded by TS keeps its own fields; the sequence gate is simply
-/// skipped for it (`sequence` is absent, and the gap check treats 0 as "unknown").
+/// the supported version is REPORTED, not repaired. The version gate comes FIRST, on both record
+/// kinds, which is why a one-line version mismatch on the header cascades into `event before
+/// header` on every event line below it.
 fn parse_line(line: &str) -> Result<ParsedLine, String> {
     let parsed: Value =
         serde_json::from_str(line).map_err(|error| format!("not valid JSON: {error}"))?;
 
-    let object = parsed.as_object().ok_or("not a JSON object")?;
+    let object = match parsed.as_object() {
+        Some(object) => object,
+        // `isRecordObject` (`:158-160`): an array is not a record either.
+        None => return Err("not a JSON object".to_string()),
+    };
 
-    if object.get("type").and_then(Value::as_str) == Some("header") {
-        let version = object.get("v").and_then(Value::as_u64);
-
-        if version != Some(u64::from(HARNESS_JOURNAL_VERSION)) {
-            return Err(format!(
-                "unsupported journal version {}; this server writes version {HARNESS_JOURNAL_VERSION}",
-                object
-                    .get("v")
-                    .map_or_else(|| "undefined".to_string(), |value| value.to_string())
-            ));
-        }
-
-        if !object
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .is_some_and(|id| !id.is_empty())
-        {
-            return Err("header sessionId is missing".to_string());
-        }
-
-        if !object.get("createdAt").is_some_and(Value::is_number) {
-            return Err("header createdAt is missing".to_string());
-        }
-
-        return Ok(ParsedLine::Header);
-    }
-
-    let version = object
-        .get("version")
-        .or_else(|| object.get("v"))
-        .and_then(Value::as_u64);
-
-    if version != Some(u64::from(HARNESS_JOURNAL_VERSION)) {
+    // `if (v !== HARNESS_JOURNAL_VERSION)` (`:174-179`). `JSON.stringify(v)` prints `undefined` for
+    // an absent key, which is what serde's `Display` for a missing value cannot say - hence the
+    // explicit arm.
+    if object.get("v").and_then(Value::as_u64) != Some(u64::from(HARNESS_JOURNAL_VERSION)) {
         return Err(format!(
             "unsupported journal version {}; this server writes version {HARNESS_JOURNAL_VERSION}",
-            version.map_or_else(|| "undefined".to_string(), |value| value.to_string())
+            shown(object.get("v"))
         ));
     }
 
-    let event = object
-        .get("event")
-        .and_then(Value::as_object)
-        .ok_or("event payload is missing")?;
+    match object.get("type").and_then(Value::as_str) {
+        Some("header") => {
+            let session_id = match object.get("sessionId") {
+                Some(Value::String(id)) if !id.is_empty() => id.clone(),
+                _ => return Err("header sessionId is missing".to_string()),
+            };
 
-    if !event.get("type").is_some_and(Value::is_string) {
-        return Err("event payload is missing".to_string());
+            let created_at = match object.get("createdAt").and_then(Value::as_u64) {
+                Some(created_at) => created_at,
+                None => return Err("header createdAt is missing".to_string()),
+            };
+
+            Ok(ParsedLine::Header(JournalHeaderRecord {
+                session_id,
+                created_at,
+            }))
+        }
+        Some("event") => {
+            let turn_id = match object.get("turnId") {
+                Some(Value::String(id)) if !id.is_empty() => id.clone(),
+                _ => return Err("event turnId is missing".to_string()),
+            };
+
+            let index = match object.get("index").and_then(Value::as_u64) {
+                Some(index) => index,
+                None => {
+                    return Err(
+                        "event index is missing or not a non-negative integer".to_string(),
+                    );
+                }
+            };
+
+            let at = match object.get("at").and_then(Value::as_u64) {
+                Some(at) => at,
+                None => return Err("event at is missing".to_string()),
+            };
+
+            let event = match object.get("event") {
+                Some(Value::Object(payload)) if payload.contains_key("type") => {
+                    if payload.get("type").is_some_and(Value::is_string) {
+                        parsed.get("event").cloned().unwrap_or(Value::Null)
+                    } else {
+                        return Err("event payload is missing".to_string());
+                    }
+                }
+                _ => return Err("event payload is missing".to_string()),
+            };
+
+            Ok(ParsedLine::Event(JournalEventRecord {
+                turn_id,
+                index,
+                at,
+                event,
+            }))
+        }
+        // `unknown journal record type ${JSON.stringify(type)}` (`:223`).
+        _ => Err(format!(
+            "unknown journal record type {}",
+            shown(object.get("type"))
+        )),
     }
+}
 
-    if object
-        .get("sequence")
-        .is_some_and(|sequence| !sequence.is_number())
-    {
-        return Err("event sequence is missing or not a non-negative integer".to_string());
+/// `JSON.stringify(value)` for a problem text: absent reads as `undefined`, everything else keeps
+/// its JSON spelling.
+fn shown(value: Option<&Value>) -> String {
+    match value {
+        Some(value) => value.to_string(),
+        None => "undefined".to_string(),
     }
-
-    if object
-        .get("timestamp")
-        .is_some_and(|stamp| !stamp.is_number())
-    {
-        return Err("event at is missing".to_string());
-    }
-
-    Ok(ParsedLine::Event(parsed))
 }
 
 /// `true` for the failures a retry can plausibly clear - a sharing/lock violation, an access
