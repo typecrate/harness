@@ -300,5 +300,5 @@ dependency under
 lib is therefore *excluded* from the wasm artifact, not linked into it - the wasm build compiles
 neither the harness nor its axum/tokio/reqwest stack.
 
-`node scripts/check-playground.mjs` is 122/122 against the 18-row listing (the three `ANY /v1/harness`
+`yarn vite-node scripts/check-playground.ts` is 122/122 against the 18-row listing (the three `ANY /v1/harness`
 rows first), which is the shape `tests/server_http.rs::route_table` pins over a socket.

@@ -942,11 +942,11 @@ async fn the_tool_switch_is_durable_and_the_member_disappears_when_nothing_is_di
 }
 
 // ---------------------------------------------------------------------------
-// 5 - `PATCH .../blocks/{block_id}`: the guards, then the placeholder
+// 5 - `PATCH .../blocks/{block_id}`: the guards, then the segment lookup
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_block_write_guards_answer_before_the_placeholder() {
+async fn the_block_write_guards_answer_before_the_segment_lookup() {
     let root = Root::new("block-write");
     let session = create_session(&root.path).await;
 
@@ -1042,9 +1042,13 @@ async fn the_block_write_guards_answer_before_the_placeholder() {
         "Unknown field \"lane\". Allowed fields: included, reasoningIncluded.",
     );
 
-    // A well-formed write reaches the engine gap: the joins (`blockUnitOf` / `blockThoughtOf`) and
-    // the ENTRY flag this port does not carry yet. The two per-axis 409s sit behind it, which is
-    // why they are not pinned here.
+    // A well-formed body clears every guard, and the segment lookup is what answers next: the
+    // lookup is the SAME resolver the read runs (`api/turns.rs:1200-1204`, from `store.blockDetail`),
+    // so the invented id this fixture uses - `blk`, which the engine never mints - is a 404 naming
+    // the block. This loop used to pin the 500 PLACEHOLDER ("PATCH blocks answers once the transcript
+    // entry flags land"); that placeholder is GONE: `patch_session_turn_block` (`api/turns.rs:1132`)
+    // now performs the write through the two joins, the real write and its per-axis 409s are pinned
+    // by `tests/http_sessions.rs:4915` (R18/R19), and no 5xx remains on this route.
     for body in [
         json!({ "included": false }),
         json!({ "reasoningIncluded": true }),
@@ -1052,10 +1056,13 @@ async fn the_block_write_guards_answer_before_the_placeholder() {
     ] {
         let reply = Reply::patch(&root, &block_path, body.clone()).await;
 
-        assert_eq!(reply.status, 500, "`{body}` reaches the entry-flag gap");
+        assert_eq!(
+            reply.status, 404,
+            "`{body}` clears every guard and is refused by the segment lookup"
+        );
         assert_eq!(
             reply.message(),
-            "The context segment inclusion write is not implemented on this build; PATCH blocks answers once the transcript entry flags land."
+            format!("Unknown context block \"blk\" in turn \"{turn_id}\".")
         );
         assert!(!reply.headers.contains_key(&REVISION_HEADER));
     }

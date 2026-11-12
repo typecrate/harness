@@ -300,7 +300,13 @@ pub struct AsyncLifecycle {
 /// The one payload per event (`HarnessLifecyclePayloads`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Payload {
-    Thread(HarnessThreadRecord),
+    // Boxed on purpose: `HarnessThreadRecord` is 424 bytes inline (the whole persisted row - id,
+    // agent, messages, context, timestamps) while the second-largest variant here is 216, so an
+    // unboxed enum would size EVERY event - including the field-less `Dispose` - at the record's
+    // full width. The record reaches every handler as a COPY anyway (`event.rs` module header), so
+    // the one extra allocation is paid where a copy is already being made, and the enum - which is
+    // what gets moved into each hook registration and each round's `HandlerCall` - halves.
+    Thread(Box<HarnessThreadRecord>),
     /// The record is already purged when this fires, so the payload is the identity a handler
     /// still needs (`types:4231-4233`).
     ThreadDeleted { thread_id: String, agent: String },

@@ -231,31 +231,33 @@ impl Plugin for AsyncPingPlugin {
                     // announces nothing and is ignored rather than guessed at.
                     _ => return Ok(Contribution::nothing()),
                 };
-                let agent = Some(agent);
+                // `agent` deliberately stays a plain String: `arm_decision` takes Option<&str> only
+                // because its PUBLIC surface must also reject an unknown identity, never because this
+                // payload's identity can be absent - `Payload::AsyncPending` always carries one. The
+                // old `let agent = Some(agent);` shim made that always-Some Option the source of a
+                // meaningless `unwrap_or_default()` two branches later.
                 let has_work = !pending.is_empty();
 
                 // The reserved switch, read LIVE (`isEnabled`, async-ping.plugin.ts:133).
                 let enabled = scope.is_enabled();
-                let already_armed = agent.as_ref().is_some_and(|name| {
-                    handle
-                        .lock()
-                        .is_ok_and(|table| table.contains_key(name.as_str()))
-                });
+                let already_armed = handle
+                    .lock()
+                    .is_ok_and(|table| table.contains_key(agent.as_str()));
 
-                match arm_decision(agent.as_deref(), has_work, enabled, already_armed) {
+                match arm_decision(Some(agent.as_str()), has_work, enabled, already_armed) {
                     ArmDecision::Ignore | ArmDecision::Keep => Ok(Contribution::nothing()),
                     ArmDecision::Release => {
-                        if let Some(name) = agent {
-                            if let Ok(mut table) = handle.lock() {
-                                if let Some(task) = table.remove(&name) {
-                                    task.abort();
-                                }
-                            }
+                        // `arm_decision` only answers Release for a non-empty identity, so the key to
+                        // drop is exactly `agent` - no Option peel needed.
+                        if let Ok(mut table) = handle.lock()
+                            && let Some(task) = table.remove(&agent)
+                        {
+                            task.abort();
                         }
                         Ok(Contribution::nothing())
                     }
                     ArmDecision::Arm => {
-                        let name = agent.unwrap_or_default();
+                        let name = agent;
                         // Resolved at ARM time, never at setup, so a settings change
                         // applies to the next ping (async-ping.plugin.ts:135-145).
                         let fallback = scope
@@ -268,10 +270,10 @@ impl Plugin for AsyncPingPlugin {
                         let interval_ms = interval_of(configured.unwrap_or(fallback));
                         let next =
                             spawn_heartbeat(handle.clone(), name.clone(), interval_ms, scope.clone());
-                        if let Some(next) = next {
-                            if let Ok(mut table) = handle.lock() {
-                                table.insert(name, next);
-                            }
+                        if let Some(next) = next
+                            && let Ok(mut table) = handle.lock()
+                        {
+                            table.insert(name, next);
                         }
                         Ok(Contribution::nothing())
                     }
@@ -289,10 +291,10 @@ impl Plugin for AsyncPingPlugin {
                     Payload::AsyncDrained(lifecycle) => lifecycle.agent.clone(),
                     _ => return Ok(Contribution::nothing()),
                 };
-                if let Ok(mut table) = handle.lock() {
-                    if let Some(task) = table.remove(&agent) {
-                        task.abort();
-                    }
+                if let Ok(mut table) = handle.lock()
+                    && let Some(task) = table.remove(&agent)
+                {
+                    task.abort();
                 }
                 Ok(Contribution::nothing())
             },
@@ -376,14 +378,14 @@ fn thread_id_of(call: &HandlerCall) -> Option<String> {
 /// Clear one thread's board key and sweep the rest (async-ping.plugin.ts:257-260).
 fn release_thread(timers: &Timers, call: &HandlerCall, runtime: &dyn PluginRuntime) {
     let event = call.event;
-    if matches!(event, LifecycleEvent::ThreadStopped | LifecycleEvent::ThreadDeleted) {
-        if let Some(thread_id) = thread_id_of(call) {
-            if let Ok(mut table) = timers.lock() {
-                if let Some(task) = table.remove(&thread_timer_key(&thread_id)) {
-                    task.abort();
-                }
-            }
-        }
+    if matches!(
+        event,
+        LifecycleEvent::ThreadStopped | LifecycleEvent::ThreadDeleted
+    ) && let Some(thread_id) = thread_id_of(call)
+        && let Ok(mut table) = timers.lock()
+        && let Some(task) = table.remove(&thread_timer_key(&thread_id))
+    {
+        task.abort();
     }
     sweep_drained(timers, runtime);
 }
@@ -398,10 +400,10 @@ fn sweep_drained(timers: &Timers, runtime: &dyn PluginRuntime) {
         if !runtime.async_pending_for(Some(&name)).is_empty() {
             continue;
         }
-        if let Ok(mut table) = timers.lock() {
-            if let Some(task) = table.remove(&name) {
-                task.abort();
-            }
+        if let Ok(mut table) = timers.lock()
+            && let Some(task) = table.remove(&name)
+        {
+            task.abort();
         }
     }
 }
@@ -446,10 +448,10 @@ fn spawn_heartbeat(
         }
 
         scope.runtime().async_wake(Some(&agent));
-        if let Some(next) = spawn_heartbeat(timers.clone(), agent.clone(), interval_ms, scope) {
-            if let Ok(mut table) = timers.lock() {
-                table.insert(agent, next);
-            }
+        if let Some(next) = spawn_heartbeat(timers.clone(), agent.clone(), interval_ms, scope)
+            && let Ok(mut table) = timers.lock()
+        {
+            table.insert(agent, next);
         }
     }))
 }

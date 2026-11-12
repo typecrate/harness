@@ -375,7 +375,8 @@ pub fn unknown_event_error(name: &str) -> RegistrationError {
 /// Rust's `u64` cannot carry NaN or Infinity, so the only reachable spelling of "not a finite
 /// number >= 0" is the caller's own sentinel: `u64::MAX` is a budget no timer can arm, and TS
 /// refuses that input rather than running unbounded by accident.
-#[must_use]
+// No `#[must_use]` here: the return is a `Result`, which is already `#[must_use]` in std, and an
+// attribute with no message on top of it is the `clippy::double_must_use` redundancy.
 fn check_options(name: &str, options: &HookOptions) -> Result<(), RegistrationError> {
     if options.timeout_ms == Some(u64::MAX) {
         return Err(RegistrationError(format!(
@@ -740,10 +741,10 @@ impl HookBus {
         for list in state.by_event.values() {
             for entry in list {
                 // A named registration is live on exactly the event it was pointed at.
-                if entry.owner == owner {
-                    if let SubscriptionTarget::Event(event) = entry.target {
-                        ordered.push((entry.id, vec![event.as_str()]));
-                    }
+                if entry.owner == owner
+                    && let SubscriptionTarget::Event(event) = entry.target
+                {
+                    ordered.push((entry.id, vec![event.as_str()]));
                 }
             }
         }

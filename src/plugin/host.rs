@@ -31,7 +31,7 @@
 // turn - every session, because every harness was built with the one live provider.
 //
 // The resolution order is stored override -> the plugin's own declared `enabled` default -> `true`
-/// for a plugin that declares no such key, and it is THE SAME READ the plugin itself performs (a
+// for a plugin that declares no such key, and it is THE SAME READ the plugin itself performs (a
 // plugin that declares `enabled: false` is off from the first turn with nothing stored, and one
 // stored `true` turns both reads on at once - `host.test.ts:415-469`).
 //
@@ -201,6 +201,7 @@ pub fn resolve_plugin_list<'a>(
 ///     namespace, and the fallback default comes from what THIS plugin declares;
 ///   * the live enablement gate - so every registration this api makes is gated by the same stored
 ///     key the operator's switch writes.
+///
 /// `Clone` so a plugin's setup can hand its own scoped api to the closures it registers, exactly
 /// as TS closes over `api` (async-ping.plugin.ts:112-133). Every field is an `Arc`, so a clone is
 /// four reference-count bumps and there is no second copy of any state to keep in sync.

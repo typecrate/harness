@@ -1529,7 +1529,7 @@ spec is the TS source, and where a fix could not reach the seam it says so.
 | 8 | The usage fold invented a `cached` member and ordered threads by name. | The tally states `{input, output, total}` and preserves FIRST-APPEARANCE thread order; `cached` stays a transport-side figure. | `api-reads.ts`'s usage page builder, `sessions.ts`'s usage fold | `tests/store.rs` / `tests/turn.rs` usage cases |
 | 9 | Several display bounds counted `chars().count()` (code points) where TypeScript counts UTF-16 code units. | `display_chars` is the single UTF-16 measure, used by every preview, notice, tail and block count. | `turn-projector.ts:134-190`, `turn-display.ts:95-99,412-416` (invariant 5) | `tests/foundation.rs::character_figures_are_utf16_code_units`, `tests/data_plane.rs::the_harness_text_bounds_are_measured_in_utf16_units` |
 | 10 | The `typecrate-services` listener never told the harness runtime it was going away, so a live turn stream held the graceful drain open. | `bin/server.rs` runs `typecrate_harness::server::begin_shutdown_all()` as soon as the signal resolves, before axum stops accepting: every cached root's store flips `shuttingDown` and every live stream closes with `1001`. A process that serves no harness root (remote-hosts mode) is unaffected. | `start.ts:319-327`, `sessions.ts:8638` (`dispose`'s `shuttingDown`) | the harness side is pinned by `tests/stream.rs::the_host_shutdown_closes_a_live_stream_with_the_1001_frame`; the services wiring is a one-line hook in the bin |
-| 11 | The playground checker's listing fixture was the pre-T6 fifteen-row table, so it validated a listing the server no longer produces. | `LISTING_JSON` is the eighteen-row listing with the three `ANY /v1/harness` rows first; the eight expectations that encoded the fifteen-row order moved with it. | `tests/server_http.rs::route_table`, `tests/discovery.rs` (R2 sort order) | `node scripts/check-playground.mjs` - 122/122 |
+| 11 | The playground checker's listing fixture was the pre-T6 fifteen-row table, so it validated a listing the server no longer produces. | `LISTING_JSON` is the eighteen-row listing with the three `ANY /v1/harness` rows first; the eight expectations that encoded the fifteen-row order moved with it. | `tests/server_http.rs::route_table`, `tests/discovery.rs` (R2 sort order) | `yarn vite-node scripts/check-playground.ts` - 122/122 |
 | 12 | `README.md` still described stage T1. | Rewritten as the crate's real manual: layout, commands, the standalone listener's flags and defaults, the environment ladder, the data-root and journal formats, the parity matrix, the full deviation list, and the verification counts. | - | - |
 
 ### Assertions that encoded the old behaviour, and were corrected to the spec
@@ -1595,7 +1595,7 @@ in `packages/typecrate/harness`: **261 passed, 0 failed** across 13 targets (56 
 `store_restore`, 21 `stream`, 24 `tools`, 24 `transport`, 13 `turn`).
 
 `cargo check --locked --target wasm32-unknown-unknown` in `packages/typecrate/services` is clean, and
-`node scripts/check-playground.mjs` is 122/122. `cargo test --locked` there is 71 tests with one
+`yarn vite-node scripts/check-playground.ts` is 122/122. `cargo test --locked` there is 71 tests with one
 expected failure: `tests/harness_gateway.rs::health_the_empty_page_a_created_session_and_the_catalogue_reads_answer_through_the_gateway`
 pins `GET /v1/harness/tools?limit=100` at **35** rows, and fix 4 makes the listed surface **31**. The
 assertion belongs to a services test file, which T7b's brief did not put in scope - it needs the same
@@ -1661,7 +1661,7 @@ place that knows what this build actually provides.
 In `packages/typecrate/services`: `cargo fmt -- --check`, `cargo clippy --all-targets --locked --
 -D warnings` and `cargo check --locked --target wasm32-unknown-unknown` are clean, `cargo test --locked
 --no-fail-fast` is **96 passed, 0 failed** (13 lib, 15 `bin/server`, 1 `api`, 29 `discovery`,
-8 `harness_gateway`, 30 `server_http`), and `node scripts/check-playground.mjs` is **122/122**. T7b's
+8 `harness_gateway`, 30 `server_http`), and `yarn vite-node scripts/check-playground.ts` is **122/122**. T7b's
 "71 tests with one expected failure" paragraph above is the state AT THAT RUN; the `harness_gateway`
 35-row pin has since moved to the 31 LISTED rows, which is what the gateway test asserts today.
 

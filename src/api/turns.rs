@@ -911,13 +911,12 @@ fn messages_with_reasoning_inclusion(
         .map(|(index, message)| {
             let mut copy = message.clone();
 
-            if index == entry {
-                if let HarnessMessage::Assistant {
+            if index == entry
+                && let HarnessMessage::Assistant {
                     reasoning_included, ..
                 } = &mut copy
-                {
-                    *reasoning_included = flag;
-                }
+            {
+                *reasoning_included = flag;
             }
 
             copy

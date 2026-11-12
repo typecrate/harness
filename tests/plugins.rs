@@ -434,6 +434,10 @@ async fn the_catalogue_answers_both_builtins_with_their_declared_metadata_and_va
                 "harness.dispose"
             ],
             "builtin": true,
+            // R2's reserved switch key: `PluginSummary.enabled` is a non-optional `bool` in
+            // `contract.rs:1923` and `api.ts:2373 pluginRowOf` emits it on EVERY row, so the row
+            // literal must carry it - the key-set assertion above already demanded it.
+            "enabled": true,
             "settings": [
                 {
                     "key": "intervalMs",
@@ -451,33 +455,166 @@ async fn the_catalogue_answers_both_builtins_with_their_declared_metadata_and_va
         "the row IS the plugin's own metadata beside the values in force"
     );
 
+    // `context-compaction`, byte for byte. This literal was stale in every field the 2026-11
+    // plugin-host push moved: the description text, FIVE hooks instead of one, the SIX declared
+    // settings (contextLimit, modelLimits, enabled, minTokens, safetyTurns, mode) instead of
+    // one, the 200000 default that replaced 100000, and the reserved `enabled` row key.
+    // Cross-checked against the parity reference
+    // `packages/underload/harness/src/plugins/context-compaction.plugin.ts:364-446` for every
+    // structural field (name, title, version, tags, hooks, and each setting's key/label/type/
+    // default/min/step) and against the shipped catalogue in `src/plugins.rs` for the prose.
     assert_eq!(
         page.body["items"][1],
         json!({
             "name": "context-compaction",
             "title": "Context Compaction",
             "description": "Watches each agent conversation against a context limit and, when the \
-                            limit is reached, compacts the transcript at the turn boundary before \
-                            the next model request is sent.",
+                    limit is reached, compacts the conversation at the turn boundary before the \
+                    next model request is sent. In the default \"summarize\" mode the \
+                    conversation does the work: the thread is parked, an instruction the plugin \
+                    commits into the transcript is answered by this same agent with a summary of \
+                    what is done, what it is working on and where it left off, and everything \
+                    before that instruction (and the turns between it and the answer) stops being \
+                    sent. The thread resumes with a nudge to continue, and the context is small \
+                    again: the instruction plus the agent's own summary. The older \"exclude\" \
+                    mode prunes only the tool units a later success already answered. Neither \
+                    mode deletes anything: a withheld unit keeps its place in history and can be \
+                    switched back on. The limit is the firing point: compaction starts as soon as \
+                    the estimate reaches the effective limit, which is the per-model override for \
+                    the model the conversation is running, capped by that model's declared \
+                    context window when one is declared.",
             "version": "1.0.0",
-            "tags": ["context", "compaction", "lifecycle"],
-            "hooks": ["turn.before"],
+            "tags": [
+                "context",
+                "compaction",
+                "lifecycle"
+            ],
+            "hooks": [
+                "turn.before",
+                "turn.after",
+                "thread.idle",
+                "run.finished",
+                "run.failed"
+            ],
             "builtin": true,
+            "enabled": true,
             "settings": [
                 {
                     "key": "contextLimit",
                     "label": "Context limit (tokens)",
                     "type": "number",
-                    "default": 100000,
+                    "default": 200000,
                     "min": 1000,
                     "step": 1000,
-                    "description": "Estimated tokens a conversation may reach before this plugin \
-                                    compacts it. Measured with the same ~4 characters/token \
-                                    estimate the UI context bar uses."
+                    "description": "The firing point: estimated tokens a conversation may reach \
+                            before this plugin compacts it, measured with the ~4 characters/token \
+                            estimate the UI context bar uses, anchored on the reported prompt \
+                            size of the last request that reported usage — so after the first \
+                            report it can differ from the bar by whatever the tool schemas and \
+                            message framing actually cost. There is no separate headroom: the \
+                            estimate at or above this number fires the pass on that turn. It is \
+                            this value unless modelLimits overrides it for the model this \
+                            conversation runs, or caps it at that model's declared context \
+                            window. Set to 0 to turn compaction off for every model."
+                },
+                {
+                    "key": "modelLimits",
+                    "label": "Per-model limits (JSON)",
+                    "type": "string",
+                    "default": "{}",
+                    "description": "A JSON object keyed by model id, each value `{ \"limit\": \
+                            number, \"window\": number }` — both optional. `limit` replaces \
+                            contextLimit for that model, for an operator who is willing to pay \
+                            more (or less) for one model than for the rest. `window` states the \
+                            model's HARD context window: it caps whatever limit is in force, so a \
+                            512000 ceiling on a 262144-token model still compacts around the 256k \
+                            behaviour rather than waiting for a size the provider never accepts. \
+                            Example: `{\"gpt-4o\": {\"limit\": 512000, \"window\": 131072}, \
+                            \"llama-8b\": {\"window\": 8192}}`. The model id is read live from \
+                            the agent, so switching models changes the ceiling on the next turn. \
+                            Anything malformed — broken JSON, a value that is not an object, a \
+                            non-positive or non-numeric limit — is ignored and the global limit \
+                            applies, never an error."
+                },
+                {
+                    "key": "enabled",
+                    "label": "Compact conversations",
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Runs compaction on or off, in either mode. Off changes nothing \
+                            else: the limit is still read, the context bar still measures, and no \
+                            other plugin is affected. It is the switch an operator expects when \
+                            they want the behaviour gone without removing the built-in."
+                },
+                {
+                    "key": "minTokens",
+                    "label": "Minimum saving per pass (tokens)",
+                    "type": "number",
+                    "default": 200,
+                    "min": 0,
+                    "step": 50,
+                    "description": "A pass must withhold at least this many estimated tokens, or \
+                            it does nothing at all — no flag write, no persistence notification, \
+                            no save. A prune that saves 40 tokens is a provider prompt-cache \
+                            invalidation for nothing, so this floor is what makes running on \
+                            every turn cheap. Measured as a difference of the same estimate, so \
+                            any provider anchor cancels out of it and only the withheld \
+                            characters count. In \"summarize\" mode the same number is read the \
+                            other way round, as a trivial floor on the LIVE estimate: a \
+                            conversation smaller than this is never worth a compaction round \
+                            trip, so the pass refuses rather than paying for a summary of a \
+                            handful of turns. Set it to 0 to remove the floor, which a small \
+                            per-model limit needs: a floor above that limit would never be \
+                            crossed."
+                },
+                {
+                    "key": "safetyTurns",
+                    "label": "Recent units to protect",
+                    "type": "number",
+                    "default": 6,
+                    "min": 0,
+                    "step": 1,
+                    "description": "How many units at the END of the conversation no pass may \
+                            touch. A unit is one assistant tool-call block plus its results, or \
+                            one standalone message. The horizon counts UNITS from the end, never \
+                            the per-run turn counter: a failure the model has not moved past yet \
+                            is the highest-signal thing in the window, and pruning it is how an \
+                            agent repeats the call it just watched fail. 0 removes the horizon. \
+                            It belongs to \"exclude\" mode; \"summarize\" mode needs no horizon \
+                            because the recent tail is exactly what the agent is summarizing."
+                },
+                {
+                    "key": "mode",
+                    "label": "Compaction mode",
+                    "type": "string",
+                    "default": "summarize",
+                    "description": "Which compaction runs when the limit is reached. \"summarize\" \
+                            — the default since the 2026-11-10 context-compaction ruling — parks \
+                            the conversation at the turn boundary and lets its NEXT model turn \
+                            write the summary: the agent condenses what is done, what it is \
+                            working on and where it left off, everything before that instruction \
+                            stops being sent, and the conversation resumes with a nudge. \
+                            \"exclude\" is the earlier behaviour: a superseded tool unit keeps \
+                            its place in canonical history and simply stops being sent, which is \
+                            the reversible option the evidence favours and the cheaper one — no \
+                            extra model turn. \"annotate\" — replace the result with a one-line \
+                            handle back to the full text — is the planned SECOND WRITER over the \
+                            same candidate list the policy already computes before writing \
+                            anything, and any value other than these two (including that one) \
+                            behaves as \"exclude\", the flow that cannot spend a model turn by \
+                            accident. The value actually used is reported in the pass diagnostic."
                 }
             ],
-            "values": { "contextLimit": 100000 }
-        })
+            "values": {
+                "contextLimit": 200000,
+                "modelLimits": "{}",
+                "enabled": true,
+                "minTokens": 200,
+                "safetyTurns": 6,
+                "mode": "summarize"
+            }
+        }),
+        "the row IS the plugin's own metadata beside the values in force"
     );
 
     server.stop().await;
@@ -526,7 +663,11 @@ async fn q_filters_the_catalogue_and_limit_pages_it_like_every_other_collection(
         "a blank filter never filters on the empty substring"
     );
 
-    // A full page always advertises a next page, and the cursor addresses the rest.
+    // A full page always advertises a next page, and the cursor addresses the rest. The catalogue
+    // ships THREE built-ins (`CATALOGUE`), so `limit=1` walks three pages; only the page that
+    // REACHES the total ends the collection, because this route hands `slice_page` a known total
+    // (`api/plugins.rs:69-70`) exactly like `api.ts:2386`'s
+    // `slicePage(filtered, cursor, limit, filtered.length)`.
     let first = list(&server, "limit=1").await;
 
     assert_eq!(first.body["items"].as_array().expect("items").len(), 1);
@@ -542,16 +683,43 @@ async fn q_filters_the_catalogue_and_limit_pages_it_like_every_other_collection(
     assert_eq!(
         page_names(&second.body),
         vec!["context-compaction"],
-        "the second page holds the rest of the collection"
+        "the second page holds the middle row of the three-row catalogue"
     );
-    assert_eq!(second.body["next_cursor"], Value::Null);
 
-    // A cursor PAST the end answers an empty page rather than an error, like every other route. The
-    // token is OPAQUE, so the fixture issues it through the crate's own encoder rather than spelling
-    // a base64url string by hand.
+    let cursor = second.body["next_cursor"]
+        .as_str()
+        .expect("an exactly-full page that has NOT reached the known total still carries a cursor")
+        .to_owned();
+
+    // The token is OPAQUE, so the fixture states what it must be through the crate's OWN encoder:
+    // two of three rows served, so the cursor addresses ordinal 2 of THIS epoch.
     let epoch = second
         .header(&EPOCH_HEADER)
         .expect("the page stamps the epoch its cursor was issued for");
+
+    assert_eq!(
+        cursor,
+        typecrate_harness::paging::encode_cursor(&epoch, 2),
+        "page two of a three-row catalogue advertises ordinal 2, not the end"
+    );
+
+    let third = list(&server, &format!("limit=1&cursor={cursor}")).await;
+
+    assert_eq!(
+        page_names(&third.body),
+        vec!["context-trimmer"],
+        "the cursor of page two addresses the last row of the catalogue"
+    );
+    assert_eq!(
+        third.body["next_cursor"],
+        Value::Null,
+        "the page that reaches the known total ENDS the collection instead of advertising an \
+         empty fourth page"
+    );
+
+    // A cursor PAST the end answers an empty page rather than an error, like every other route. The
+    // token is OPAQUE, so the fixture issues it through the crate's own encoder rather than spelling
+    // a base64url string by hand (`epoch` is the one already read above - the same page family).
     let beyond = typecrate_harness::paging::encode_cursor(&epoch, 9);
     let past = list(&server, &format!("limit=1&cursor={beyond}")).await;
 
@@ -1077,18 +1245,24 @@ async fn every_malformed_patch_says_exactly_what_was_wrong_and_changes_nothing()
         "the unknown key that arrived FIRST is the one named"
     );
 
-    // 4b. One bad key inside an otherwise valid patch refuses the WHOLE patch.
+    // 4b. One bad key inside an otherwise valid patch refuses the WHOLE patch. The bad key is an
+    // INVENTED one: `enabled` can no longer play that role, because the reserved switch key is part
+    // of the EFFECTIVE allowlist for EVERY plugin (`plugins.rs:1135-1138`, TS `plugins.ts:560`
+    // `effectiveSettingsOf`) and `context-compaction` additionally DECLARES it
+    // (`context-compaction.plugin.ts:419`) - `{settings:{contextLimit:5000, enabled:true}}` is
+    // therefore a VALID patch and answers 200, which is the sentence the message below already
+    // states by listing `enabled` among the allowed settings.
     let mixed = patch_settings(
         &server,
         "context-compaction",
-        json!({ "contextLimit": 5000, "enabled": true }),
+        json!({ "contextLimit": 5000, "maxTokens": 1 }),
     )
     .await;
 
     assert_eq!(mixed.status, StatusCode::BAD_REQUEST);
     assert_eq!(
         mixed.message(),
-        "Unknown setting \"enabled\" for plugin \"context-compaction\". Allowed settings: contextLimit, modelLimits, enabled, \
+        "Unknown setting \"maxTokens\" for plugin \"context-compaction\". Allowed settings: contextLimit, modelLimits, enabled, \
          minTokens, safetyTurns, mode."
     );
     assert_eq!(

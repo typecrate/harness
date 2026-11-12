@@ -24,7 +24,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde_json::{Map, Value, json};
+use serde_json::{Map, json};
 
 use typecrate_harness::contract::HarnessMessage;
 use typecrate_harness::plugin::async_ping::{
