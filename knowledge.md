@@ -763,7 +763,8 @@ labels the invocation join provides.
   (`result::bound_tool_result`; `tests/tools.rs::an_oversized_result_becomes_the_named_budget_envelope`).
 * `TurnInput::transcript` is the conversation and `system_instruction` is projected on EVERY request
   and never stored; a transcript that already leads with a system entry is left alone
-  (`turn::Run::request_messages`). `max_iterations: 0` means "use the library default" (16), the
+  (`turn::Run::request_messages`). `max_iterations: 0` means "use the library default"
+  (`u64::MAX` — no limit, since the count guard is an optional safeguard), the
   steering receiver must be drained to empty when the run settles, and a run that does not succeed
   returns the ORIGINAL transcript because the store REPLACES the conversation with the result.
 * The projector must be folded exactly once per recorded event, in order, and settled once at the

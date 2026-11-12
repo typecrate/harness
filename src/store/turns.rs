@@ -63,9 +63,9 @@ use crate::store::{
     session::validate_input, turn_key,
 };
 
-/// `PRESET_MAX_ITERATIONS` (`harnesses/toolbox.ts:103`): the tool-loop budget every profiled harness
-/// runs with.
-pub const PRESET_MAX_ITERATIONS: u64 = 1000;
+/// `PRESET_MAX_ITERATIONS` (`harnesses/toolbox.ts`): the tool-loop budget every profiled harness
+/// runs with — uncapped, because the count guard is an optional safeguard rather than policy.
+pub const PRESET_MAX_ITERATIONS: u64 = u64::MAX;
 
 /// `A session cannot queue more than 100 pending tasks.` (`sessions.ts:8556-8561`).
 pub const PENDING_CAP_MESSAGE: &str = "A session cannot queue more than 100 pending tasks.";

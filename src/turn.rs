@@ -53,9 +53,10 @@ use crate::transport::{OpenAiClient, StreamEvent, TransportError};
 pub const MAX_RETRIES: u64 = 10;
 /// `agent.ts:212` `DEFAULT_RETRY_BASE_DELAY_MS`.
 pub const RETRY_BASE_DELAY_MS: u64 = 1_000;
-/// `harness.ts:425` `DEFAULT_MAX_ITERATIONS`, the library's runaway guard. The store hands
-/// the live budget (`PRESET_MAX_ITERATIONS = 1000`) in `TurnInput::max_iterations`.
-pub const DEFAULT_MAX_ITERATIONS: u64 = 16;
+/// `harness.ts` `DEFAULT_MAX_ITERATIONS`, the OPTIONAL runaway guard: `u64::MAX` means
+/// NO LIMIT, which is the library default and what the store hands in
+/// (`PRESET_MAX_ITERATIONS`, also uncapped). A host that names a finite count opts back in.
+pub const DEFAULT_MAX_ITERATIONS: u64 = u64::MAX;
 /// The agent name a Rust turn reports. TypeScript names the ENTRY agent; the
 /// [`TurnInput`] seam carries no agent name, so the turn's own root flow answers for the
 /// primary agent (`knowledge.md`, "the agent-name seam").

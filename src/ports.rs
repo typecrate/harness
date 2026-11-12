@@ -97,7 +97,8 @@ pub struct TurnInput {
     /// keeps `actionRequest` unregistered in TS (`src/harness.ts`: presence registers the tool).
     pub action_host: Option<Arc<dyn ActionHost>>,
     pub task_host: Option<Arc<dyn TaskHost>>,
-    /// The tool-loop budget (`harnesses/toolbox.ts:103` `PRESET_MAX_ITERATIONS = 1000`).
+    /// The tool-loop budget (`harnesses/toolbox.ts` `PRESET_MAX_ITERATIONS`) — `u64::MAX` is
+    /// "no limit", which is what the store hands in; `0` falls back to the library default.
     pub max_iterations: u64,
 }
 

@@ -1193,7 +1193,9 @@ async fn a_recorded_transcript_continues_the_conversation() {
 
 #[tokio::test]
 async fn a_zero_iteration_budget_falls_back_to_the_library_default() {
-    assert_eq!(DEFAULT_MAX_ITERATIONS, 16);
+    // The library default is NO LIMIT: the optional safeguard is off unless a host names
+    // a finite count.
+    assert_eq!(DEFAULT_MAX_ITERATIONS, u64::MAX);
 
     let finished = run(
         Case {

@@ -121,8 +121,9 @@ pub const DEFAULT_SESSION_LIMIT: usize = 64;
 /// an hour-long run must not lose all of its events when the process dies.
 pub const CHECKPOINT_INTERVAL_MS: u64 = 2_500;
 
-/// Tool-loop budget (`harnesses/toolbox.ts:103 PRESET_MAX_ITERATIONS = 1000`).
-pub const PRESET_MAX_ITERATIONS: u64 = 1_000;
+/// Tool-loop budget (`harnesses/toolbox.ts PRESET_MAX_ITERATIONS`) — uncapped: the count
+/// guard is an optional safeguard, and no shipped harness arms it.
+pub const PRESET_MAX_ITERATIONS: u64 = u64::MAX;
 
 /// The `tool` entry a slash command result rides on (`core/command.ts COMMAND_TOOL_NAME`).
 pub const COMMAND_TOOL_NAME: &str = "command";
