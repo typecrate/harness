@@ -349,10 +349,13 @@ impl ToolRuntime for ToolRegistry {
             .collect()
     }
 
-    /// Every row the SERVER lists, in the order `GET /tools` emits them. The four
-    /// `listed: false` runtime rows are withheld exactly as `tools/descriptors.ts:290-328`
-    /// withholds them from `RUNTIME_DESCRIPTORS`; they stay resolvable through
-    /// [`catalogue::find`] for the session toolbox and the execution dispatch.
+    /// Every row the SERVER lists, in the order `GET /tools` emits them. The four rows withheld
+    /// here are the `listed: false` rows this table carries at `tool-manifest.ts:1446, 2265, 2379,
+    /// 2410`, exactly as `tools/descriptors.ts:290-328` withholds TS's five such runtime names from
+    /// `RUNTIME_DESCRIPTORS` - the fifth, `threadDelete` (`:2219`), has no row here at all, see
+    /// `catalogue`'s header. `search`/`fetch` also carry the flag in the manifest and stay listed,
+    /// in this build and in TS, whose server re-appends them through their own factories. They stay
+    /// resolvable through [`catalogue::find`] for the session toolbox and the execution dispatch.
     fn summaries(&self) -> Vec<ToolSummary> {
         catalogue::listed_entries()
             .map(|entry| self.summary_of(entry))
@@ -361,7 +364,9 @@ impl ToolRuntime for ToolRegistry {
 
     /// Every row of the generated table, which is what a SESSION toolbox walks: TS's
     /// `sessionToolRowsOf` reads the live harness registry (`api-reads.ts:831-836`), and that
-    /// registry holds the four `listed: false` capability rows.
+    /// registry holds the withheld rows as well - FIVE names in TS (`tool-manifest.ts:1446, 2219,
+    /// 2265, 2379, 2410`), four of which exist as rows here, because `threadDelete` was never
+    /// ported.
     fn catalogue_summaries(&self) -> Vec<ToolSummary> {
         ENTRIES.iter().map(|entry| self.summary_of(entry)).collect()
     }
@@ -883,8 +888,12 @@ mod tests {
         });
         let summaries = registry.summaries();
 
-        // The LISTED set is the TS page: 36 rows minus the four the manifest marks
-        // `listed: false` (`tool-manifest.ts:1002, 1046, 1692, 1811`).
+        // The LISTED set is the TS page: 36 rows minus the four `listed: false` rows THIS table
+        // carries (`toolCancel`, `threadSend`, `threadRead`, `threadList` at
+        // `tool-manifest.ts:1446, 2265, 2379, 2410`). TS withholds FIVE runtime names with that
+        // flag - the fifth is `threadDelete` (`tool-manifest.ts:2219`) - and this build mirrors
+        // four because `threadDelete` has no row here at all (no `Entry`, no `UNLISTED` member, no
+        // execution arm), so the counts differ by that one unported name rather than by drift.
         assert_eq!(summaries.len(), ENTRIES.len() - UNLISTED_EXPECTED.len());
         assert_eq!(ENTRIES.len(), 36);
         assert_eq!(summaries[0].name, "toolRegistry");
@@ -980,8 +989,12 @@ mod tests {
         assert_eq!(registry.catalogue_summaries().len(), ENTRIES.len());
     }
 
-    /// The manifest's `listed: false` runtime rows, restated here so the test names the same set
+    /// The four withheld names that exist as rows in this table (`toolCancel`, `threadSend`,
+    /// `threadRead`, `threadList`), restated here so the test names the same set
     /// `catalogue::UNLISTED` does (a drift between the two is a catalogue bug worth failing on).
+    /// The manifest marks FIVE runtime names `listed: false` - `tool-manifest.ts:1446, 2219, 2265,
+    /// 2379, 2410` - and this list carries four because the fifth, `threadDelete` (`:2219`), was
+    /// never ported as a row (see `catalogue::UNLISTED`'s doc).
     const UNLISTED_EXPECTED: [&str; 4] = ["toolCancel", "threadSend", "threadRead", "threadList"];
 
     #[test]

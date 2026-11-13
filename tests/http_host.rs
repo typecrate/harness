@@ -1851,12 +1851,15 @@ async fn the_tool_read_carries_the_catalogue_the_filters_and_the_gate() {
     assert_eq!(
         summaries.len(),
         32,
-        "the LISTED catalogue: 36 generated rows minus the four `listed: false` runtime rows \
-         (`tool-manifest.ts:1002, 1046, 1692, 1811`)"
+        "the LISTED catalogue: 36 generated rows minus the four `listed: false` rows this table \
+         carries (`tool-manifest.ts:1446, 2265, 2379, 2410`) - TS withholds FIVE runtime names \
+         with that flag, the fifth being `threadDelete` (`:2219`), which has no row here at all"
     );
 
-    // T7b: the four unlisted rows are absent from the page and from the identified read, exactly
-    // as `tools/descriptors.ts:290-328` withholds them from `RUNTIME_DESCRIPTORS`.
+    // T7b: the four unlisted ROWS are absent from the page and from the identified read, exactly
+    // as `tools/descriptors.ts:290-328` withholds them from `RUNTIME_DESCRIPTORS`. `threadDelete`
+    // is the fifth withheld name in TS and is not exercised here, because it is absent from this
+    // table entirely rather than withheld by it (`catalogue::UNLISTED`'s doc).
     for withheld in ["toolCancel", "threadSend", "threadRead", "threadList"] {
         assert!(
             !summaries.iter().any(|row| row.name == withheld),

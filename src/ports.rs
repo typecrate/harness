@@ -149,9 +149,11 @@ pub struct ToolExecOutcome {
 /// the CURRENT policy enables belong in a request.
 pub trait ToolRuntime: Send + Sync {
     fn declarations(&self, policy: &ToolPolicy) -> Vec<contract::ToolDecl>;
-    /// The rows the GLOBAL `/tools` surface lists. The four runtime rows the manifest marks
-    /// `listed: false` are withheld here, exactly as `tools/descriptors.ts:290-328` withholds them
-    /// from `RUNTIME_DESCRIPTORS` (`api.test.ts:133-165`'s `TOOL_NAMES` has no `toolCancel`).
+    /// The rows the GLOBAL `/tools` surface lists. The four `listed: false` rows this crate
+    /// carries (`tool-manifest.ts:1446, 2265, 2379, 2410`) are withheld here, exactly as
+    /// `tools/descriptors.ts:290-328` withholds TS's five such runtime names - the fifth,
+    /// `threadDelete` (`:2219`), has no row here at all, so there is nothing here to withhold
+    /// (`api.test.ts:133-165`'s `TOOL_NAMES` has no `toolCancel`).
     fn summaries(&self) -> Vec<contract::ToolSummary>;
     /// EVERY row, listed or not (`tools/catalogue::find`'s own set). A SESSION toolbox shows them:
     /// TypeScript's `sessionToolRowsOf` reads the live harness registry

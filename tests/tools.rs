@@ -190,14 +190,28 @@ fn the_catalogue_lists_every_group_in_the_published_order() {
         rows.len(),
         32,
         "every LISTED runtime, preset, harness and web row: the 36 generated rows minus the four \
-         the manifest marks `listed: false` (`tool-manifest.ts:1002, 1046, 1692, 1811`)"
+         `listed: false` rows this table carries (`tool-manifest.ts:1446, 2265, 2379, 2410`) - TS \
+         withholds FIVE runtime names with that flag, the fifth being `threadDelete` (`:2219`), \
+         which has no row here at all"
     );
     assert_eq!(names.len(), 32);
     assert_eq!(rows[0].name, "toolRegistry");
     assert_eq!(names[0], "toolRegistry");
 
-    // T7b: the four unlisted runtime rows are absent from the listing.
-    for withheld in ["toolCancel", "threadSend", "threadRead", "threadList"] {
+    // T7b: the unlisted runtime names are absent from the listing. The first four ARE rows in
+    // `ENTRIES` and are withheld by `catalogue::UNLISTED`; `threadDelete` is the fifth name the
+    // manifest marks `listed: false` (`tool-manifest.ts:2219`) and is absent here for the OTHER
+    // reason - it was never ported as a row at all. That is the port-owner decision recorded once
+    // in `README.md`'s "Tool catalogue" parity row (`README.md:145`); this line pins only the
+    // observable half (the listing never carries the name), so pinning it does not pre-decide the
+    // row.
+    for withheld in [
+        "toolCancel",
+        "threadSend",
+        "threadRead",
+        "threadList",
+        "threadDelete",
+    ] {
         assert!(
             !names.contains(&withheld),
             "`{withheld}` is `listed: false` in the manifest, so the server does not advertise it"

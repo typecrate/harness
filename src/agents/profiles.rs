@@ -49,23 +49,23 @@ pub struct AgentProfileDef {
 }
 
 /// Tools outside the declaration list are searchable, not missing
-/// (`agents/guidelines.ts:45-46` `DISCOVERY_GUIDELINE`).
+/// (`agents/guidelines.ts:61-62` `DISCOVERY_GUIDELINE`).
 pub const DISCOVERY_GUIDELINE: &str = "Your declared tool list is not the whole catalogue: call toolRequest (exact names, a regex, or capability tags) to enable a searchable tool before concluding a capability is missing.";
 
 /// Web access is asymmetric, and only the prompt can say so honestly
-/// (`agents/guidelines.ts:59-60` `WEB_SEARCH_GUIDELINE`).
+/// (`agents/guidelines.ts:75-76` `WEB_SEARCH_GUIDELINE`).
 pub const WEB_SEARCH_GUIDELINE: &str = "search is declared only when the host configured a web-search key; when it is not declared, say so instead of inventing sources. fetch is declared without a key, and download is searchable under \"web\" or \"url\".";
 
 /// One wording for all five real roles: correct for a primary, a subagent, and a lone agent
-/// (`agents/guidelines.ts:63-64` `DELEGATION_GUIDELINE`).
-pub const DELEGATION_GUIDELINE: &str = "If you are the primary agent and this harness configures subagents, delegate is declared to you: give ONE target a self-contained brief (a subagent never sees this conversation) and verify its answer. A subagent never receives delegate and cannot delegate further; otherwise do the work yourself.";
+/// (`agents/guidelines.ts:101-102` `DELEGATION_GUIDELINE`).
+pub const DELEGATION_GUIDELINE: &str = "When you delegate, give ONE target a self-contained brief because a subagent never sees this conversation and every delegation starts a NEW one, verify its answer before relying on it, and continue a child you already used with threadSend on the threadId it returned rather than assuming it remembers the last brief.";
 
 /// No sandbox: side effects land on the machine running the harness
-/// (`agents/guidelines.ts:67-68` `PERMISSIONS_GUIDELINE`).
+/// (`agents/guidelines.ts:105-106` `PERMISSIONS_GUIDELINE`).
 pub const PERMISSIONS_GUIDELINE: &str = "File and command tools run unsandboxed with the server process permissions, so inspect before you change anything.";
 
 /// The self-extending escape hatch, one line rather than a tool manual
-/// (`agents/guidelines.ts:73-74` `TOOL_CREATE_GUIDELINE`).
+/// (`agents/guidelines.ts:133-134` `TOOL_CREATE_GUIDELINE`).
 pub const TOOL_CREATE_GUIDELINE: &str = "toolCreate is searchable, not declared: enable it with toolRequest before using it to add a small missing capability to this session.";
 
 /// The general-purpose default agent (`agents/instruct.ts:25-45`).
