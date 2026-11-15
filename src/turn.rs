@@ -6,12 +6,16 @@
 //!     = 10, a doubling wait of `DEFAULT_RETRY_BASE_DELAY_MS * 2^(attempt-1)`, the abort
 //!     boundaries, and the rule that the LAST attempt's own error is the answer
 //!     (`agent.ts:626-669`));
-//!   * `harness.ts:6539-6803` `runAgentCore` - the model-request loop, the
+//!   * `runAgentCore`, `harness.ts:12565-12987` - the model-request loop, the
 //!     `attempt_commit` boundaries, the exhaustion sentence, and the transcript rollback on
 //!     every failure (`brain.messages.splice(commitIndex)`);
-//!   * `harness.ts:5144-5177` `launchToolCall` - the per-call event pair and the validation
+//!     DATED 2026-11-15: that rollback is the rule the TypeScript source of truth USED to
+//!     follow, and it is the one fact in this header that no longer matches it. The upstream
+//!     package changed it the same day (see rule 2 below, and
+//!     upstream issue 0036, now closed).
+//!   * `launchToolCall`, `harness.ts:9747-10201` - the per-call event pair and the validation
 //!     refusals;
-//!   * `harness.ts:4960-5097` `deliverTask` - the tool-result projection this module mirrors
+//!   * `deliverTask`, `harness.ts:9080-9381` - the tool-result projection this module mirrors
 //!     (`outcome` decides `isError`, the span is reported only for a call that EXECUTED).
 //!
 //! THE TWO COMMIT RULES THAT MATTER MOST
@@ -28,6 +32,20 @@
 //!      transcript, because the store REPLACES the conversation's messages with whatever
 //!      comes back (`turns.rs:1143-1159`) - a half-committed failed turn would otherwise
 //!      replay a tool call the provider never completed.
+//!
+//!      DATED 2026-11-15 - TRUE OF THIS CRATE, NO LONGER TRUE OF THE TYPESCRIPT SOURCE.
+//!      `packages/underload/harness` changed this rule on 2026-11-15 (issue 0036, now closed):
+//!      a run that does not conclude AND owns a conversation now RETAINS its committed turns, and
+//!      a tool call left without an answer is closed with one synthesized interrupted tool result
+//!      instead of being spliced away with the rest of the tail. Only a branch / ephemeral run -
+//!      one that owns no conversation - still rolls back there.
+//!
+//!      THIS CRATE STILL IMPLEMENTS THE ROLLBACK ABOVE AND HAS NO `inactive` MODEL: both terminal
+//!      arms of `AgentExecutor::run` hand back the untouched transcript, the store treats an empty
+//!      `messages` vector as "the executor changed nothing", and a thread record carries no
+//!      soft-delete flag and no thread-level stop cause. So a reader who takes these two rules as
+//!      the current TypeScript contract is wrong; the divergence, and exactly what remains
+//!      unported, is recorded in the dated section of this crate's `knowledge.md` (`:668-709`).
 //!
 //! TOOL EXECUTION IS SEQUENTIAL AND IN ORDER. TypeScript launches a message's calls
 //! concurrently through its scheduler; this port runs them one after another, which keeps
@@ -105,9 +123,12 @@ struct Run<'a> {
     /// EVERY steer text this run drained from its channel, in arrival order, whether or not the
     /// model has seen it yet.
     ///
-    /// TS keeps the same list as `run.steering` (`harness.ts:6831-6836`): a failure rolls the
-    /// transcript back to `commitIndex`, so guidance that was appended into it is unwound WITH it and
-    /// must be handed to the next run rather than silently consumed. A successful run's list is
+    /// TS keeps the same list as `run.steering` - it is built by `drainThreadQueue`, appending at
+    /// `harness.ts:12452`. WHY this crate hands the list back is CRATE-ONLY: a failure here rolls the
+    /// transcript back to `commitIndex`, so guidance appended into it is unwound WITH it and must go
+    /// to the next run rather than be silently consumed. TypeScript dropped that reason on 2026-11-15
+    /// (issue 0036) - it retains the tail, the drained text survives inside it, and the queue is
+    /// simply cleared (`run.steering = []`, `harness.ts:12953-12961`). A successful run's list is
     /// dropped with the run.
     delivered: Vec<String>,
 }
@@ -183,7 +204,9 @@ async fn run_turn(mut input: TurnInput) -> TurnOutcome {
     };
 
     // `start` FIRST: the store's contract is that the first turn's start predates a watcher
-    // attached just after submission (`harness.ts:6835-6836`).
+    // attached just after submission. This is the CRATE's own ordering contract; no TypeScript line
+    // anchor is restated, because the TypeScript side binds its run to the conversation elsewhere
+    // (`runThreadId`, `harness.ts:13409`) rather than through this call shape.
     run.emit(HarnessEvent::Start {
         agent: PRIMARY_AGENT.to_owned(),
         model: model.clone(),
@@ -229,9 +252,11 @@ async fn run_turn(mut input: TurnInput) -> TurnOutcome {
                     cancelled: true,
                     messages: run.original.clone(),
                     stop_reason: None,
-                    // A STOP discards the guidance by contract (`harness.ts:6831-6835`: the thread is
-                    // stopped and its queue cleared), but it is still REPORTED here so the store can
-                    // decide — it decides not to re-queue.
+                    // A STOP discards the guidance by contract (`stopThreadState`, `harness.ts:6775-6786`:
+                    // the record is marked stopped, its epoch is bumped and `state.queue.length = 0`
+                    // drops the queue at :6786), but it is still REPORTED here so the store can
+                    // decide — it decides not to re-queue. TypeScript keeps the same discard on a
+                    // stop; what it no longer does is re-queue the drained list on a failure.
                     unused_steering: std::mem::take(&mut run.delivered),
                 }
             } else {
@@ -249,9 +274,11 @@ async fn run_turn(mut input: TurnInput) -> TurnOutcome {
                     cancelled: false,
                     messages: run.original.clone(),
                     stop_reason: None,
-                    // R5 preservation: every steer this run drained is rolled back with the
-                    // transcript, so it goes back to the store in arrival order
-                    // (`harness.ts:6826-6837`).
+                    // R5 preservation, HERE ONLY: every steer this run drained is rolled back with the
+                    // transcript, so it goes back to the store in arrival order. TypeScript inverted
+                    // this on 2026-11-15 (issue 0036): the tail is retained, the drained text
+                    // survives inside it, and the queue is cleared instead of re-queued
+                    // (`run.steering = []`, `harness.ts:12953-12961`).
                     unused_steering: std::mem::take(&mut run.delivered),
                 }
             }
@@ -273,7 +300,7 @@ impl Run<'_> {
         let tools: Vec<ToolDecl> = self.input.tools.clone();
 
         loop {
-            // ABORT BOUNDARY (`harness.ts:6557-6560`): no new model request and no tool
+            // ABORT BOUNDARY (`harness.ts:12587`): no new model request and no tool
             // launch once the run is cancelled.
             if self.input.signal.is_cancelled() {
                 return Err(Failure {
@@ -422,8 +449,9 @@ impl Run<'_> {
     /// executor must drain to empty when it settles).
     ///
     /// Whatever is taken is also remembered in [`Run::delivered`], because a later failure rolls the
-    /// transcript back past it and the store has to be able to hand the same text to the next run
-    /// (`harness.ts:6826-6837`).
+    /// transcript back past it and the store has to be able to hand the same text to the next run. The
+    /// TypeScript mirror appends the same texts at `harness.ts:12452` and, since 2026-11-15
+    /// (issue 0036), clears the queue rather than re-queueing them (`harness.ts:12953-12961`).
     fn drain_steering(&mut self) -> Vec<String> {
         let Some(receiver) = self.input.steering.as_mut() else {
             return Vec::new();

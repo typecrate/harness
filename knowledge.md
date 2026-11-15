@@ -665,6 +665,49 @@ table's. `execution` is `{scope: session_required | global, manual: true}` per t
 TS spells the session scope `session_only`, which is the same gate under the contract's enum.
 `testFlaky` (the example harness) is not part of the shared catalogue and is not listed.
 
+### Dated 2026-11-15: four rows were hand-edited, and they now describe behaviour this crate lacks
+
+The TypeScript package shipped IT19 R1-R5 on 2026-11-15 (recorded in upstream
+issue 0036, now closed):
+a cancelled run bound to a conversation KEEPS its committed turns and only a tool call left without
+an answer is closed with a synthesized interrupted result; `threadDelete` MARKS a conversation
+`inactive` (+ `inactiveAt`) instead of destroying it; a stopped record carries `stopReason` as its
+CAUSE; and an agent send now has THREE receipts - `queued` (steering), `started` (continue) and
+`resumed` (continue a run that was cut short). Four catalogue rows here were re-worded to keep the
+prose mirror true: `agentResult`, `delegate`, `threadSend` (description AND `parameters_json`), and
+`threadList`. PROSE ONLY - no row added or removed, and the pinned shape is unchanged
+(`ENTRIES: [Entry; 36]` at `catalogue.rs:103`, `const UNLISTED: [&str; 4]` at `:563`, 36 `name:`
+rows, 32 LISTED at the gateway). The edit was HAND-WRITTEN because the generator the section above
+names (`Temp/typecrate-harness/t4/generate-catalogue.mjs`) is not a checked-in artifact, so
+regeneration is not an available route (the same fact issue 0035 records).
+
+**What this crate still does NOT model, stated so nobody reads the rows as a spec of this runtime:**
+
+- The rollback rule is still the opposite one. `src/turn.rs:30-34` declares that "a run that does
+  not succeed leaves the transcript exactly as it found it", and both terminal arms honour it by
+  returning `messages: run.original.clone()` (`src/turn.rs:253` cancelled, `:275` failed); the store replaces
+  the conversation's messages on that contract (`src/store/turns.rs:1189-1194`, where an empty
+  vector means "the executor changed nothing"). Both arms also carry `stop_reason: None`, so the
+  cause the TypeScript side now stamps has no field to land in here. TypeScript now retains for a
+  thread-bound run and splices only for a branch; this crate splices for both.
+- There is no `inactive` / `inactiveAt` on a thread record and no thread-level `stopReason`. The
+  lifecycle union is `running` / `stopped` / `paused` / `idle` (`src/contract.rs:362-373`, the R7
+  widening), and both readers fold anything unknown to `idle` (`src/store/read.rs:1320-1327`
+  `parse_lifecycle`, `src/api/threads.rs:326-330` `thread_lifecycle_of`), so a soft-deleted
+  conversation and a stop-with-cause have nowhere to live yet.
+- The interrupted-result vocabulary exists ONLY on the restore side: `INTERRUPTED_TOOL_RESULT_TEXT`
+  (`src/persistence.rs:86-90`) and the recovery pass that closes dangling calls
+  (`:2104-2127`). Nothing synthesizes it when a turn is cut short in a live run, because a live run
+  discards its tail instead.
+
+So the four rows are a TypeScript-parity document, not a description of the Rust runtime, and
+closing the gap is a behaviour port (retention + `stopReason` + the soft delete + the third
+receipt), not another wording change. **Verification limit, stated plainly: `cargo` was not run in
+that session**, so the edit is text-verified only - the string literals were re-parsed to confirm
+every `description:` / `parameters_json:` value still terminates where it should and the counts
+above did not move, and no Rust test pins description text anyway
+(`packages/typecrate/services/tests/harness_gateway.rs:626` pins names and counts).
+
 ### Executable here, catalogued only
 
 21 of the 36 rows run: the six file tools, `shell`, `gitDiff`, `syntax`, `toolList`, `toolRequest`,
@@ -1449,7 +1492,7 @@ the LEGACY array" bullet, T5c's "T6's seam" sentence, and T6's shutdown deviatio
    (`SAMPLING_KEYS`) into the body - a server-side knob a client can never supply
    (`transport/openai.ts:126-140`).
 10. **Steering a failed run never consumed goes back to the conversation**
-    (`turn.rs:228`, `:248`, `contract.rs:2913`, `store/turns.rs:1263-1289`). `Run` tracks
+    (`src/turn.rs:253`, `:275`, `contract.rs:2913`, `store/turns.rs:1263-1289`). `Run` tracks
     `delivered`, the mailbox drain hands those texts to the outcome as `TurnOutcome::Failed::unused_steering`,
     and `settle_turn` re-queues them into the conversation's steer mailbox and puts `steer_active` back,
     so the next run reads guidance the user already typed (`sessions.ts:6461-6495`, which re-queues on a
@@ -1836,7 +1879,7 @@ route table moved underneath it.
 reachable through the gateway as soon as the harness crate builds - `cargo check --lib` in that package
 compiles the uplifted harness cleanly. Its own `cargo test` currently fails to BUILD for a reason
 unrelated to T10: the working tree's uncommitted `src/bin/server.rs` has a `match`-arm type error in the
-SIGTERM handler (`Option<()>` vs `()` at `src/bin/server.rs:633-639`). That file is outside this
+SIGTERM handler (`Option<()>` vs `()` at `src/bin/server.rs:633-639` of that day’s tree; the same handler is `src/bin/server.rs:378-414` in the tree today, and this package has not been re-compiled here, so NO claim is made about whether the error still reproduces). That file is outside this
 stage's ownership, so the failure is reported rather than fixed.
 
 ## Contract resync - the published display lane (`ContextBlock.lane`) - 2026-11-11

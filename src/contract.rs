@@ -3377,6 +3377,14 @@ pub struct ToolCall {
 /// `stop_reason` is the final model response's reason (`types/index.ts:182`), retained so a
 /// later stage can tell `tool_calls` (the run was not finished) from `stop` without re-reading
 /// the events. `None` is "the provider never reported one", i.e. a failed or cancelled run.
+///
+/// DATED 2026-11-15: the TypeScript source no longer leaves a non-concluded run without a cause.
+/// Its one non-concluded exit classifies WHY the run stopped (`classifyRunStopReason` upstream)
+/// and keeps that cause on the conversation record beside an `idle` status, so `stopReason` is now
+/// a CAUSE there rather than only a provider field. This crate still answers `None` on every
+/// failure and cancellation arm, and has no thread-level cause field at all - so do not read this
+/// field as mirroring the current TypeScript shape. The dated section of this crate's
+/// `knowledge.md` (`:668-709`) lists what is unported.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnOutcome {
     pub usage: Option<HarnessUsage>,
@@ -3385,14 +3393,23 @@ pub struct TurnOutcome {
     pub messages: Vec<HarnessMessage>,
     pub stop_reason: Option<String>,
     /// Guidance this run DRAINED from its steering channel and then lost, because the run failed or
-    /// was aborted and its transcript was rolled back (`harness.ts:6826-6837`: "R5 preservation:
-    /// steering this run drained is rolled back with the transcript, so hand it to the NEXT host turn
-    /// in its original order").
+    /// was aborted and its transcript was rolled back.
     ///
-    /// Empty on a successful run, where every drained steer reached the model. The store re-queues
-    /// this list onto the conversation's lane unless the run was explicitly stopped
-    /// (`sessions.ts`/`harness.ts` discard it for a stopped thread), which is what keeps guidance a
-    /// user already paid for from vanishing on a provider hiccup.
+    /// DATED 2026-11-15: the TypeScript source this field mirrored is gone. Its comment used to
+    /// read "R5 preservation: steering this run drained is rolled back with the transcript, so hand
+    /// it to the NEXT host turn in its original order", and that sentence no longer exists there -
+    /// `harness.ts:6826-6837` is the thread-stop family now, not the steering hand-back. Upstream
+    /// issue 0036
+    /// (now closed)
+    /// retired the rollback for a conversation-bound run, so the drained steering now survives
+    /// INSIDE the retained transcript and the TypeScript side hands back an empty list in exactly
+    /// that case.
+    ///
+    /// This crate still rolls back, so the behaviour described here is still correct HERE and is no
+    /// longer a mirror of TypeScript: empty on a successful run, where every drained steer reached
+    /// the model, and the store re-queues the list onto the conversation's lane unless the run was
+    /// explicitly stopped. The divergence is listed in the dated section of this crate's
+    /// `knowledge.md` (`:668-709`).
     pub unused_steering: Vec<String>,
 }
 
