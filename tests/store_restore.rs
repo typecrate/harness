@@ -324,7 +324,7 @@ impl Fixture {
     /// only place a key ever comes from (`sessions.ts:1618-1634`).
     fn open(&self, answers: Vec<Scripted>, api_key: &str) -> Store {
         let deployment = HarnessRuntimeSettings {
-            base_url: "http://localhost:5500/providers/private/v1".to_owned(),
+            base_url: "http://localhost:6660/providers/private/v1".to_owned(),
             api_key: api_key.to_owned(),
             model: "merge/ds4-flash".to_owned(),
         };
@@ -338,7 +338,7 @@ impl Fixture {
             Arc::new(FoldFactory),
             Arc::new(HarnessRegistry::shipped(
                 &HarnessRuntimeSettings {
-                    base_url: "http://localhost:5500/providers/private/v1".to_owned(),
+                    base_url: "http://localhost:6660/providers/private/v1".to_owned(),
                     api_key: api_key.to_owned(),
                     model: "merge/ds4-flash".to_owned(),
                 },
@@ -772,7 +772,7 @@ async fn a_running_turn_is_repaired_into_an_error_row_on_restart() {
     let path = fixture.document(&typecrate_harness::store::Store::open(
         StoreConfig::at(&fixture.directory),
         HarnessRuntimeSettings {
-            base_url: "http://localhost:5500/providers/private/v1".to_owned(),
+            base_url: "http://localhost:6660/providers/private/v1".to_owned(),
             api_key: String::new(),
             model: "merge/ds4-flash".to_owned(),
         },
@@ -782,7 +782,7 @@ async fn a_running_turn_is_repaired_into_an_error_row_on_restart() {
         Arc::new(FoldFactory),
         Arc::new(HarnessRegistry::shipped(
             &HarnessRuntimeSettings {
-                base_url: "http://localhost:5500/providers/private/v1".to_owned(),
+                base_url: "http://localhost:6660/providers/private/v1".to_owned(),
                 api_key: String::new(),
                 model: "merge/ds4-flash".to_owned(),
             },
@@ -879,7 +879,7 @@ async fn the_provider_credential_is_never_persisted() {
     assert_eq!(created["session"]["endpoint"]["has_api_key"], json!(true));
     assert_eq!(
         created["session"]["endpoint"]["base_url"],
-        json!("http://localhost:5500/providers/private/v1")
+        json!("http://localhost:6660/providers/private/v1")
     );
 
     // The document on disk has no key field at all - `HarnessSessionSettingsRecord` has no such
@@ -925,7 +925,7 @@ async fn the_provider_credential_is_never_persisted() {
     assert_eq!(restored["session"]["endpoint"]["has_api_key"], json!(false));
     assert_eq!(
         restored["session"]["endpoint"]["base_url"],
-        json!("http://localhost:5500/providers/private/v1"),
+        json!("http://localhost:6660/providers/private/v1"),
         "the session's own endpoint pair is durable even when its credential is not"
     );
     assert_eq!(

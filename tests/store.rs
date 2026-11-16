@@ -804,7 +804,7 @@ impl Drop for Fixture {
 /// the pair the registry tests use.
 fn settings() -> HarnessRuntimeSettings {
     HarnessRuntimeSettings {
-        base_url: "http://localhost:5500/providers/private/v1".to_owned(),
+        base_url: "http://localhost:6660/providers/private/v1".to_owned(),
         api_key: String::new(),
         model: "merge/ds4-flash".to_owned(),
     }

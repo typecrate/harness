@@ -844,7 +844,7 @@ fn config_defaults_match_the_typescript_loader() {
 
     assert_eq!(
         loaded.base_url,
-        "http://localhost:5500/providers/private/v1"
+        "http://localhost:6660/providers/private/v1"
     );
     // The LOCAL basalt model, which is the id the private provider at the default base URL actually
     // serves (`config.ts:105-111`). A hosted `merge/ds4-flash` costs money and `localhost/basalt`
@@ -868,7 +868,7 @@ fn config_defaults_match_the_typescript_loader() {
     assert_eq!(
         defaults,
         contract::ProviderDefaults {
-            base_url: "http://localhost:5500/providers/private/v1".to_string(),
+            base_url: "http://localhost:6660/providers/private/v1".to_string(),
             model: "local/basalt".to_string(),
             has_api_key: false,
         }
@@ -980,19 +980,19 @@ fn config_refusals_are_aggregated_and_prefixed() {
         "{error}"
     );
 
-    // `localhost:5500/v1` looks like a URL but has no authority (`//`), and a scheme without an
+    // `localhost:6660/v1` looks like a URL but has no authority (`//`), and a scheme without an
     // authority can never be a provider endpoint, so this parser refuses it as not absolute.
     // `new URL` would accept it and then fail the http(s) protocol check, so both runtimes
     // refuse it; only the wording differs - see knowledge.md "Deviations".
     let odd_scheme = BTreeMap::from([(
         "HARNESS_BASE_URL".to_string(),
-        "localhost:5500/v1".to_string(),
+        "localhost:6660/v1".to_string(),
     )]);
     assert!(
         config::load_server_config(&odd_scheme)
             .unwrap_err()
             .message
-            .contains("\"localhost:5500/v1\" is not an absolute URL."),
+            .contains("\"localhost:6660/v1\" is not an absolute URL."),
         "odd scheme"
     );
 
@@ -1841,7 +1841,7 @@ fn origin_gates_answer_with_the_contract_messages() {
         origin::check_rest_origin(Some("http://localhost:5173"), Some("127.0.0.1:5000")).is_ok()
     );
     assert!(
-        origin::check_rest_origin(Some("http://127.0.0.1:6000"), Some("127.0.0.1:5000")).is_ok()
+        origin::check_rest_origin(Some("http://127.0.0.1:6660"), Some("127.0.0.1:5000")).is_ok()
     );
     assert!(origin::check_stream_origin(Some("http://[::1]:5180"), Some("0.0.0.0:5000")).is_ok());
     assert!(origin::check_stream_origin(Some("http://::1:5180"), None).is_ok());

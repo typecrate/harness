@@ -95,7 +95,7 @@ impl Drop for Fixture {
 /// The settings a registry test runs with: the shipped defaults, no credential.
 fn settings() -> HarnessRuntimeSettings {
     HarnessRuntimeSettings {
-        base_url: "http://localhost:5500/providers/private/v1".to_string(),
+        base_url: "http://localhost:6660/providers/private/v1".to_string(),
         api_key: String::new(),
         model: "merge/ds4-flash".to_string(),
     }
@@ -170,7 +170,7 @@ fn session_value(id: &str) -> Value {
             "builtin": true,
             "editable": true
         },
-        "settings": { "baseURL": "http://localhost:5500/providers/private/v1", "model": "merge/ds4-flash" },
+        "settings": { "baseURL": "http://localhost:6660/providers/private/v1", "model": "merge/ds4-flash" },
         "title": "  Named conversation  ",
         "status": "idle",
         "createdAt": 1_700_000_000_000_u64,
@@ -235,7 +235,7 @@ fn state_json_round_trips_with_unknown_fields_and_no_credential() {
             "registryNote": "preset unknown field"
         }],
         "deleted": ["  demo  ", "demo"],
-        "globalSettings": { "baseURL": "http://localhost:5500/providers/private/v1", "model": "merge/ds4-flash" },
+        "globalSettings": { "baseURL": "http://localhost:6660/providers/private/v1", "model": "merge/ds4-flash" },
         "sessions": [session_value("session-1")],
         "futureBlock": { "kept": true }
     });
@@ -257,7 +257,7 @@ fn state_json_round_trips_with_unknown_fields_and_no_credential() {
     assert_eq!(
         loaded.global_settings,
         Some(persistence::HarnessGlobalSettingsRecord {
-            base_url: Some("http://localhost:5500/providers/private/v1".to_string()),
+            base_url: Some("http://localhost:6660/providers/private/v1".to_string()),
             model: Some("merge/ds4-flash".to_string()),
             extra: serde_json::Map::new(),
         })
@@ -2922,7 +2922,7 @@ fn config_document_has_the_contract_shape() {
     let environment = std::collections::BTreeMap::from([
         (
             "HARNESS_BASE_URL".to_string(),
-            "http://localhost:5500/v1".to_string(),
+            "http://localhost:6660/v1".to_string(),
         ),
         ("HARNESS_MODEL".to_string(), "merge/test".to_string()),
         (
@@ -2948,7 +2948,7 @@ fn config_document_has_the_contract_shape() {
     assert_eq!(
         body["defaults"],
         json!({
-            "base_url": "http://localhost:5500/v1",
+            "base_url": "http://localhost:6660/v1",
             "model": "merge/test",
             "has_api_key": true,
         })
@@ -2979,7 +2979,7 @@ fn config_document_has_the_contract_shape() {
 
     // `provider_defaults` keeps the key-free rule for a session or a discovery request too.
     let no_key = serde_json::to_value(read::provider_defaults(&HarnessRuntimeSettings {
-        base_url: "http://localhost:5500/v1".to_string(),
+        base_url: "http://localhost:6660/v1".to_string(),
         api_key: "   ".to_string(),
         model: "m".to_string(),
     }))
