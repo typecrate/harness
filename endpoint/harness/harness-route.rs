@@ -63,12 +63,23 @@ pub async fn harness_api(
     typecrate_harness::api::handle_request(state.database_root, request).await
 }
 
-// The one place the three mounts are written. `ANY` has no `axum::routing::MethodFilter`
-// constant, so the `service_routes!` macro routes it through `axum::routing::any` and lists it
-// as the literal `"ANY"` (`packages/typecrate/services/src/server/metadata.rs`); the listing is
-// still generated from these same tokens, so it cannot disagree with the router.
+// The one place the three mounts are written: path first, `ANY` inside that path's handler
+// group. `ANY` has no `axum::routing::MethodFilter` constant, so the `service_routes!` macro
+// routes it through `axum::routing::any` and lists it as the literal `"ANY"`
+// (`packages/typecrate/services/src/server/metadata.rs`); the listing is still generated from
+// these same tokens, so it cannot disagree with the router. No group declares a port, so all
+// three mounts belong to the default listener - the harness owns `/v1/harness` on that one
+// listener, and a second listener would have to declare its own group here.
 crate::service_routes! {
-    ANY "/v1/harness" => harness_root, "Underload harness service document";
-    ANY "/v1/harness/stream" => harness_stream, "Underload harness realtime stream (harness.v1 WebSocket)";
-    ANY "/v1/harness/{*rest}" => harness_api, "Underload harness API resources";
+    "/v1/harness" => {
+        ANY: harness_root, "Underload harness service document";
+    };
+
+    "/v1/harness/stream" => {
+        ANY: harness_stream, "Underload harness realtime stream (harness.v1 WebSocket)";
+    };
+
+    "/v1/harness/{*rest}" => {
+        ANY: harness_api, "Underload harness API resources";
+    };
 }
