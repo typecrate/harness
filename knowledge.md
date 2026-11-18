@@ -1432,8 +1432,11 @@ the REST epoch; the non-upgrade 400; the static-vs-catch-all sentences; prefligh
 `OPTIONS`; the body-cap triangle), one repo-root discovery test, one `ANY` macro test, two gateway-layer
 unit tests, and the 18-row pin of `GET /v1/services/routes` inside
 `tests/server_http.rs` (whose dispatch plan now sends the literal `ANY` verb to the three harness
-rows; that pin is 19 rows and one `port` key ever since the route grammar grew the optional
-`, port:` trailer, which is when the `health` sample started contributing two rows).
+rows; that pin is 23 rows and five `port` keys ever since the route grammar grew the optional
+`, port:` trailer, which is when the `health` sample started contributing two rows; four of those
+`port` keys are the `8800` rows of the provider bridge
+(`packages/typecrate/provider/endpoint/provider/provider-route.rs`), added when the services scan
+picked up that second foreign route tree).
 `cargo check --target
 wasm32-unknown-unknown` still passes: `cargo tree --target wasm32-unknown-unknown` lists `wasm-bindgen`
 and nothing else, which is the proof that the non-wasm path dependency did not leak.
@@ -1615,7 +1618,7 @@ spec is the TS source, and where a fix could not reach the seam it says so.
 | 8 | The usage fold invented a `cached` member and ordered threads by name. | The tally states `{input, output, total}` and preserves FIRST-APPEARANCE thread order; `cached` stays a transport-side figure. | `api-reads.ts`'s usage page builder, `sessions.ts`'s usage fold | `tests/store.rs` / `tests/turn.rs` usage cases |
 | 9 | Several display bounds counted `chars().count()` (code points) where TypeScript counts UTF-16 code units. | `display_chars` is the single UTF-16 measure, used by every preview, notice, tail and block count. | `turn-projector.ts:134-190`, `turn-display.ts:95-99,412-416` (invariant 5) | `tests/foundation.rs::character_figures_are_utf16_code_units`, `tests/data_plane.rs::the_harness_text_bounds_are_measured_in_utf16_units` |
 | 10 | The `typecrate-services` listener never told the harness runtime it was going away, so a live turn stream held the graceful drain open. | `bin/server.rs` runs `typecrate_harness::server::begin_shutdown_all()` as soon as the signal resolves, before axum stops accepting: every cached root's store flips `shuttingDown` and every live stream closes with `1001`. A process that serves no harness root (remote-hosts mode) is unaffected. | `start.ts:319-327`, `sessions.ts:8638` (`dispose`'s `shuttingDown`) | the harness side is pinned by `tests/stream.rs::the_host_shutdown_closes_a_live_stream_with_the_1001_frame`; the services wiring is a one-line hook in the bin |
-| 11 | The playground checker's listing fixture was the pre-T6 fifteen-row table, so it validated a listing the server no longer produces. | `LISTING_JSON` is the listing the server publishes with the three `ANY /v1/harness` rows first; the eight expectations that encoded the fifteen-row order moved with it. It is NINETEEN rows now, not the eighteen this line first recorded: the optional `, port:` trailer added the second `health` row (the one carrying `"port":8010`), and the checker pins that row's listener marker and its composer notice as well. | `tests/server_http.rs::route_table`, `tests/discovery.rs` (R2 sort order) | `yarn vite-node scripts/check-playground.ts` - 137/137 today (122/122 when this row was written) |
+| 11 | The playground checker's listing fixture was the pre-T6 fifteen-row table, so it validated a listing the server no longer produces. | `LISTING_JSON` is the listing the server publishes with the three `ANY /v1/harness` rows first; the eight expectations that encoded the fifteen-row order moved with it. It is TWENTY-THREE rows now, not the nineteen this line first recorded and not the eighteen before that: the optional `, port:` trailer added the second `health` row (the one carrying `"port":8010`), and the provider bridge `packages/typecrate/provider/endpoint/provider/provider-route.rs` then added four `ANY /providers/private/v1/…` rows that all carry `"port":8800` - registered SECOND, between the harness and this package's trees. The checker pins those rows' rail text, the five listener markers in listing order (`port 8800` x4, then `port 8010`), and the ported row's composer notice as well. | `tests/server_http.rs::route_table`, `tests/discovery.rs` (R2 sort order) | `yarn vite-node scripts/check-playground.ts` - 137/137 today (122/122 when this row was written), and 150/150 in `--base http://127.0.0.1:8000` live mode |
 | 12 | `README.md` still described stage T1. | Rewritten as the crate's real manual: layout, commands, the standalone listener's flags and defaults, the environment ladder, the data-root and journal formats, the parity matrix, the full deviation list, and the verification counts. | - | - |
 
 ### Assertions that encoded the old behaviour, and were corrected to the spec
@@ -1744,10 +1747,24 @@ place that knows what this build actually provides.
 15 `projector`, 6 `routes`, 12 `runtime_execution`, 27 `store`, 4 `store_restore`, 21 `stream`,
 24 `tools`, 24 `transport`, 13 `turn`, 1 `worker_execution_http`).
 
-In `packages/typecrate/services`: `cargo fmt -- --check`, `cargo clippy --all-targets --locked --
--D warnings` and `cargo check --locked --target wasm32-unknown-unknown` are clean, `cargo test --locked
---no-fail-fast` is **96 passed, 0 failed** (13 lib, 15 `bin/server`, 1 `api`, 29 `discovery`,
-8 `harness_gateway`, 30 `server_http`), and `yarn vite-node scripts/check-playground.ts` is **122/122**. T7b's
+In `packages/typecrate/services`: `cargo fmt -- --check` and `cargo clippy --all-targets --locked --
+-D warnings` are clean, `cargo test --locked --no-fail-fast` is **146 passed, 0 failed** (37 lib, 26
+`bin/server`, 1 `api`, 29 `discovery`, 8 `harness_gateway`, 6 `logging`, 5 `server_process`, 34
+`server_http`), and `yarn vite-node scripts/check-playground.ts` is **137/137**. The `logging` and
+`server_process` targets, the log-line unit tests inside the lib (`src/logging.rs` and
+`src/server/request_log.rs`, one of which now pins the "a write failure is dropped, not panicked"
+guarantee), and `bin/server`'s ONE behavioural test for it (`the_request_line_is_a_route_layer_fact`)
+are the per-request log line (`tests/logging.rs`, `tests/server_process.rs`): the gateway's
+`Incoming request: [GET] http://host/path` line, which the binary used not to print, plus the
+`tracing` subscriber that makes the compiled-in provider's own events reach a terminal. What the
+other two new `bin/server` functions add (`help_documents_every_line_a_start_prints`,
+`help_lists_every_variable_the_binary_reads`) is `HELP.contains` assertions on documented text - the
+same kind the pre-existing `--help` tests already make - so "3 extra tests" overstates it: one
+behavioural test, two documentation pins. The wasm claim in the paragraph above is **moot rather
+than merely untrue**: this tree removes the wasm target outright (`Cargo.toml` is a native-only
+`crate-type = ["rlib"]`, and `package.json` has no `wasm:check` / `build:wasm` / `verify:wasm`
+left), so `cargo check --target wasm32-unknown-unknown` is never run here at all - "stops inside
+`mio`/`getrandom`" was an intermediate state on the way to that removal. T7b's
 "71 tests with one expected failure" paragraph above is the state AT THAT RUN; the `harness_gateway`
 pin has since moved twice - 35 rows, then the 31 LISTED rows, and now **32 LISTED rows over the 36
 generated** (`packages/typecrate/services/tests/harness_gateway.rs:586-612`), which is what the
