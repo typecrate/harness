@@ -1,0 +1,71 @@
+# Runs this package's test suite on GitHub.
+#
+# WHY THE WORKFLOW LIVES HERE (not in the noobscript monorepo root):
+# packages/typecrate/harness is its own git repository (origin
+# typecrate/harness). Inside the monorepo it is an embedded repo, so the root
+# repository never sees anything under it and a root-level workflow could not
+# trigger on these files; GitHub Actions reads .github/workflows/ from the root
+# of THIS repository only. The sibling typecrate packages ship their own
+# workflows the same way.
+#
+# WHAT RUNS: `npm test`, the package's declared test entry point
+# (`package.json` -> `cargo test`), so CI runs exactly what a developer runs
+# locally. No npm dependency needs installing: the crate has no npm
+# dependencies and resolves its Rust graph from the committed Cargo.lock.
+#
+# CHECKOUT LAYOUT: the crate expects the monorepo position
+# `<repo>/packages/<scope>/<name>`. The tests resolve their scratch root both
+# through `package_root::repo_root()` (src/package_root.rs: nearest ancestor
+# whose package.json declares `workspaces`, else four parents) and through
+# literal `../../../Temp` paths, so the checkout is placed at
+# `packages/typecrate/harness` - the depth both spellings were written for.
+#
+# TOOLCHAIN: noobscript pins 1.99.1 in its root rust-toolchain.toml, which a
+# standalone checkout does not carry (this repository IS the package), so the
+# same version is installed explicitly below.
+
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+jobs:
+    test:
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v5
+              with:
+                  path: packages/typecrate/harness
+
+            - name: Setup Node
+              uses: actions/setup-node@v5
+              with:
+                  node-version: 24
+
+            - name: Install Rust 1.99.1
+              run: |
+                  rustup toolchain install 1.99.1 --profile minimal
+                  rustup default 1.99.1
+
+            - name: Cache cargo
+              uses: actions/cache@v6
+              with:
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      packages/typecrate/harness/target
+                  key: ${{ runner.os }}-cargo-${{ hashFiles('packages/typecrate/harness/Cargo.lock') }}
+                  restore-keys: |
+                      ${{ runner.os }}-cargo-
+
+            - name: Test
+              working-directory: packages/typecrate/harness
+              run: npm test
