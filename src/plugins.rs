@@ -162,7 +162,7 @@ pub static BUILTIN_PLUGINS: [PluginMetadata; 3] = [
     PluginMetadata {
         name: "async-ping",
         title: "Background Ping",
-        description: "Keeps a conversation waiting on background tool work moving by emitting a periodic ping with the calls that are still running, replacing the fixed scheduler heartbeat.",
+        description: "Keeps a conversation waiting on background tool work moving by emitting a periodic ping only while at least one pending call resolves to mode 'async', replacing the fixed scheduler heartbeat.",
         version: "1.0.0",
         tags: &["background", "async", "lifecycle"],
         hooks: &[
@@ -182,7 +182,7 @@ pub static BUILTIN_PLUGINS: [PluginMetadata; 3] = [
             max: None,
             step: Some(1000.0),
             description: Some(
-                "How often a still-running background tool is reported while work is pending. Defaults to the historical 10-minute wake.",
+                "How often a conversation is pinged while at least one pending call resolves to mode 'async'. Defaults to the historical 10-minute wake.",
             ),
         }],
     },
