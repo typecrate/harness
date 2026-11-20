@@ -33,7 +33,7 @@ use crate::origin::{ParsedUrl, parse_url};
 
 /// Safe default, kept deliberately (`config.ts:105-106`): today's behaviour, so no existing host
 /// changes shape by upgrading.
-pub const DEFAULT_BASE_URL: &str = "http://localhost:6660/providers/private/v1";
+pub const DEFAULT_BASE_URL: &str = "http://localhost:8800/providers/private/v1";
 /// The default model (`config.ts:105-111`).
 ///
 /// The LOCAL basalt model, which is the id the private provider at [`DEFAULT_BASE_URL`] actually

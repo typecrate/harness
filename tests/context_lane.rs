@@ -335,7 +335,7 @@ impl TurnExecutor for NeverRunsExecutor {
 /// so these only have to be well-formed.
 fn settings() -> HarnessRuntimeSettings {
     HarnessRuntimeSettings {
-        base_url: "http://localhost:6660/providers/private/v1".to_owned(),
+        base_url: "http://localhost:8800/providers/private/v1".to_owned(),
         api_key: "fixture".to_owned(),
         model: "local/basalt".to_owned(),
     }

@@ -205,7 +205,7 @@ type, so a later stage cannot send a misspelled field on those paths.
   `HARNESS_MAX_RETRIES`, `HARNESS_RETRY_DELAY_MS`, `HARNESS_REQUEST_TIMEOUT_MS`.
 - The provider URL is validated at load time (absolute, http/https, <=2048) even though TS only
   validates it when a provider call is built (`transport/models.ts:99-131`). Messages are copied
-  from that function. The parser here is a small one (no `url` crate), so `localhost:6660/v1`
+  from that function. The parser here is a small one (no `url` crate), so `localhost:8800/v1`
   - which `new URL` accepts as the scheme `localhost:` and then refuses for the protocol - is
   refused as "not an absolute URL" instead. Same status, same value named, different sentence.
 - `apply_settings_patch` models the credential rule as the brief states it (moving `base_url` to a
