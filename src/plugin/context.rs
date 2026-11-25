@@ -617,7 +617,10 @@ mod tests {
         let prune = entry.as_prune_entry();
 
         assert_eq!(prune.index, 0);
-        assert!(!prune.included, "the effective unit flag travels, that is the whole point");
+        assert!(
+            !prune.included,
+            "the effective unit flag travels, that is the whole point"
+        );
     }
 
     #[test]

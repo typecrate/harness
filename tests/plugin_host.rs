@@ -27,25 +27,27 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Map, json};
 
 use typecrate_harness::contract::HarnessMessage;
+use typecrate_harness::contract::PluginSettingType;
+use typecrate_harness::plugin::DiagnosticReporter;
 use typecrate_harness::plugin::async_ping::{
-    self, AsyncPingPlugin, arm_decision, interval_of, thread_timer_key, tick_decision,
-    ArmDecision, TickDecision, DEFAULT_PING_INTERVAL_MS, HOOKS, PLUGIN_NAME,
+    self, ArmDecision, AsyncPingPlugin, DEFAULT_PING_INTERVAL_MS, HOOKS, PLUGIN_NAME, TickDecision,
+    arm_decision, interval_of, thread_timer_key, tick_decision,
 };
 use typecrate_harness::plugin::context::{
-    ControlError, ContextEntry, EditPatch, EntryTarget, PluginRuntime, TurnControls,
+    ContextEntry, ControlError, EditPatch, EntryTarget, PluginRuntime, TurnControls,
 };
-use typecrate_harness::plugin::diagnostics::{DiagnosticEvent, DiagnosticKind, RecordingDiagnosticSink, SinkReporter};
+use typecrate_harness::plugin::diagnostics::{
+    DiagnosticEvent, DiagnosticKind, RecordingDiagnosticSink, SinkReporter,
+};
 use typecrate_harness::plugin::event::{
     AsyncLifecycle, Contribution, LifecycleEvent, Payload, TurnBeforePayload, TurnDecision,
     WILDCARD, event_of_name, is_wildcard_deliverable,
 };
-use typecrate_harness::plugin::host::{HostError, Plugin, PluginApi, PluginHost};
 use typecrate_harness::plugin::hooks::{
     HandlerCall, HandlerFailure, HandlerFailureSink, HandlerFuture, HandlerResult, HookBus,
     HookOptions, MaybeSync, budget_error_of, decision_error_of,
 };
-use typecrate_harness::contract::PluginSettingType;
-use typecrate_harness::plugin::DiagnosticReporter;
+use typecrate_harness::plugin::host::{HostError, Plugin, PluginApi, PluginHost};
 use typecrate_harness::plugins::{
     DeclaredDefault, PluginMetadata, PluginSettingDescriptor, PluginSettingsStore,
 };
@@ -171,7 +173,11 @@ async fn dispatches_by_priority_then_registration_order() {
             priority,
             ..owner(name)
         };
-        let name = if label == "d:p-1" { WILDCARD } else { "turn.before" };
+        let name = if label == "d:p-1" {
+            WILDCARD
+        } else {
+            "turn.before"
+        };
 
         bus.on_sync(
             name,
@@ -236,7 +242,10 @@ async fn fans_out_named_handlers_and_wildcards_without_host_state_change() {
 
     assert_eq!(
         seen(&order),
-        vec!["named:host.state_change".to_owned(), "wild:turn.before".to_owned()]
+        vec![
+            "named:host.state_change".to_owned(),
+            "wild:turn.before".to_owned()
+        ]
     );
 }
 
@@ -334,8 +343,12 @@ fn payload_for(event: LifecycleEvent) -> Payload {
 fn expands_a_wildcard_in_the_live_surface() {
     let (bus, _events) = observed_bus();
 
-    bus.on_sync(WILDCARD, |_call: &HandlerCall| Ok(Contribution::nothing()), owner("audit"))
-        .expect("'*' is a subscription form");
+    bus.on_sync(
+        WILDCARD,
+        |_call: &HandlerCall| Ok(Contribution::nothing()),
+        owner("audit"),
+    )
+    .expect("'*' is a subscription form");
 
     let live = bus.live();
 
@@ -367,7 +380,11 @@ fn refuses_an_unknown_event_and_registers_nothing() {
     let (bus, _events) = observed_bus();
 
     let error = bus
-        .on_sync("thread.exploded", |_call: &HandlerCall| Ok(Contribution::nothing()), owner("x"))
+        .on_sync(
+            "thread.exploded",
+            |_call: &HandlerCall| Ok(Contribution::nothing()),
+            owner("x"),
+        )
         .expect_err("an invented event must be refused");
 
     assert_eq!(error.0, "Unknown lifecycle event: thread.exploded.");
@@ -393,7 +410,10 @@ fn refuses_a_budget_that_cannot_be_armed() {
         )
         .expect_err("an un-armable budget must be refused, not treated as unbounded");
 
-    assert_eq!(error.0, "A \"turn.before\" timeoutMs must be a finite number >= 0.");
+    assert_eq!(
+        error.0,
+        "A \"turn.before\" timeoutMs must be a finite number >= 0."
+    );
     assert_eq!(bus.count(LifecycleEvent::TurnBefore), 0);
 
     // `timeoutMs: 0` IS legitimate ("must already be resolved"), and so is the
@@ -485,11 +505,17 @@ async fn re_reads_the_gate_on_every_dispatch() {
 
     enabled.store(false, Ordering::SeqCst);
     bus.emit(LifecycleEvent::TurnBefore, turn_payload()).await;
-    assert!(!calls.load(Ordering::SeqCst), "off before the emit means off for the emit");
+    assert!(
+        !calls.load(Ordering::SeqCst),
+        "off before the emit means off for the emit"
+    );
 
     enabled.store(true, Ordering::SeqCst);
     bus.emit(LifecycleEvent::TurnBefore, turn_payload()).await;
-    assert!(calls.load(Ordering::SeqCst), "the same registration answers again");
+    assert!(
+        calls.load(Ordering::SeqCst),
+        "the same registration answers again"
+    );
 }
 
 /// Rule 9 applied per DELIVERED event, not per registration: a wildcard
@@ -589,8 +615,15 @@ async fn drops_a_handler_that_breaches_its_budget_and_reports_it() {
 
     let round = bus.emit(LifecycleEvent::TurnBefore, turn_payload()).await;
 
-    assert_eq!(round.transcript, None, "the dropped handler contributes nothing");
-    assert_eq!(seen(&order), vec!["after".to_owned()], "the round continues");
+    assert_eq!(
+        round.transcript, None,
+        "the dropped handler contributes nothing"
+    );
+    assert_eq!(
+        seen(&order),
+        vec!["after".to_owned()],
+        "the round continues"
+    );
 
     let dropped = reported(&events);
 
@@ -776,7 +809,11 @@ async fn lets_the_last_dispatched_policy_speak_last_for_the_round() {
 
     bus.on_sync(
         "turn.before",
-        |_call: &HandlerCall| Ok(Contribution::with_decision(TurnDecision::Stop { reason: None })),
+        |_call: &HandlerCall| {
+            Ok(Contribution::with_decision(TurnDecision::Stop {
+                reason: None,
+            }))
+        },
         HookOptions {
             priority: 10,
             ..owner("authoritative-policy")
@@ -815,7 +852,9 @@ async fn composes_a_park_with_another_handlers_transcript() {
     bus.on_sync(
         "turn.before",
         |_call: &HandlerCall| {
-            Ok(Contribution::with_decision(TurnDecision::Pause { reason: None }))
+            Ok(Contribution::with_decision(TurnDecision::Pause {
+                reason: None,
+            }))
         },
         owner("parking"),
     )
@@ -849,20 +888,34 @@ async fn defers_the_round_only_when_a_handler_actually_defers() {
     )
     .expect("a sync registration");
 
-    assert!(bus.emit_maybe_sync(LifecycleEvent::ToolBefore, payload_for(LifecycleEvent::ToolBefore)).is_decided());
+    assert!(
+        bus.emit_maybe_sync(
+            LifecycleEvent::ToolBefore,
+            payload_for(LifecycleEvent::ToolBefore)
+        )
+        .is_decided()
+    );
 
     let (bus, _events) = observed_bus();
 
     bus.on_async(
         "tool.before",
-        |_call: Arc<HandlerCall>| -> HandlerFuture { Box::pin(async { Ok(Contribution::nothing()) }) },
+        |_call: Arc<HandlerCall>| -> HandlerFuture {
+            Box::pin(async { Ok(Contribution::nothing()) })
+        },
         owner("async"),
     )
     .expect("an async registration");
 
-    let round = bus.emit_maybe_sync(LifecycleEvent::ToolBefore, payload_for(LifecycleEvent::ToolBefore));
+    let round = bus.emit_maybe_sync(
+        LifecycleEvent::ToolBefore,
+        payload_for(LifecycleEvent::ToolBefore),
+    );
 
-    assert!(!round.is_decided(), "one async handler defers the WHOLE round");
+    assert!(
+        !round.is_decided(),
+        "one async handler defers the WHOLE round"
+    );
     assert_eq!(round.resolve().await, Contribution::nothing());
 }
 
@@ -906,7 +959,10 @@ impl TurnControls for FakeTurn {
         target: &EntryTarget,
         included: bool,
     ) -> Result<(), ControlError> {
-        self.log(&format!("set_reasoning_included({},{included})", target.label()));
+        self.log(&format!(
+            "set_reasoning_included({},{included})",
+            target.label()
+        ));
 
         Ok(())
     }
@@ -976,7 +1032,9 @@ async fn hands_the_round_surface_to_a_turn_before_handler() {
     bus.on_sync(
         "turn.before",
         move |call: &HandlerCall| -> HandlerResult {
-            let controls = call.turn().expect("a turn.before emit WITH a round surface");
+            let controls = call
+                .turn()
+                .expect("a turn.before emit WITH a round surface");
 
             // The LIVE reads are the contract: the estimate and the projected
             // transcript come from the seam, never from the frozen payload.
@@ -992,8 +1050,12 @@ async fn hands_the_round_surface_to_a_turn_before_handler() {
     )
     .expect("a registration");
 
-    bus.emit_with(LifecycleEvent::TurnBefore, turn_payload(), Arc::clone(&turn) as Arc<dyn TurnControls>)
-        .await;
+    bus.emit_with(
+        LifecycleEvent::TurnBefore,
+        turn_payload(),
+        Arc::clone(&turn) as Arc<dyn TurnControls>,
+    )
+    .await;
 
     assert_eq!(turn.writes(), vec!["set_transcript(1)".to_owned()]);
 }
@@ -1421,7 +1483,10 @@ async fn flips_a_live_registration_from_the_stored_override() {
         let mut store = store.lock().expect("the store");
 
         store
-            .update(PLUGIN_NAME, &Map::from_iter([("enabled".to_owned(), json!(false))]))
+            .update(
+                PLUGIN_NAME,
+                &Map::from_iter([("enabled".to_owned(), json!(false))]),
+            )
             .expect("the reserved key is writable on every shipped plugin");
     }
 
@@ -1442,7 +1507,10 @@ async fn flips_a_live_registration_from_the_stored_override() {
         let mut store = store.lock().expect("the store");
 
         store
-            .update(PLUGIN_NAME, &Map::from_iter([("enabled".to_owned(), json!(true))]))
+            .update(
+                PLUGIN_NAME,
+                &Map::from_iter([("enabled".to_owned(), json!(true))]),
+            )
             .expect("the key is writable in both directions");
     }
 
@@ -1477,7 +1545,11 @@ async fn attributes_a_policy_report_to_the_plugin_that_authored_it() {
 
     assert_eq!(records.messages(), vec!["withheld 2 units".to_owned()]);
     assert_eq!(records.kinds(), vec!["policy"]);
-    assert_eq!(records.records()[0].owner, "spy", "the forged owner is overwritten");
+    assert_eq!(
+        records.records()[0].owner,
+        "spy",
+        "the forged owner is overwritten"
+    );
     // A policy report is NOT tied to one hook, so `event` stays absent.
     assert_eq!(records.records()[0].event, None);
 }
@@ -1547,7 +1619,10 @@ async fn holds_no_heartbeat_while_the_switch_is_off() {
     {
         let mut store = store.lock().expect("the store");
         store
-            .update(PLUGIN_NAME, &Map::from_iter([("enabled".to_owned(), json!(false))]))
+            .update(
+                PLUGIN_NAME,
+                &Map::from_iter([("enabled".to_owned(), json!(false))]),
+            )
             .expect("async-ping accepts the reserved key");
     }
 
@@ -1564,7 +1639,10 @@ async fn holds_no_heartbeat_while_the_switch_is_off() {
     {
         let mut store = store.lock().expect("the store");
         store
-            .update(PLUGIN_NAME, &Map::from_iter([("enabled".to_owned(), json!(true))]))
+            .update(
+                PLUGIN_NAME,
+                &Map::from_iter([("enabled".to_owned(), json!(true))]),
+            )
             .expect("the key is writable in both directions");
     }
 
@@ -1584,7 +1662,10 @@ async fn holds_no_heartbeat_while_the_switch_is_off() {
 
     // And the teardown releases it even though the switch is whatever it is.
     bus.fire(LifecycleEvent::HarnessDispose, Payload::Dispose);
-    assert!(ping.armed().is_empty(), "`harness.dispose` clears every heartbeat");
+    assert!(
+        ping.armed().is_empty(),
+        "`harness.dispose` clears every heartbeat"
+    );
 }
 
 fn pending(call_id: &str, name: &str) -> typecrate_harness::plugin::PendingTool {
@@ -1679,7 +1760,9 @@ fn answers_no_facts_through_the_null_handle() {
     // The trait's own default for an unwired filter is "ignore the filter", which
     // is safe because every caller treats empty as "stop".
     assert!(
-        <typecrate_harness::plugin::NullRuntime as PluginRuntime>::async_pending_for(&runtime, None)
-            .is_empty()
+        <typecrate_harness::plugin::NullRuntime as PluginRuntime>::async_pending_for(
+            &runtime, None
+        )
+        .is_empty()
     );
 }

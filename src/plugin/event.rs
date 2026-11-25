@@ -143,7 +143,9 @@ impl LifecycleEvent {
 /// caller turns `None` into that same refusal).
 #[must_use]
 pub fn event_of_name(name: &str) -> Option<LifecycleEvent> {
-    LifecycleEvent::ALL.into_iter().find(|event| event.as_str() == name)
+    LifecycleEvent::ALL
+        .into_iter()
+        .find(|event| event.as_str() == name)
 }
 
 /// What `on(...)` was pointed at: one event, or every deliverable one (`'*'`).
@@ -309,7 +311,10 @@ pub enum Payload {
     Thread(Box<HarnessThreadRecord>),
     /// The record is already purged when this fires, so the payload is the identity a handler
     /// still needs (`types:4231-4233`).
-    ThreadDeleted { thread_id: String, agent: String },
+    ThreadDeleted {
+        thread_id: String,
+        agent: String,
+    },
     RunStarted(RunLifecycle),
     RunFinished {
         run: RunLifecycle,
@@ -391,7 +396,9 @@ impl Contribution {
     #[must_use]
     pub fn with_decision(decision: TurnDecision) -> Self {
         let transcript = match &decision {
-            TurnDecision::Replace { transcript } if !transcript.is_empty() => Some(transcript.clone()),
+            TurnDecision::Replace { transcript } if !transcript.is_empty() => {
+                Some(transcript.clone())
+            }
             _ => None,
         };
 
@@ -406,7 +413,10 @@ impl Contribution {
     /// stays empty, the transcript channel still applies, and the offending value is carried for
     /// the `invalid-decision` diagnostic.
     #[must_use]
-    pub fn invalid_decision(received: serde_json::Value, transcript: Option<Vec<HarnessMessage>>) -> Self {
+    pub fn invalid_decision(
+        received: serde_json::Value,
+        transcript: Option<Vec<HarnessMessage>>,
+    ) -> Self {
         Self {
             transcript,
             decision: None,
@@ -460,7 +470,9 @@ pub fn decision_of_value(value: &serde_json::Value) -> Option<TurnDecision> {
             ))
             .ok()?;
 
-            Some(TurnDecision::Replace { transcript: messages })
+            Some(TurnDecision::Replace {
+                transcript: messages,
+            })
         }
         action @ ("pause" | "stop") => {
             let reason = decision
@@ -486,7 +498,10 @@ mod tests {
 
     #[test]
     fn the_catalogue_is_the_eighteen_events_in_declaration_order() {
-        let names: Vec<&str> = LifecycleEvent::ALL.iter().map(|event| event.as_str()).collect();
+        let names: Vec<&str> = LifecycleEvent::ALL
+            .iter()
+            .map(|event| event.as_str())
+            .collect();
 
         assert_eq!(
             names,
@@ -598,7 +613,9 @@ mod tests {
         assert_eq!(contribution.transcript, Some(replacement.clone()));
         assert_eq!(
             contribution.decision,
-            Some(TurnDecision::Replace { transcript: replacement })
+            Some(TurnDecision::Replace {
+                transcript: replacement
+            })
         );
 
         let paused = Contribution::with_decision(TurnDecision::Pause { reason: None });
@@ -671,7 +688,11 @@ mod tests {
             serde_json::json!({ "action": "halt" }),
             serde_json::json!({ "action": "replace" }),
         ] {
-            assert_eq!(decision_of_value(&value), None, "{value:?} is not a decision");
+            assert_eq!(
+                decision_of_value(&value),
+                None,
+                "{value:?} is not a decision"
+            );
         }
     }
 }

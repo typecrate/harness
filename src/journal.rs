@@ -718,17 +718,15 @@ impl HarnessJournal {
                 std::thread::sleep(Duration::from_millis(*backoff));
             }
 
-            let name = self
-                .file
-                .file_name()
-                .map_or_else(
-                    || HARNESS_JOURNAL_FILE.to_string(),
-                    |name| name.to_string_lossy().into_owned(),
-                );
+            let name = self.file.file_name().map_or_else(
+                || HARNESS_JOURNAL_FILE.to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
 
-            let staging = self
-                .directory
-                .join(format!("{name}.{pid}.{}.tmp", events::now_millis() + u64::try_from(attempt).unwrap_or(attempt as u64)));
+            let staging = self.directory.join(format!(
+                "{name}.{pid}.{}.tmp",
+                events::now_millis() + u64::try_from(attempt).unwrap_or(attempt as u64)
+            ));
 
             let staged = (|| -> Result<(), String> {
                 let mut handle = OpenOptions::new()
@@ -1010,9 +1008,7 @@ fn parse_line(line: &str) -> Result<ParsedLine, String> {
             let index = match object.get("index").and_then(Value::as_u64) {
                 Some(index) => index,
                 None => {
-                    return Err(
-                        "event index is missing or not a non-negative integer".to_string(),
-                    );
+                    return Err("event index is missing or not a non-negative integer".to_string());
                 }
             };
 

@@ -360,7 +360,13 @@ pub async fn get_session_turn_block(ctx: &mut Ctx) -> ApiResult {
         // the guarantee that one segment resolves at most one axis.
         let thought = unit
             .is_none()
-            .then(|| block_thought_of(state, turn_thread_id.as_deref(), block_thought_text(&block, &events, &times).as_deref()))
+            .then(|| {
+                block_thought_of(
+                    state,
+                    turn_thread_id.as_deref(),
+                    block_thought_text(&block, &events, &times).as_deref(),
+                )
+            })
             .flatten();
 
         unit.as_ref()
@@ -767,10 +773,7 @@ fn block_call_id_of(events: &[SessionTurnEvent], block: &Value) -> Option<String
         contract::HarnessEvent::ToolResult {
             call_id: Some(call_id),
             ..
-        } if !call_id.is_empty() =>
-        {
-            Some(call_id.clone())
-        }
+        } if !call_id.is_empty() => Some(call_id.clone()),
         _ => None,
     }
 }
@@ -803,7 +806,9 @@ fn transcript_unit_of_call(messages: &[HarnessMessage], call_id: &str) -> Option
     };
 
     let call_ids: HashSet<&str> = match &messages[owner] {
-        HarnessMessage::Assistant { tool_calls, .. } => tool_calls.iter().map(|call| call.id.as_str()).collect(),
+        HarnessMessage::Assistant { tool_calls, .. } => {
+            tool_calls.iter().map(|call| call.id.as_str()).collect()
+        }
         _ => HashSet::new(),
     };
 
@@ -928,13 +933,11 @@ fn messages_with_reasoning_inclusion(
 /// `HarnessContextEntry.included`: every member on, or it is off (`unitIncludedOf`, `api.ts:1638-1640`).
 fn unit_included_of(messages: &[HarnessMessage], unit: &[usize]) -> bool {
     unit.iter().all(|index| {
-        messages.get(*index).is_some_and(|message| {
-            match message {
-                HarnessMessage::System { included, .. }
-                | HarnessMessage::User { included, .. }
-                | HarnessMessage::Assistant { included, .. }
-                | HarnessMessage::Tool { included, .. } => *included != Some(false),
-            }
+        messages.get(*index).is_some_and(|message| match message {
+            HarnessMessage::System { included, .. }
+            | HarnessMessage::User { included, .. }
+            | HarnessMessage::Assistant { included, .. }
+            | HarnessMessage::Tool { included, .. } => *included != Some(false),
         })
     })
 }
@@ -1040,11 +1043,7 @@ fn block_unit_of(
 /// deltas of one attempt concatenated IN ORDER. The writer closes at every request boundary, so those
 /// bytes are exactly one assistant entry's `reasoning` - the field the flag sits beside. Both the read and
 /// the write resolve through this one function, which is what keeps them from naming different entries.
-fn block_thought_text(
-    block: &Value,
-    events: &[SessionTurnEvent],
-    times: &[u64],
-) -> Option<String> {
+fn block_thought_text(block: &Value, events: &[SessionTurnEvent], times: &[u64]) -> Option<String> {
     if block.get("kind").and_then(Value::as_str) != Some("reasoning") {
         return None;
     }
@@ -1166,7 +1165,8 @@ pub async fn patch_session_turn_block(ctx: &mut Ctx) -> ApiResult {
     // raw bool is what keeps "absent" distinguishable from "asked for `false`" further down, which is
     // exactly the distinction TS draws with `undefined` (`api.ts:4676-4686`).
     let included = has_included.then(|| body["included"].as_bool().unwrap_or(false));
-    let reasoning_included = has_thinking.then(|| body["reasoningIncluded"].as_bool().unwrap_or(false));
+    let reasoning_included =
+        has_thinking.then(|| body["reasoningIncluded"].as_bool().unwrap_or(false));
 
     // The block lookup is the SAME resolver the read runs, so a blank id is 400 and an unknown segment
     // is 404 HERE exactly as they are there - `store.blockDetail` raises both, and both sentences come

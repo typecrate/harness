@@ -166,7 +166,9 @@ pub fn resolve_plugin_list<'a>(
             return Err(HostError::MissingName);
         }
 
-        let Some(existing) = resolved.iter().position(|entry| entry.plugin.metadata().name == name)
+        let Some(existing) = resolved
+            .iter()
+            .position(|entry| entry.plugin.metadata().name == name)
         else {
             resolved.push(ResolvedPlugin { plugin, builtin });
             continue;
@@ -528,8 +530,10 @@ impl PluginHost {
             // every plugin and reports as the framework; a policy report has to name the plugin that
             // made it, or an operator reading one stream cannot tell the compactor's decisions from a
             // host subscription's.
-            let plugin_reporter: Arc<dyn DiagnosticReporter> =
-                Arc::new(AttributedReporter::new(Arc::clone(&reporter), name.to_owned()));
+            let plugin_reporter: Arc<dyn DiagnosticReporter> = Arc::new(AttributedReporter::new(
+                Arc::clone(&reporter),
+                name.to_owned(),
+            ));
 
             let controls: Arc<dyn PluginControls> = Arc::new(ScopedControls {
                 owner: name.to_owned(),

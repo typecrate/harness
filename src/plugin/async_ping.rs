@@ -38,8 +38,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::plugin::context::PluginRuntime;
 use crate::plugin::event::{AsyncLifecycle, Contribution, LifecycleEvent, Payload};
-use crate::plugin::host::{HostError, Plugin, PluginApi};
 use crate::plugin::hooks::{HandlerCall, HandlerResult, HookOptions};
+use crate::plugin::host::{HostError, Plugin, PluginApi};
 use crate::plugins::{self, PluginMetadata};
 
 /// The documented heartbeat, used when neither the setting nor the host config
@@ -268,8 +268,12 @@ impl Plugin for AsyncPingPlugin {
                             .settings()
                             .and_then(|settings| settings.number("intervalMs", fallback));
                         let interval_ms = interval_of(configured.unwrap_or(fallback));
-                        let next =
-                            spawn_heartbeat(handle.clone(), name.clone(), interval_ms, scope.clone());
+                        let next = spawn_heartbeat(
+                            handle.clone(),
+                            name.clone(),
+                            interval_ms,
+                            scope.clone(),
+                        );
                         if let Some(next) = next
                             && let Ok(mut table) = handle.lock()
                         {

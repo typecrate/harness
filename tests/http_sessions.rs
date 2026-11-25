@@ -4923,7 +4923,12 @@ async fn a_context_block_write_switches_the_inclusion_of_the_entry_its_segment_r
     // A tool call, then the answer it was leading to: the transcript ends with the assistant entry that
     // carries the call, the tool result, and the final text, so the unit join has something to find.
     let (base, _script) = provider(vec![
-        tool_turn("call-time", "timeNow", r#"{"timezone":"UTC"}"#, usage(11, 4)),
+        tool_turn(
+            "call-time",
+            "timeNow",
+            r#"{"timezone":"UTC"}"#,
+            usage(11, 4),
+        ),
         answered("the clock reads noon", usage(7, 3)),
     ])
     .await;
@@ -5015,8 +5020,7 @@ async fn a_context_block_write_switches_the_inclusion_of_the_entry_its_segment_r
     assert_eq!(after.json_at("/block/included"), Some(&json!(false)));
 
     let messages = get(&server, &format!("{transcript_path}/messages")).await;
-    let tool_entry = messages
-        .body["items"]
+    let tool_entry = messages.body["items"]
         .as_array()
         .expect("a paged transcript")
         .iter()
@@ -5046,8 +5050,7 @@ async fn a_context_block_write_switches_the_inclusion_of_the_entry_its_segment_r
     let restored_messages = get(&server, &format!("{transcript_path}/messages")).await;
 
     assert_eq!(
-        restored_messages
-            .body["items"]
+        restored_messages.body["items"]
             .as_array()
             .expect("a paged transcript")
             .iter()
@@ -5152,7 +5155,12 @@ async fn a_context_block_write_switches_the_inclusion_of_the_entry_its_segment_r
     // is the first text delta, event 5), and that event carries no call id (`blockCallIdOf`,
     // `api.ts:334-342`), so the block write cannot address an entry through a segment that never named
     // a call.
-    let no_unit = patch_json(&server, &block_path("0-assistant-5"), json!({"included": false})).await;
+    let no_unit = patch_json(
+        &server,
+        &block_path("0-assistant-5"),
+        json!({"included": false}),
+    )
+    .await;
 
     assert_eq!(no_unit.status, StatusCode::CONFLICT);
     assert_eq!(
@@ -5182,7 +5190,12 @@ async fn a_running_conversation_refuses_both_transcript_writes_with_one_sentence
     // (the state TypeScript's guard reads, `sessions.ts:9209-9219`) while the call's segment - and the
     // transcript entry it joins on - already exist.
     let (base, _script) = provider(vec![
-        tool_turn("call-time", "timeNow", r#"{"timezone":"UTC"}"#, usage(11, 4)),
+        tool_turn(
+            "call-time",
+            "timeNow",
+            r#"{"timezone":"UTC"}"#,
+            usage(11, 4),
+        ),
         Answer::Delayed(900, answered_body("held open", usage(7, 3))),
     ])
     .await;
@@ -5210,7 +5223,12 @@ async fn a_running_conversation_refuses_both_transcript_writes_with_one_sentence
     )
     .await;
 
-    assert_eq!(seeded.status, StatusCode::OK, "the seed writes: {}", seeded.body);
+    assert_eq!(
+        seeded.status,
+        StatusCode::OK,
+        "the seed writes: {}",
+        seeded.body
+    );
 
     let running = submit(&server, &id, "the first ask", Some(&thread)).await;
     let turn_id = running.string_at("/turn_id");
@@ -5236,9 +5254,14 @@ async fn a_running_conversation_refuses_both_transcript_writes_with_one_sentence
     )
     .await;
 
-    assert_eq!(status.string_at("/turn/status"), "running", "the run is still up");
+    assert_eq!(
+        status.string_at("/turn/status"),
+        "running",
+        "the run is still up"
+    );
 
-    let expected = format!("Thread \"{thread}\" is running; stop it before replacing its transcript.");
+    let expected =
+        format!("Thread \"{thread}\" is running; stop it before replacing its transcript.");
 
     // THE WHOLE-DOCUMENT WRITE, which would otherwise answer 200 and rewrite the transcript under a run
     // that is appending to it.

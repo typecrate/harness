@@ -592,16 +592,14 @@ impl HookBus {
         body: HandlerBody,
         mut options: HookOptions,
     ) -> Result<u64, RegistrationError> {
-        let target = super::event::subscription_of_name(name)
-            .ok_or_else(|| unknown_event_error(name))?;
+        let target =
+            super::event::subscription_of_name(name).ok_or_else(|| unknown_event_error(name))?;
 
         check_options(name, &options)?;
 
         // An unscoped registration still needs an api: a host-level `on` has no settings view,
         // and `fallback_controls` is the read-only nothing that TS's absent `api` corresponds to.
-        let controls = options
-            .controls
-            .get_or_insert_with(fallback_controls);
+        let controls = options.controls.get_or_insert_with(fallback_controls);
 
         let wildcard = matches!(target, SubscriptionTarget::Wildcard);
         let id = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
@@ -628,7 +626,11 @@ impl HookBus {
 
         match target {
             SubscriptionTarget::Event(event) => {
-                state.by_event.entry(event).or_default().push(Arc::clone(&registration));
+                state
+                    .by_event
+                    .entry(event)
+                    .or_default()
+                    .push(Arc::clone(&registration));
             }
             SubscriptionTarget::Wildcard => state.wildcard.push(Arc::clone(&registration)),
         }
@@ -916,7 +918,12 @@ impl HookBus {
     }
 
     /// [`Self::fire`] with the round's control surface.
-    pub fn fire_with(&self, event: LifecycleEvent, payload: Payload, turn: Option<Arc<dyn TurnControls>>) {
+    pub fn fire_with(
+        &self,
+        event: LifecycleEvent,
+        payload: Payload,
+        turn: Option<Arc<dyn TurnControls>>,
+    ) {
         let snapshot = self.listeners_of(event);
 
         for registration in &snapshot {
@@ -927,7 +934,13 @@ impl HookBus {
                     // `fire` ignores the round result (`hooks.ts:280-283`): the sync caller
                     // cannot consume one. A drop is still reported (rule 8).
                     let outcome = handler(&call);
-                    apply_result(event, registration, outcome, &mut Contribution::nothing(), self.on_handler_error.as_ref());
+                    apply_result(
+                        event,
+                        registration,
+                        outcome,
+                        &mut Contribution::nothing(),
+                        self.on_handler_error.as_ref(),
+                    );
                 }
                 HandlerBody::Async(handler) => {
                     let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
@@ -986,7 +999,11 @@ impl HookBus {
         if !is_wildcard_deliverable(event) {
             // `host.state_change`: an explicit subscriber only, never the wildcard
             // (`hooks.test.ts:695-710`).
-            return if state.ordered && named.len() > 1 { ordered(named) } else { named };
+            return if state.ordered && named.len() > 1 {
+                ordered(named)
+            } else {
+                named
+            };
         }
 
         let wild = gate(&state.wildcard, event);
@@ -996,7 +1013,11 @@ impl HookBus {
         }
 
         if wild.is_empty() {
-            return if state.ordered && named.len() > 1 { ordered(named) } else { named };
+            return if state.ordered && named.len() > 1 {
+                ordered(named)
+            } else {
+                named
+            };
         }
 
         let mut joined = named;
@@ -1013,7 +1034,13 @@ impl HookBus {
         outcome: HandlerResult,
         round: &mut Contribution,
     ) {
-        apply_result(event, registration, outcome, round, self.on_handler_error.as_ref());
+        apply_result(
+            event,
+            registration,
+            outcome,
+            round,
+            self.on_handler_error.as_ref(),
+        );
     }
 }
 
@@ -1045,7 +1072,8 @@ fn deliverable_list(list: Option<&Vec<Arc<Registration>>>, event: LifecycleEvent
         return true;
     }
 
-    list.iter().any(|entry| HookBus::is_deliverable(entry, event))
+    list.iter()
+        .any(|entry| HookBus::is_deliverable(entry, event))
 }
 
 /// Priority order, then registration order, higher priority FIRST (`byPriority`,

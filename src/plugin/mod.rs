@@ -54,8 +54,8 @@ pub mod async_ping;
 // `context_compaction`); see the port plan in this module's header.
 pub mod diagnostics;
 pub mod event;
-pub mod host;
 pub mod hooks;
+pub mod host;
 pub mod settings;
 
 pub use context::{
@@ -68,19 +68,30 @@ pub use diagnostics::{
     SinkReporter, kind_label, now_ms, settings_written_data,
 };
 pub use event::{
-    ALWAYS_DELIVERED, AsyncLifecycle, Contribution, LifecycleEvent, PendingTool, Payload,
+    ALWAYS_DELIVERED, AsyncLifecycle, Contribution, LifecycleEvent, Payload, PendingTool,
     RunLifecycle, SubscriptionTarget, ToolAfterPayload, ToolBeforePayload, TurnAfterPayload,
     TurnBeforePayload, TurnDecision, WILDCARD, decision_of_value, event_of_name,
     is_wildcard_deliverable, subscription_of_name,
 };
-pub use host::{
-    HostError, Plugin, PluginApi, PluginHost, PluginHostReport, ResolvedPlugin, resolve_plugin_list,
-};
 pub use hooks::{
-    HandlerBody, HandlerCall, HandlerFailure, HandlerFuture, HandlerResult, HookBus, HookOptions,
-    MaybeSync, ReporterFailureSink, RoundFuture, budget_error_of, decision_error_of,
+    HandlerBody,
+    HandlerCall,
+    HandlerFailure,
+    HandlerFuture,
+    HandlerResult,
+    HookBus,
+    HookOptions,
+    MaybeSync,
     // The bus's own registration type, aliased so `plugin::Registration` never shadows
     // `plugins::Registration`-style names in a caller that globs both.
-    Registration as HookRegistration, RegistrationError,
+    Registration as HookRegistration,
+    RegistrationError,
+    ReporterFailureSink,
+    RoundFuture,
+    budget_error_of,
+    decision_error_of,
+};
+pub use host::{
+    HostError, Plugin, PluginApi, PluginHost, PluginHostReport, ResolvedPlugin, resolve_plugin_list,
 };
 pub use settings::{MapSettingsProvider, SettingsProvider, SettingsView};

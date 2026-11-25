@@ -22,9 +22,30 @@
 //! contract is easiest to get wrong (the budget envelope's key order, and a branded
 //! envelope leaking `__toolUi` into the text the model reads) are exactly the ones a
 //! shared helper keeps identical for all thirty-five tools.
+//!
+//! THE JSON REFUSAL (F-CUTTER, 2026-11-25)
+//! ---------------------------------------
+//! A stress run proved the head/tail envelope's founding claim wrong for one input class:
+//! a cut JSON DOCUMENT is not that document. Both previews fail to parse (the head ends
+//! inside a string value, the tail starts inside one) and every key that fell into the hole
+//! is simply absent from a message that still reads like an answer - with no cursor to say
+//! anything was omitted. So an over-budget result now splits into TWO outcomes, decided once
+//! in [`bound_with_reason`] (the same single decision point the TS twin uses, which is why
+//! both the per-result cap and the per-turn spill are covered):
+//!   * it PARSES as a JSON document -> REFUSED: the document is discarded, [`BoundedResult`]
+//!     carries `rejected`, `truncated` stays false (nothing was shortened), and the consumer
+//!     ([`completed_outcome`]) reports a FAILED tool result, never `ok: true`;
+//!   * it does not parse (a log, a build output, a truncated write) -> the head/tail envelope
+//!     exactly as before, because for prose both previews are real content.
+//!
+//! Deliberate divergences from the TS twin, both pre-existing and untouched here: this crate
+//! gates on raw UTF-8 bytes (`utf8_byte_length`) where TS gates on serialized payload bytes
+//! (`modelPayloadBytes`), and `MODEL_TOOL_RESULT_BUDGET_BYTES` is 256 KiB here vs TS's 32 KiB.
+//! The RULE is mirrored at this twin's own numbers; aligning the numbers is a separate call.
 
 use std::time::Instant;
 
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::contract::{
@@ -74,15 +95,59 @@ pub fn utf8_byte_length(value: &str) -> usize {
 }
 
 /// The outcome of applying the budget (`result-budget.ts:126` `BoundedToolResult`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Over budget there are TWO outcomes, and `rejected` is the discriminator
+/// (`result-budget.ts:306`, F-CUTTER): a JSON document that does not fit is REFUSED
+/// (`truncated: false`, `rejected` set, `content` the refusal sentence) and anything else is
+/// CUT into the head/tail envelope (`truncated: true`, `rejected` absent). A caller that only
+/// ever reads `content` still delivers the honest sentence; a caller that can classify an
+/// outcome ([`completed_outcome`]) branches on this field.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BoundedResult {
-    /// What goes on the wire: the exact input when it fits, otherwise the envelope.
+    /// What goes on the wire: the exact input when it fits, the envelope when it is cut, or
+    /// the refusal sentence when a document was discarded.
     pub content: String,
-    /// Whether the cap was applied, so a caller (the server, a test) can report it without
-    /// re-measuring the string.
+    /// Whether the cap was APPLIED (a cut), so a caller (the server, a test) can report it
+    /// without re-measuring the string. A refusal is not a cut: the document went whole into
+    /// the hole, so this stays `false` there.
     pub truncated: bool,
     /// The UTF-8 byte length of the input the cap was applied to.
+    #[serde(rename = "originalBytes")]
     pub original_bytes: usize,
+    /// Present ONLY when the result was refused rather than cut
+    /// (`result-budget.ts:316` `rejected`). Skipped by serde when `None` so the wire shape of
+    /// every fitting and every cut result is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected: Option<ToolResultRejection>,
+}
+
+/// Why a result was refused rather than bounded
+/// (`result-budget.ts:322` `ToolResultRejection.reason`, a single-member union today).
+/// `kebab-case` on the wire, so the value is TS's `'oversized-json'`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolResultRejectionReason {
+    /// The content parsed as a JSON document and exceeded the budget that was applied.
+    OversizedJson,
+}
+
+/// Everything a caller needs to report a refusal without re-deriving it and drifting
+/// (`result-budget.ts:322` `ToolResultRejection`): the two sizes, and the exact sentence that
+/// is being delivered in place of the document.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ToolResultRejection {
+    /// Which rule refused it; `oversized-json` is the only rule today.
+    pub reason: ToolResultRejectionReason,
+    /// UTF-8 bytes of the document that was discarded.
+    #[serde(rename = "originalBytes")]
+    pub original_bytes: usize,
+    /// The budget that was applied to it - the per-result cap, or this turn's remaining
+    /// headroom when the aggregate is what the document failed.
+    #[serde(rename = "budgetBytes")]
+    pub budget_bytes: usize,
+    /// The sentence the model reads instead of the document; identical to
+    /// [`BoundedResult::content`], carried here so a host quotes the budget's own wording.
+    pub message: String,
 }
 
 /// The floor for an aggregate spill (`result-budget.ts:96` `SPILL_MIN_BUDGET_BYTES`).
@@ -150,6 +215,92 @@ fn source_phrase(source: Option<&ToolResultSource>) -> String {
         (Some(name), None) => format!("tool '{name}'"),
         (Some(name), Some(call_id)) => format!("tool '{name}' (call {call_id})"),
     }
+}
+
+/// JSON's own whitespace set - space, tab, CR, LF (`result-budget.ts:392`
+/// `isJsonWhitespace`). Scanned BYTE-wise and without allocating a trimmed copy: every
+/// UTF-8 continuation byte is `>= 0x80`, so none of them can collide with these four.
+const fn is_json_whitespace(byte: u8) -> bool {
+    matches!(byte, 0x20 | 0x09 | 0x0a | 0x0d)
+}
+
+/// The characters that can BEGIN a JSON value (`result-budget.ts:396` `startsJsonValue`):
+/// `{`/`[` for containers, `"` for a string, `-` or a digit for a number, and the first
+/// letter of the three literals. Mirrored from the reference rather than narrowed to
+/// `{`/`[`: it is only a PRE-filter, and the parse below is the decision either way.
+const fn starts_json_value(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'{' | b'[' | b'"' | b'-' | b't' | b'f' | b'n' | b'0'..=b'9'
+    )
+}
+
+/// The JSON question, answered once per over-budget result (`result-budget.ts:404`
+/// `isJsonDocument`).
+///
+/// WHY THE CHEAP PRE-FILTER. Parsing is the only reliable test - `serde_json::from_str` is
+/// this port's definition of "is a JSON document", exactly as `JSON.parse` is TS's - but an
+/// over-budget result is often megabytes of build log, and a prose log never parses: its
+/// first non-whitespace byte cannot begin a JSON value. Testing that byte first keeps the
+/// parse off every prose and log delivery, and it is ONLY a filter: whatever survives it
+/// still has to parse, so a brace inside a prose sentence cannot buy a false refusal.
+///
+/// A pathologically nested document (a megabyte of `[`) fails the parse too - here on
+/// serde_json's own 128-level recursion guard, which returns an `Err` instead of overflowing
+/// the stack, the same verdict the reference's `catch` produces - so it keeps the head/tail
+/// envelope rather than crashing or being refused.
+fn is_json_document(content: &str) -> bool {
+    let bytes = content.as_bytes();
+    let mut start = 0;
+
+    while start < bytes.len() && is_json_whitespace(bytes[start]) {
+        start += 1;
+    }
+
+    if start >= bytes.len() || !starts_json_value(bytes[start]) {
+        return false;
+    }
+
+    serde_json::from_str::<Value>(content).is_ok()
+}
+
+/// The refusal sentence (`result-budget.ts:436` `refusalMessage`), worded byte for byte as
+/// the TS twin words it and sharing `spill_note`'s discipline: exact numbers, no
+/// locale-dependent prose, and the address the model can act on. It has to carry four things,
+/// because it is the only thing the model will ever learn about this call:
+///   * that the result is GONE rather than shortened, so a missing field is not read as an
+///     empty one;
+///   * both sizes, so the model can pick an argument set that fits;
+///   * the narrowing that fits (limit / ids / fields) - the actionable half;
+///   * the write-safety warning, because a discarded RESULT does not undo a completed WRITE:
+///     the tool may have committed the change and only its receipt is missing.
+///
+/// Units follow [`spill_note`]: `original_bytes` is UTF-8 bytes of the tool's text, and
+/// `budget_bytes` is the budget that was applied - the aggregate case says out loud that it
+/// was this turn's headroom, so a turn-level squeeze is not read as a second per-result cap
+/// the operator never set.
+fn refusal_message(
+    original_bytes: usize,
+    budget_bytes: usize,
+    reason: SpillReason,
+    aggregate_bytes: Option<usize>,
+    source: Option<&ToolResultSource>,
+) -> String {
+    let cap = match (reason, aggregate_bytes) {
+        (SpillReason::Aggregate, Some(aggregate)) => format!(
+            "against the {budget_bytes} bytes this turn had left of its {aggregate}-byte per-turn cap"
+        ),
+        _ => format!("against a {budget_bytes}-byte budget"),
+    };
+
+    format!(
+        "Tool result too large to deliver: {original_bytes} bytes {cap}. The result was \
+         discarded, not truncated: no part of it reached this transcript. Re-run {} with \
+         narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it. If this \
+         call could have written anything, that write may already be applied \u{2014} re-read \
+         before retrying.",
+        source_phrase(source)
+    )
 }
 
 /// The honest line: what was dropped, which cap did it, and where the rest is
@@ -314,6 +465,10 @@ fn envelope(
 
 /// Shared implementation behind [`bound_tool_result`] and the per-turn ledger
 /// (`result-budget.ts:265` `boundWithReason`).
+///
+/// THIS IS THE SINGLE DECISION POINT for the JSON refusal (F-CUTTER): the per-result cap and
+/// the aggregate spill both come through here, so there is no path in this crate that can
+/// hand a middle-cut JSON document to the model.
 fn bound_with_reason(
     content: &str,
     budget_bytes: usize,
@@ -323,12 +478,45 @@ fn bound_with_reason(
 ) -> BoundedResult {
     let original_bytes = utf8_byte_length(content);
 
-    // Small outputs are EXACT: no re-encoding, no normalization, no marker.
+    // Small outputs are EXACT: no re-encoding, no normalization, no marker. The boundary is
+    // INCLUSIVE, and it stays inclusive for a document: JSON at exactly the budget is a
+    // result, not a refusal.
     if original_bytes <= budget_bytes {
         return BoundedResult {
             content: content.to_owned(),
             truncated: false,
             original_bytes,
+            rejected: None,
+        };
+    }
+
+    // THE JSON RULE (F-CUTTER). A document that parses is a STRUCTURE, and a structure cut in
+    // the middle is not that structure: the head ends inside a value, the tail starts inside
+    // one, and whichever keys fell into the hole are simply absent from a message that still
+    // reads like an answer (the stress probe recorded BOTH previews failing to parse). So the
+    // document is refused rather than sliced, and the caller reports it: `completed_outcome`
+    // turns it into a FAILED tool result, and the manual route answers the same failure shape
+    // it answers every other tool failure with. Everything that does NOT parse keeps the
+    // head/tail envelope exactly as before, because for prose both previews are real content.
+    if is_json_document(content) {
+        let message = refusal_message(
+            original_bytes,
+            budget_bytes,
+            reason,
+            aggregate_bytes,
+            source,
+        );
+
+        return BoundedResult {
+            content: message.clone(),
+            truncated: false,
+            original_bytes,
+            rejected: Some(ToolResultRejection {
+                reason: ToolResultRejectionReason::OversizedJson,
+                original_bytes,
+                budget_bytes,
+                message,
+            }),
         };
     }
 
@@ -386,6 +574,7 @@ fn bound_with_reason(
         content: bounded,
         truncated: true,
         original_bytes,
+        rejected: None,
     }
 }
 
@@ -414,10 +603,16 @@ pub fn bound_tool_result_with_source(
 ///
 /// WHY A LEDGER RATHER THAN A BATCH SCAN: results are committed one at a time as their
 /// calls settle, and a provider request must contain an answer for EVERY call of the block,
-/// so a result can never be refused outright and an already-committed message is never
-/// rewritten behind an event that was already reported. The first results of a turn keep
-/// their per-result size; once the turn's aggregate is spent each later result is spilled
-/// through the SAME envelope at a budget equal to what is left.
+/// so a result is never DROPPED and an already-committed message is never rewritten behind an
+/// event that was already reported. The first results of a turn keep their per-result size;
+/// once the turn's aggregate is spent each later result is spilled through the SAME envelope
+/// at a budget equal to what is left.
+///
+/// "Never dropped" is NOT "never refused" (F-CUTTER): an oversized JSON document that reaches
+/// [`ToolResultTurnBudget::commit`] is refused by the rule inside `bound_with_reason` - one of
+/// the two caps it could not fit - and the refusal sentence is what the ledger books and the
+/// turn delivers. Pairing still holds: the call gets exactly one answer, it is just an honest
+/// one instead of two halves of a broken document.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolResultTurnBudget {
     /// Bytes committed into this turn so far (envelope included, UTF-8).
@@ -491,6 +686,18 @@ impl ToolResultTurnBudget {
         let capped = bound_with_reason(content, requested, SpillReason::Cap, None, source);
         let size = utf8_byte_length(&capped.content);
 
+        // A REFUSAL is never spilled (F-CUTTER). The document is already gone and the sentence
+        // that replaced it IS the delivery; re-cutting that sentence to whatever headroom the
+        // turn had left would trade an actionable error for an envelope about an envelope. It
+        // is booked at its own size, so an oversized JSON result costs the turn a few hundred
+        // bytes instead of its whole (discarded) body - soft-bound past the line like every
+        // other delivery, and the results behind it still fit.
+        if capped.rejected.is_some() {
+            self.committed += size;
+
+            return capped;
+        }
+
         if self.aggregate == 0 || self.committed + size <= self.aggregate {
             self.committed += size;
 
@@ -518,6 +725,10 @@ impl ToolResultTurnBudget {
             Some(self.aggregate),
             source,
         );
+        // A JSON document that fits the PER-RESULT cap but not this turn's headroom is refused
+        // here rather than spilled (the rule lives in `bound_with_reason`, which is why one
+        // decision covers both caps), and what gets booked is the short refusal sentence -
+        // never the bytes of the document that did not fit.
         self.committed += utf8_byte_length(&spilled.content);
 
         spilled
@@ -700,6 +911,18 @@ pub fn media_value(media: &[HarnessAttachment]) -> Value {
 /// The committed form of a SUCCESSFUL tool body: unwrap the envelopes, serialize, bound
 /// to the model budget, and stamp the measured span (`deliverTask`'s `completed`
 /// branch, `harness.ts:5031-5092`).
+///
+/// F-CUTTER - THE DOOR the finding is about: when the budget REFUSED the value (an oversized
+/// JSON document, `rejected` set) the call is a FAILED one, not a completed one. A value that
+/// never reached the model must not be reported as an answer, because `ok` is what every
+/// consumer here derives the outcome from - `turn.rs:673` turns it into
+/// `HarnessToolOutcome::{Completed, Failed}` and the `isError` flag the provider reads, and
+/// `api/session_tools.rs:432` turns it into the route's `ok: false` failure body. Both doors
+/// are automatic once `ok` is honest, so no routing site needs its own JSON check.
+///
+/// The human half survives: `panels` and `media` travel on their own bounded channels, never
+/// as capped text, so a refusal costs the model a document and costs the UI nothing
+/// (`harness.ts:10462-10478`). The measured span is kept too - the call DID run.
 #[must_use]
 pub fn completed_outcome(value: Value, started: Instant) -> ToolExecOutcome {
     let extracted = unwrap_tool_result(value);
@@ -710,8 +933,14 @@ pub fn completed_outcome(value: Value, started: Instant) -> ToolExecOutcome {
     let media = extracted.media.unwrap_or_default();
     let panels = extracted.panels;
 
+    // The refusal sentence is `bounded.content`; the descriptor is the same sentence plus the
+    // two sizes, and `error` quotes the descriptor so the wire's error text is the budget's
+    // own wording rather than a re-derivation of it.
+    let refused = bounded.rejected.is_some();
+    let error = bounded.rejected.map(|rejection| rejection.message);
+
     ToolExecOutcome {
-        ok: true,
+        ok: !refused,
         content: bounded.content,
         panels: panels.map(|entries| {
             Value::Array(
@@ -726,7 +955,7 @@ pub fn completed_outcome(value: Value, started: Instant) -> ToolExecOutcome {
         } else {
             Some(media_value(&media))
         },
-        error: None,
+        error,
         duration_ms: elapsed_millis(started),
     }
 }
@@ -734,6 +963,10 @@ pub fn completed_outcome(value: Value, started: Instant) -> ToolExecOutcome {
 /// The committed form of a FAILED tool body (`deliverTask`'s `failed` branch): the text
 /// the model reads is the wrapped failure, still budgeted, and the measured span is the
 /// run's.
+///
+/// A failure message that is itself an oversized JSON document gets REFUSED by the same rule
+/// (`result-budget.ts:649` `boundErrorMessage`), which only swaps the delivered text for the
+/// refusal sentence; the outcome is already failed, so nothing here has to branch.
 #[must_use]
 pub fn failed_outcome(name: &str, message: &str, started: Instant) -> ToolExecOutcome {
     let bounded = bound_tool_result(
@@ -927,7 +1160,8 @@ mod tests {
             BoundedResult {
                 content: "hello".to_owned(),
                 truncated: false,
-                original_bytes: 5
+                original_bytes: 5,
+                rejected: None
             }
         );
         assert_eq!(
@@ -935,7 +1169,8 @@ mod tests {
             BoundedResult {
                 content: String::new(),
                 truncated: false,
-                original_bytes: 0
+                original_bytes: 0,
+                rejected: None
             }
         );
 
@@ -945,7 +1180,8 @@ mod tests {
             BoundedResult {
                 content: "{\"a\":1}".to_owned(),
                 truncated: false,
-                original_bytes: 7
+                original_bytes: 7,
+                rejected: None
             }
         );
     }
@@ -972,7 +1208,8 @@ mod tests {
             BoundedResult {
                 content: exact.clone(),
                 truncated: false,
-                original_bytes: 100
+                original_bytes: 100,
+                rejected: None
             }
         );
         assert!(bound_tool_result(&"x".repeat(101), 100).truncated);
@@ -999,6 +1236,7 @@ mod tests {
                 ),
                 truncated: true,
                 original_bytes: 1_000,
+                rejected: None,
             }
         );
 
@@ -1069,33 +1307,209 @@ mod tests {
         );
     }
 
-    /// `result-budget.test.ts:126-143`: the reason a head/tail split replaces the old
-    /// mid-string cut - a large `read` answer keeps its opening structure AND its trailing
-    /// continuation fields.
+    /// `result-budget.test.ts:177-211` (F-CUTTER). This REPLACES the old
+    /// `both_ends_of_a_json_document_survive_the_cut` pin, which asserted the behavior this
+    /// rule removed: this very fixture was the one the head/tail split was praised for - a
+    /// `read` page whose opening structure AND trailing `nextLine` were said to survive the
+    /// cut. They did survive, as TEXT, but neither half parses (the head ends inside the
+    /// `content` string, the tail starts inside it) and the 1,398 bytes in the hole were gone
+    /// with no cursor, so the "still valid JSON" claim was about the ENVELOPE and never about
+    /// the document inside it. A structure that does not fit is now REFUSED.
     #[test]
-    fn both_ends_of_a_json_document_survive_the_cut() {
-        let content =
+    fn an_oversized_json_document_is_refused_instead_of_two_broken_halves() {
+        let doc =
             json!({ "files": [{ "path": "a.ts", "content": "q".repeat(2_000) }], "nextLine": 42 })
                 .to_string();
-        let bounded = bound_tool_result_with_source(&content, 1_000, Some(&source("read", "r1")));
-        let envelope = envelope_of(&bounded.content);
 
-        assert_eq!(bounded.original_bytes, utf8_byte_length(&content));
+        assert_eq!(utf8_byte_length(&doc), 2_054);
+
+        // The sentence is TS's `refusalMessage` word for word, at this crate's own numbers:
+        // discarded (not shortened), both sizes, the narrowing that fits, the write-safety
+        // warning, and the address of the call that produced it.
+        let refusal = "Tool result too large to deliver: 2054 bytes against a 1000-byte budget. \
+                       The result was discarded, not truncated: no part of it reached this \
+                       transcript. Re-run tool 'read' (call r1) with narrower arguments (smaller \
+                       limit, fewer ids, narrower fields) to fetch it. If this call could have \
+                       written anything, that write may already be applied \u{2014} re-read before retrying.";
+
+        let bounded = bound_tool_result_with_source(&doc, 1_000, Some(&source("read", "r1")));
+
+        assert_eq!(
+            bounded,
+            BoundedResult {
+                content: refusal.to_owned(),
+                // Nothing was CUT - the document was dropped whole - so the cut marker stays
+                // false and `rejected` is what says what happened.
+                truncated: false,
+                original_bytes: 2_054,
+                rejected: Some(ToolResultRejection {
+                    reason: ToolResultRejectionReason::OversizedJson,
+                    original_bytes: 2_054,
+                    budget_bytes: 1_000,
+                    message: refusal.to_owned(),
+                }),
+            }
+        );
+        // The refusal IS the delivered text, byte for byte, and it is small: 367 bytes for a
+        // page that would have cost the model 2,054.
+        assert_eq!(utf8_byte_length(&bounded.content), 367);
+        assert_eq!(bounded.content, refusal);
+        // NOTHING of the document is delivered: no head, no tail, no half a key.
+        assert!(!bounded.content.contains("nextLine"));
+        assert!(!bounded.content.contains("a.ts"));
+        // Every fact a model needs in order to act, stated in the one string it gets.
+        assert!(bounded.content.contains("discarded, not truncated"));
+        assert!(bounded.content.contains("2054 bytes"));
+        assert!(bounded.content.contains("1000-byte budget"));
+        assert!(bounded.content.contains("Re-run tool 'read' (call r1)"));
         assert!(
-            envelope["content"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("{\"files\":[{\"path\":\"a.ts\",\"content\":\"qq")
+            bounded
+                .content
+                .contains("smaller limit, fewer ids, narrower fields")
         );
         assert!(
-            envelope["tail"]
-                .as_str()
-                .unwrap_or_default()
-                .ends_with("],\"nextLine\":42}")
+            bounded
+                .content
+                .contains("that write may already be applied \u{2014} re-read before retrying")
+        );
+
+        // The descriptor is the published shape: camelCase sizes, the `oversized-json` reason,
+        // and `rejected` absent entirely (not `null`) on the two paths that did not refuse.
+        assert_eq!(
+            serde_json::to_value(bounded.rejected.expect("a descriptor")).expect("serializable"),
+            json!({
+                "reason": "oversized-json",
+                "originalBytes": 2_054,
+                "budgetBytes": 1_000,
+                "message": refusal,
+            })
         );
         assert_eq!(
-            envelope["note"],
-            "Cut 1398 of 2054 bytes from the middle by a 1000-byte cap; kept a 492-byte head and a 164-byte tail. The full text is not in this transcript: re-run tool 'read' (call r1) with narrower arguments to fetch it."
+            serde_json::to_value(&BoundedResult {
+                content: "{\"a\":1}".to_owned(),
+                truncated: false,
+                original_bytes: 7,
+                rejected: None,
+            })
+            .expect("serializable"),
+            json!({ "content": "{\"a\":1}", "truncated": false, "originalBytes": 7 })
+        );
+    }
+
+    /// `result-budget.test.ts:252-270`: the boundary stays INCLUSIVE for a document - JSON at
+    /// exactly the budget is a result, not a refusal - and one byte under, the same document is
+    /// refused, so there is no gap between fitting and refusing. Pinned at a trivial size AND
+    /// at this crate's published 256 KiB cap, which is the number production applies.
+    #[test]
+    fn a_json_document_at_exactly_the_budget_is_delivered_whole() {
+        let small = "{\"ok\":true,\"items\":[1,2,3]}";
+
+        assert_eq!(utf8_byte_length(small), 27);
+        assert_eq!(
+            bound_tool_result(small, 27),
+            BoundedResult {
+                content: small.to_owned(),
+                truncated: false,
+                original_bytes: 27,
+                rejected: None,
+            }
+        );
+        assert_eq!(
+            bound_tool_result_with_source(small, 26, Some(&source("store", "s1"))).rejected,
+            Some(ToolResultRejection {
+                reason: ToolResultRejectionReason::OversizedJson,
+                original_bytes: 27,
+                budget_bytes: 26,
+                message: "Tool result too large to deliver: 27 bytes against a 26-byte budget. \
+                          The result was discarded, not truncated: no part of it reached this \
+                          transcript. Re-run tool 'store' (call s1) with narrower arguments \
+                          (smaller limit, fewer ids, narrower fields) to fetch it. If this call \
+                          could have written anything, that write may already be applied \
+                          \u{2014} re-read before retrying."
+                    .to_owned(),
+            })
+        );
+
+        // The production cap: a document of EXACTLY 262 144 bytes is delivered whole.
+        let exact = format!("{{\"data\":\"{}\"}}", "q".repeat(262_144 - 11));
+
+        assert_eq!(utf8_byte_length(&exact), MODEL_TOOL_RESULT_BUDGET_BYTES);
+        assert_eq!(
+            bound_tool_result(&exact, MODEL_TOOL_RESULT_BUDGET_BYTES),
+            BoundedResult {
+                content: exact.clone(),
+                truncated: false,
+                original_bytes: MODEL_TOOL_RESULT_BUDGET_BYTES,
+                rejected: None,
+            }
+        );
+        assert_eq!(
+            bound_tool_result(&exact, MODEL_TOOL_RESULT_BUDGET_BYTES - 1).rejected,
+            Some(ToolResultRejection {
+                reason: ToolResultRejectionReason::OversizedJson,
+                original_bytes: MODEL_TOOL_RESULT_BUDGET_BYTES,
+                budget_bytes: MODEL_TOOL_RESULT_BUDGET_BYTES - 1,
+                message: "Tool result too large to deliver: 262144 bytes against a 262143-byte \
+                          budget. The result was discarded, not truncated: no part of it reached \
+                          this transcript. Re-run the tool call with narrower arguments (smaller \
+                          limit, fewer ids, narrower fields) to fetch it. If this call could have \
+                          written anything, that write may already be applied \u{2014} re-read \
+                          before retrying."
+                    .to_owned(),
+            })
+        );
+    }
+
+    /// `result-budget.test.ts:272-310`: the rule does NOT apply to a document. A truncated
+    /// write, a stack trace from a JSON service, or a log line that starts with a brace all
+    /// LEAD like JSON and parse as nothing, and for them both previews are real content - which
+    /// is why the byte pre-filter is only a filter and the parse is the decision.
+    #[test]
+    fn text_that_only_looks_like_json_keeps_the_head_tail_envelope() {
+        // A document with its closing brace missing: brace-led, 2,053 bytes, parses as nothing.
+        let doc =
+            json!({ "files": [{ "path": "a.ts", "content": "q".repeat(2_000) }], "nextLine": 42 })
+                .to_string();
+        let broken = doc[..doc.len() - 1].to_owned();
+
+        assert_eq!(utf8_byte_length(&broken), 2_053);
+
+        let cut = bound_tool_result_with_source(&broken, 1_000, Some(&source("read", "r1")));
+
+        assert!(cut.truncated);
+        assert_eq!(cut.rejected, None);
+        assert_eq!(cut.original_bytes, 2_053);
+        assert_eq!(
+            envelope_of(&cut.content),
+            json!({
+                "truncated": true,
+                "originalBytes": 2_053,
+                "budgetBytes": 1_000,
+                "note": "Cut 1397 of 2053 bytes from the middle by a 1000-byte cap; kept a 492-byte head and a 164-byte tail. The full text is not in this transcript: re-run tool 'read' (call r1) with narrower arguments to fetch it.",
+                "content": &broken[..492],
+                "tail": broken[broken.len() - 164..],
+            })
+        );
+
+        // A brace-led log page: the pre-filter cannot answer it, the parser can.
+        let log = format!("{{lead}}\n{}\n{{tail}}", "l".repeat(1_000));
+
+        assert_eq!(utf8_byte_length(&log), 1_014);
+
+        let log_cut = bound_tool_result_with_source(&log, 400, Some(&source("tail", "t1")));
+
+        assert!(log_cut.truncated);
+        assert_eq!(log_cut.rejected, None);
+        assert_eq!(
+            envelope_of(&log_cut.content),
+            json!({
+                "truncated": true,
+                "originalBytes": 1_014,
+                "budgetBytes": 400,
+                "note": "Cut 915 of 1014 bytes from the middle by a 400-byte cap; kept a 74-byte head and a 25-byte tail. The full text is not in this transcript: re-run tool 'tail' (call t1) with narrower arguments to fetch it.",
+                "content": &log[..74],
+                "tail": log[log.len() - 25..],
+            })
         );
     }
 
@@ -1143,6 +1557,7 @@ mod tests {
                 content: content.clone(),
                 truncated: false,
                 original_bytes: utf8_byte_length(&content),
+                rejected: None,
             }
         );
     }
@@ -1199,6 +1614,7 @@ mod tests {
                     .to_owned(),
                 truncated: true,
                 original_bytes: 3,
+                rejected: None,
             }
         );
     }
@@ -1272,7 +1688,8 @@ mod tests {
             BoundedResult {
                 content: "c".repeat(100),
                 truncated: false,
-                original_bytes: 100
+                original_bytes: 100,
+                rejected: None
             }
         );
         assert_eq!(turn.committed_bytes(), 2_035);
@@ -1389,6 +1806,120 @@ mod tests {
         assert_eq!(turn.committed_bytes(), 658);
     }
 
+    /// `result-budget.test.ts:597-627` (F-CUTTER, contract 3): a 1,433-byte JSON page over a
+    /// 1,024-byte per-result cap is REFUSED, and the turn pays the 368 bytes of the sentence -
+    /// not the 1,433 bytes of the body the model never received. One oversized result can no
+    /// longer spend a turn's window, and the results behind it still fit.
+    #[test]
+    fn a_refusal_is_booked_for_the_refusal_never_for_the_discarded_document() {
+        let mut turn = ToolResultTurnBudget::new(2_048, 1_024);
+        let doc = json!({ "ok": true, "records": [{ "id": "x".repeat(1_400) }] }).to_string();
+
+        assert_eq!(utf8_byte_length(&doc), 1_433);
+
+        let refusal = "Tool result too large to deliver: 1433 bytes against a 1024-byte budget. \
+                       The result was discarded, not truncated: no part of it reached this \
+                       transcript. Re-run tool 'store' (call s1) with narrower arguments (smaller \
+                       limit, fewer ids, narrower fields) to fetch it. If this call could have \
+                       written anything, that write may already be applied \u{2014} re-read before retrying.";
+
+        assert_eq!(
+            turn.commit(&doc, Some(1_024), Some(&source("store", "s1"))),
+            BoundedResult {
+                content: refusal.to_owned(),
+                truncated: false,
+                original_bytes: 1_433,
+                rejected: Some(ToolResultRejection {
+                    reason: ToolResultRejectionReason::OversizedJson,
+                    original_bytes: 1_433,
+                    budget_bytes: 1_024,
+                    message: refusal.to_owned(),
+                }),
+            }
+        );
+        // The window was charged the SENTENCE (368), not the document (1,433) and not an
+        // envelope either: a refusal is booked for the refusal.
+        assert_eq!(turn.committed_bytes(), 368);
+
+        // 1,680 of the 2,048-byte window are still there, so the next result arrives whole.
+        assert_eq!(
+            turn.commit(&"c".repeat(100), Some(1_024), Some(&source("gamma", "c3"))),
+            BoundedResult {
+                content: "c".repeat(100),
+                truncated: false,
+                original_bytes: 100,
+                rejected: None,
+            }
+        );
+        assert_eq!(turn.committed_bytes(), 468);
+    }
+
+    /// `result-budget.test.ts:629-660`: the spill case, and the reason the JSON rule sits in
+    /// `bound_with_reason` rather than in `bound_tool_result` - this document FITS its
+    /// 1,024-byte per-result cap (593 bytes), so it reaches the aggregate, where the 512-byte
+    /// spill floor used to hand the model a slice of a JSON value. It is refused instead, and
+    /// the sentence names the TURN's cap rather than inventing a second per-result limit.
+    #[test]
+    fn the_per_turn_spill_refuses_a_json_document_it_used_to_cut() {
+        let mut turn = ToolResultTurnBudget::new(1_400, 1_024);
+
+        // The prose sibling first: it takes the ordinary per-result cut, leaving 432 bytes of
+        // headroom under this test's 1,400-byte aggregate.
+        assert_eq!(
+            utf8_byte_length(
+                &turn
+                    .commit(
+                        &"a".repeat(1_500),
+                        Some(1_024),
+                        Some(&source("alpha", "a1"))
+                    )
+                    .content
+            ),
+            968
+        );
+
+        let doc = json!({ "ok": true, "records": [{ "id": "x".repeat(560) }] }).to_string();
+
+        assert_eq!(utf8_byte_length(&doc), 593);
+        // It fits the PER-RESULT cap on its own - the aggregate is the only thing wrong.
+        assert_eq!(
+            bound_tool_result(&doc, 1_024),
+            BoundedResult {
+                content: doc.clone(),
+                truncated: false,
+                original_bytes: 593,
+                rejected: None,
+            }
+        );
+
+        let refusal = "Tool result too large to deliver: 593 bytes against the 512 bytes this \
+                       turn had left of its 1400-byte per-turn cap. The result was discarded, not \
+                       truncated: no part of it reached this transcript. Re-run tool 'store' (call \
+                       s2) with narrower arguments (smaller limit, fewer ids, narrower fields) to \
+                       fetch it. If this call could have written anything, that write may already \
+                       be applied \u{2014} re-read before retrying.";
+
+        assert_eq!(
+            turn.commit(&doc, Some(1_024), Some(&source("store", "s2"))),
+            BoundedResult {
+                content: refusal.to_owned(),
+                truncated: false,
+                original_bytes: 593,
+                rejected: Some(ToolResultRejection {
+                    reason: ToolResultRejectionReason::OversizedJson,
+                    original_bytes: 593,
+                    // The spill budget (512), attributed to the turn's cap in the sentence -
+                    // never a slice of the document, and never the document's bytes.
+                    budget_bytes: 512,
+                    message: refusal.to_owned(),
+                }),
+            }
+        );
+        // 968 + 411: still INSIDE the 1,400-byte window, and every call still has exactly one
+        // answer, so the pairing rule holds with nothing dropped.
+        assert_eq!(turn.committed_bytes(), 1_379);
+    }
+
     #[test]
     fn both_envelope_orders_unwrap_to_the_same_triple() {
         let attachment = json!({
@@ -1463,6 +1994,64 @@ mod tests {
         assert!(!outcome.ok);
         assert_eq!(outcome.duration_ms, 0);
         assert_eq!(outcome.error.as_deref(), Some("no"));
+    }
+
+    /// F-CUTTER's consumer leg: `harness.ts:10462-10478` (`deliverTask`'s completed branch,
+    /// `outcome = delivered.rejected ? 'failed' : 'completed'`) and `api.ts:684` (the manual
+    /// route answers its ordinary failure shape). This crate stamps that decision in ONE place,
+    /// [`completed_outcome`], and both doors derive from it - `turn.rs:673` turns `ok` into
+    /// `HarnessToolOutcome::Failed` plus the provider's `isError`, and
+    /// `api/session_tools.rs:432` turns it into the route's `ok: false` body - so a refusal can
+    /// no longer reach a provider as `ok: true` with two broken halves.
+    #[test]
+    fn a_refusal_reaches_the_model_as_a_failed_outcome() {
+        // A `read` page 54 bytes over this crate's published 262 144-byte cap.
+        let doc = json!({
+            "files": [{ "path": "a.ts", "content": "q".repeat(MODEL_TOOL_RESULT_BUDGET_BYTES) }],
+            "nextLine": 42,
+        });
+        let outcome = completed_outcome(doc.clone(), Instant::now());
+
+        assert!(!outcome.ok);
+        assert_eq!(
+            outcome.content,
+            "Tool result too large to deliver: 262198 bytes against a 262144-byte budget. \
+             The result was discarded, not truncated: no part of it reached this transcript. \
+             Re-run the tool call with narrower arguments (smaller limit, fewer ids, narrower \
+             fields) to fetch it. If this call could have written anything, that write may \
+             already be applied \u{2014} re-read before retrying."
+        );
+        // The wire's error text IS the refusal sentence (`error` is what rides with `isError`).
+        assert_eq!(outcome.error.as_deref(), Some(outcome.content.as_str()));
+        assert_eq!(outcome.media, None);
+        // Nothing of the document is delivered: no head, no tail, no half a key.
+        assert!(!outcome.content.contains("nextLine"));
+        assert!(!outcome.content.contains("a.ts"));
+
+        // The human half survives: `toolUi` panels ride their own bounded channel, so a refusal
+        // costs the model a document and costs the UI nothing.
+        let panel = json!({
+            "id": "p",
+            "slot": "right",
+            "title": "T",
+            "blocks": [{ "type": "text", "text": "still rendered" }],
+        });
+        let with_panels = completed_outcome(
+            json!({ TOOL_UI_BRAND: [panel.clone()], "content": doc }),
+            Instant::now(),
+        );
+
+        assert!(!with_panels.ok);
+        assert_eq!(with_panels.content, outcome.content);
+        assert_eq!(with_panels.panels, Some(json!([panel])));
+
+        // And a document INSIDE the cap is still an ordinary COMPLETED outcome: the rule changed
+        // nothing about the paths that fit.
+        let small = completed_outcome(json!({ "a": 1 }), Instant::now());
+
+        assert!(small.ok);
+        assert_eq!(small.error, None);
+        assert_eq!(small.content, "{\"a\":1}");
     }
 
     #[test]

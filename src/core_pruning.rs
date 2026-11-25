@@ -330,8 +330,8 @@ pub fn estimate_context_tokens(messages: &[HarnessMessage], instructions: &[Stri
     // hop is only the saturating cast (`as f64` rounds a value above `u64::MAX`, and the
     // estimator's own ceiling is `u64::MAX` tokens), and the result is the float the TS
     // `Math.ceil` division returns.
-    u64::try_from(transcript_chars(messages, instructions).div_ceil(CHARS_PER_TOKEN)).unwrap_or(u64::MAX)
-        as f64
+    u64::try_from(transcript_chars(messages, instructions).div_ceil(CHARS_PER_TOKEN))
+        .unwrap_or(u64::MAX) as f64
 }
 
 // ---------------------------------------------------------------------------

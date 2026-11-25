@@ -2230,7 +2230,11 @@ impl TurnProjector {
                 // the flow's section ordinal - `0-assistant-56` is the answer window that opened on
                 // event 56 of section 0 - which is what makes a captured block id survive a restart
                 // (invariant 4) and what the inclusion write addresses.
-                let block_kind = if kind == "text" { "assistant" } else { "reasoning" };
+                let block_kind = if kind == "text" {
+                    "assistant"
+                } else {
+                    "reasoning"
+                };
                 let block_id = format!("{}-{block_kind}-{index}", self.block_ordinal());
 
                 self.add_block(

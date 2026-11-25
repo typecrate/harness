@@ -1414,12 +1414,16 @@ async fn a_queued_submit_runs_the_turn_and_the_record_keeps_every_event() {
          (`sessions.ts:7930-7961`)"
     );
     assert!(
-        lines[1..].iter().all(|line| line["event"].get("at").is_none()),
+        lines[1..]
+            .iter()
+            .all(|line| line["event"].get("at").is_none()),
         "an event body carries no `at` of its own, so the envelope's stamp is the single figure every \
          surface agrees on rather than one of two that could disagree"
     );
     assert!(
-        lines[1..].iter().all(|line| line["at"].as_u64().is_some_and(|at| at > 0)),
+        lines[1..]
+            .iter()
+            .all(|line| line["at"].as_u64().is_some_and(|at| at > 0)),
         "the envelope stamp is a real clock figure on every line"
     );
     assert_eq!(

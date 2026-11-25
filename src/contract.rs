@@ -85,35 +85,76 @@ pub const MAX_PENDING_ACTIONS: usize = 4;
 pub const MAX_STEER_RECORDS: usize = 64;
 /// Tools one session may create (`created_tools`).
 pub const MAX_CREATED_TOOLS: usize = 32;
-/// Model-facing tool-result text budget (`tool_result_bytes`, `core/result-budget.ts`).
+/// Model-facing tool-result text budget (`tool_result_bytes`).
 ///
-/// THE PUBLISHED FIGURE, and the enforced one: `core/result-budget.ts:54` sets
-/// `MODEL_TOOL_RESULT_BUDGET_BYTES = 256 * 1024`, and `harness-api.ts:216` /
-/// `harness.swagger.yaml:243` publish the same `262144` in the boot document, so the two
-/// TypeScript sources agree and this build now enforces what it advertises. The number was
-/// 64 KiB here while the document said 256 KiB (documented deviation 17), and the reason TS
-/// raised it is the reason the gap had to close: "`read` budgets its own output at the same
-/// order of magnitude, and the two numbers MUST agree" — with both at 64 KiB a read that
+/// A DIVERGENCE, NOT PARITY — stated as an explicit, numbered divergence because the prose
+/// this block used to carry claimed TypeScript agreement that no longer exists. It was wrong
+/// on the figures, on the unit, and on all three of its citation coordinates; restate it as
+/// figures + gap rather than agreement so nobody "reconciles" the number by accident:
+///
+/// 1. THE TYPESCRIPT FIGURE (verified 2026-11-25, F-CUTTER review): the reference budgets
+///    **32,768** bytes per result and **98,304** per turn. `MODEL_TOOL_RESULT_BUDGET_BYTES` is
+///    token-derived at
+///    `packages/underload/harness/src/engine/core/result-budget.ts:231`
+///    (`MODEL_TOOL_RESULT_BUDGET_TOKENS` 8,192 at `:193` × `MODEL_TOKEN_BYTES` 4 at `:163`),
+///    and the aggregate sibling at `:242` is 24,576 × 4 = 98,304 (`:194`). TS publishes the
+///    figure it enforces: `engine/shared/harness-api.ts:231`
+///    `tool_result_bytes: 32768`, and `src/harness-server.swagger.yaml:296`
+///    `tool_result_bytes: 32768`. Both numbers are SERIALIZED PAYLOAD bytes (what the provider
+///    bills), not raw text bytes.
+/// 2. THE COORDINATES THE OLD COMMENT CITED ARE GONE: `core/result-budget.ts:54` (no 256 KiB
+///    line any more), `harness-api.ts:216` (the published figure moved to `:231`, and the file
+///    lives at `engine/shared/harness-api.ts`), and `harness.swagger.yaml:243` (that filename
+///    does not exist; the document is `src/harness-server.swagger.yaml`, figure at `:296`).
+///    None of the three may be re-cited. `README.md` deviation 17 still repeats the stale
+///    coordinates — that row is the historical record of the 64 KiB → 256 KiB close, and its
+///    TS references need the same correction (README is outside this comment's edit).
+/// 3. THE RUST FIGURE (what THIS crate enforces AND publishes): **262,144** (256 KiB, below)
+///    per result, and **524,288** (512 KiB) per turn
+///    ([`MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES`]) — 8× the TS per-result cap, ~5.3× its
+///    per-turn cap, and a 2× per-result-to-per-turn ratio where TS's is 3×.
+///    [`PUBLISHED_TOOL_RESULT_BYTES`] is derived from the enforced constant, so the Rust boot
+///    document advertises 262144 as well: this crate enforces what it advertises, it just
+///    advertises a different window than TS.
+/// 4. WHY THE GAP IS DELIBERATE AND STILL OPEN: TS sizes the budget from the model window
+///    (token shares × 4) and measures ESCAPED payload bytes; this crate keeps the historical
+///    256 KiB figure and measures raw UTF-8 bytes
+///    ([`crate::tools::result::utf8_byte_length`]). Closing the gap means moving BOTH axes at
+///    once — magnitude and currency — which changes delivered bytes for every existing client
+///    and needs the matching TS-side currency work. The 2026-11-25 JSON-refusal mirror
+///    therefore mirrored the RULE at these numbers, not the numbers themselves: the refusal
+///    lives in [`crate::tools::result::bound_with_reason`] and
+///    `tools::result::tests::a_json_document_at_exactly_the_budget_is_delivered_whole`
+///    deliberately freezes 262,144 so an unowned constant change shows up as a test failure.
+///
+/// The reason the ENFORCED figure sits at 256 KiB rather than the 64 KiB this crate once used
+/// is still valid and is why 64 KiB must not come back: `read` budgets its own output at the
+/// same order of magnitude and the two numbers MUST agree — with both at 64 KiB, a `read` that
 /// exactly filled its content budget was ALWAYS over the wire cap (JSON escaping adds 2-15%),
 /// so the harness cut the result mid-string and replaced the whole object with its envelope,
-/// destroying the `nextLine`/`nextColumn` fields an agent needs to continue
-/// (`core/result-budget.ts:66-76`).
+/// destroying the `nextLine`/`nextColumn` fields an agent needs to continue.
 pub const MODEL_TOOL_RESULT_BUDGET_BYTES: usize = 256 * 1024;
 
-/// The `tool_result_bytes` figure the boot document publishes (`harness-api.ts:216`,
-/// `harness.swagger.yaml:243`). Derived from the ENFORCED budget so the advertised figure and
-/// the enforced one can never drift apart again — which is exactly how deviation 17 got away.
+/// The `tool_result_bytes` figure THIS crate's boot document publishes: 262144, derived from
+/// the ENFORCED budget so the advertised figure and the enforced one can never drift apart
+/// again — which is how the old deviation 17 got away. It is NOT TS's published figure: TS
+/// advertises 32768 (`engine/shared/harness-api.ts:231`,
+/// `src/harness-server.swagger.yaml:296`); see the numbered divergence on
+/// [`MODEL_TOOL_RESULT_BUDGET_BYTES`] above.
 pub const PUBLISHED_TOOL_RESULT_BYTES: u64 = MODEL_TOOL_RESULT_BUDGET_BYTES as u64;
 
 /// The aggregate sibling of the cap above: the most TOTAL tool-result text ONE turn may
 /// commit, summed over every call the model asked for in one assistant message
-/// (`core/result-budget.ts:94` `MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES`, enforced by
+/// (`MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES`, enforced by
 /// `createToolResultTurnBudget` / [`crate::tools::result::ToolResultTurnBudget`]).
 ///
-/// It is 2x the per-result cap ON PURPOSE: one full-budget `read` (256 KiB) plus one more
-/// large result still fit UNCHANGED — the case the 256 KiB number was raised for — while a
-/// turn that fires eight big reads and a build-log dump can no longer spend 2 MiB of the
-/// window in one round (`core/result-budget.ts:78-87`).
+/// Part of the same numbered divergence as [`MODEL_TOOL_RESULT_BUDGET_BYTES`] (item 3): TS's
+/// aggregate is **98,304** — `engine/core/result-budget.ts:242`, 24,576 tokens × 4 — i.e. 3×
+/// its own 32,768-byte cap, while THIS crate's is **524,288** (512 KiB) at 2× its 262,144-byte
+/// cap. The 2× ratio is the Rust design and is pinned as arithmetic by
+/// `tools::result::tests::the_per_turn_aggregate_is_published_next_to_the_per_result_cap`: one
+/// full-budget `read` (256 KiB) plus one more large result still fit UNCHANGED, while a turn
+/// that fires eight big reads and a build-log dump can no longer spend 2 MiB in one round.
 pub const MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES: usize = 512 * 1024;
 
 /// The `service` identity the root document advertises. TS sends the literal
@@ -146,8 +187,10 @@ pub fn service_limits() -> ServiceLimits {
         pending_actions: MAX_PENDING_ACTIONS as u64,
         steer_records: MAX_STEER_RECORDS as u64,
         created_tools: MAX_CREATED_TOOLS as u64,
-        // The CONTRACT figure (`harness-api.ts:216`), not this build's enforced window
-        // ([`MODEL_TOOL_RESULT_BUDGET_BYTES`]); see that constant for the documented split.
+        // THIS build's enforced window, published as its own boot-document figure
+        // ([`PUBLISHED_TOOL_RESULT_BYTES`], derived from [`MODEL_TOOL_RESULT_BUDGET_BYTES`] so
+        // the two can never drift). TS publishes 32768 at `engine/shared/harness-api.ts:231`;
+        // the two documents differ on purpose — see the numbered divergence on that constant.
         tool_result_bytes: PUBLISHED_TOOL_RESULT_BYTES,
         page_limit_default: PAGE_LIMIT_DEFAULT,
         page_limit_max: PAGE_LIMIT_MAX,

@@ -2148,10 +2148,7 @@ impl SessionState {
         // through the SAME predicate a test pins - so a renamed variant cannot silently stop being logged.
         let logged = plugin_diagnostic_is_failure(entry.kind);
 
-        let journal = self
-            .record
-            .plugin_diagnostics
-            .get_or_insert_with(Vec::new);
+        let journal = self.record.plugin_diagnostics.get_or_insert_with(Vec::new);
 
         journal.push(Value::Object(value));
 
@@ -2170,7 +2167,10 @@ impl SessionState {
         // The stderr line, TS's shape verbatim (`:3279`); `console.error` is this crate's `eprintln!`. The
         // text itself is built by `plugin_diagnostic_line` so the sentence is assertable without owning a
         // process, and so a host that mirrors these lines somewhere else prints the SAME one.
-        eprintln!("{}", plugin_diagnostic_line(&self.record.id, &stamped_entry));
+        eprintln!(
+            "{}",
+            plugin_diagnostic_line(&self.record.id, &stamped_entry)
+        );
     }
 
     /// `sessions.ts:2254 touch`: any activity moves `updatedAt` and re-arms the idle expiry, so a busy
@@ -2226,7 +2226,10 @@ pub const fn plugin_diagnostic_is_failure(
 ) -> bool {
     use crate::contract::SessionPluginDiagnosticKind as Kind;
 
-    matches!(kind, Kind::HandlerThrew | Kind::HandlerTimedOut | Kind::InvalidDecision)
+    matches!(
+        kind,
+        Kind::HandlerThrew | Kind::HandlerTimedOut | Kind::InvalidDecision
+    )
 }
 
 /// The wire spelling of one diagnostic kind (`harness-api.ts:930`), for the log line the sink composes.

@@ -119,7 +119,8 @@ fn fixture_text(name: &str) -> String {
         .join("tests/fixtures")
         .join(name);
 
-    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{} is readable: {error}", path.display()))
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("{} is readable: {error}", path.display()))
 }
 
 /// The same file as raw bytes, for a case file a test replays into a session directory.
@@ -778,7 +779,8 @@ fn journal_appends_reads_and_reports_problems() {
     let header_line = opened
         .strip_suffix('\n')
         .expect("a complete line ends with a newline");
-    let parsed: Value = serde_json::from_str(header_line).expect("the header line is one JSON record");
+    let parsed: Value =
+        serde_json::from_str(header_line).expect("the header line is one JSON record");
     let created_at = parsed["createdAt"]
         .as_u64()
         .expect("the header carries a numeric createdAt");
@@ -836,7 +838,11 @@ fn journal_appends_reads_and_reports_problems() {
         u64::try_from(recorded.len()).expect("a byte count fits"),
         "`size()` tracks the file without a stat"
     );
-    assert_eq!(journal.failures(), 0, "a clean run reports no write failure");
+    assert_eq!(
+        journal.failures(),
+        0,
+        "a clean run reports no write failure"
+    );
     assert!(journal.error().is_none());
 
     // THE HEALTHY READ (`journal.ts:328-434`): every record, the header, and nothing reported.
@@ -850,7 +856,11 @@ fn journal_appends_reads_and_reports_problems() {
     assert_eq!(
         journal.read(),
         JournalReadResult {
-            events: vec![record(0, 1, "one"), record(1, 2, "two"), record(2, 3, "three")],
+            events: vec![
+                record(0, 1, "one"),
+                record(1, 2, "two"),
+                record(2, 3, "three")
+            ],
             header: Some(JournalHeaderRecord {
                 session_id: "session-j".to_owned(),
                 created_at,
@@ -871,7 +881,11 @@ fn journal_appends_reads_and_reports_problems() {
 
     assert_eq!(
         reopened.read().events,
-        vec![record(0, 1, "one"), record(1, 2, "two"), record(2, 3, "three")],
+        vec![
+            record(0, 1, "one"),
+            record(1, 2, "two"),
+            record(2, 3, "three")
+        ],
         "a reopen reads the same log"
     );
 
@@ -887,7 +901,10 @@ fn journal_appends_reads_and_reports_problems() {
 
     let snapshot = journal.read();
 
-    assert!(snapshot.truncated_tail, "a line without its newline is a torn tail");
+    assert!(
+        snapshot.truncated_tail,
+        "a line without its newline is a torn tail"
+    );
     assert_eq!(
         snapshot.events,
         vec![record(0, 1, "one"), record(1, 2, "two")],
@@ -900,7 +917,12 @@ fn journal_appends_reads_and_reports_problems() {
             kind: JournalProblemKind::Malformed,
             // The parse wording belongs to the JSON engine, so the two stable halves are what the
             // port owes TS: the refusal class and the `(truncated tail)` suffix (`:388`).
-            reason: snapshot.problems.first().expect("one problem").reason.clone(),
+            reason: snapshot
+                .problems
+                .first()
+                .expect("one problem")
+                .reason
+                .clone(),
             tail: true,
         }]
     );
@@ -968,7 +990,12 @@ fn journal_appends_reads_and_reports_problems() {
         vec![(1, JournalProblemKind::Malformed, false)]
     );
     assert_eq!(
-        (junk.events.as_slice(), junk.header.as_ref(), junk.empty, junk.missing),
+        (
+            junk.events.as_slice(),
+            junk.header.as_ref(),
+            junk.empty,
+            junk.missing
+        ),
         (&[] as &[JournalEventRecord], None, true, false),
         "`{{events: [], problems: [...], empty: true, missing: false}}` with no header"
     );
@@ -993,7 +1020,8 @@ fn journal_appends_reads_and_reports_problems() {
         vec![JournalProblem {
             line: 2,
             kind: JournalProblemKind::Malformed,
-            reason: "unsupported journal version undefined; this server writes version 1".to_owned(),
+            reason: "unsupported journal version undefined; this server writes version 1"
+                .to_owned(),
             tail: false,
         }],
         "a legacy line is a reported problem, worded exactly as TS words it"
@@ -1019,9 +1047,14 @@ fn journal_appends_reads_and_reports_problems() {
 
     let pruned = journal.read();
 
-    assert_eq!(pruned.problems, Vec::new(), "a first line at index 7 is not a gap");
     assert_eq!(
-        pruned.events
+        pruned.problems,
+        Vec::new(),
+        "a first line at index 7 is not a gap"
+    );
+    assert_eq!(
+        pruned
+            .events
             .iter()
             .map(|entry| entry.index)
             .collect::<Vec<u64>>(),
@@ -1092,7 +1125,10 @@ fn journal_appends_reads_and_reports_problems() {
         }],
         "a gap in one turn's index sequence is corruption, worded exactly as TS words it (`:415`)"
     );
-    assert!(!after_rewrite.truncated_tail, "a gap on the LAST line is still real corruption");
+    assert!(
+        !after_rewrite.truncated_tail,
+        "a gap on the LAST line is still real corruption"
+    );
     assert!(after_rewrite.has_corruption());
 
     // TRUNCATE IS `rewrite([])` (`:491-493`): header only, and a FRESH stamp, so the header bytes
@@ -1100,10 +1136,9 @@ fn journal_appends_reads_and_reports_problems() {
     journal.truncate().expect("truncate succeeds");
 
     let truncated = std::fs::read_to_string(journal.path()).expect("readable");
-    let truncated_header: Value = serde_json::from_str(
-        truncated.strip_suffix('\n').expect("one complete line"),
-    )
-    .expect("the truncated file holds one JSON header line");
+    let truncated_header: Value =
+        serde_json::from_str(truncated.strip_suffix('\n').expect("one complete line"))
+            .expect("the truncated file holds one JSON header line");
     let truncated_at = truncated_header["createdAt"]
         .as_u64()
         .expect("a numeric createdAt");
@@ -1145,7 +1180,10 @@ fn journal_appends_reads_and_reports_problems() {
 
     assert!(!journal.directory().exists());
     assert!(!journal.exists());
-    assert!(journal.error().is_none(), "a successful removal clears the last error");
+    assert!(
+        journal.error().is_none(),
+        "a successful removal clears the last error"
+    );
 
     assert_eq!(
         journal.read(),
@@ -1170,8 +1208,7 @@ fn journal_appends_reads_and_reports_problems() {
 /// this crate's event serializer at all - only through its journal envelope.
 #[test]
 fn journal_write_path_matches_the_typescript_bytes() {
-    let observations: Value =
-        read_fixture("journal-write-path/write-path-observations.json");
+    let observations: Value = read_fixture("journal-write-path/write-path-observations.json");
     let seen = &observations["observations"];
     let records = observations["records"].as_array().expect("three records");
 
@@ -1212,12 +1249,17 @@ fn journal_write_path_matches_the_typescript_bytes() {
     // naming the session, and the directory is created with it.
     let mut journal = HarnessJournal::open(&sessions, "write-path", None).expect("opens");
 
-    assert!(journal.directory().exists(), "`sessions/<id>/` is created by `open`");
+    assert!(
+        journal.directory().exists(),
+        "`sessions/<id>/` is created by `open`"
+    );
 
     let opened = std::fs::read_to_string(journal.path()).expect("readable");
     let opened_header: Value =
         serde_json::from_str(opened.trim_end_matches('\n')).expect("one header line");
-    let opened_at = opened_header["createdAt"].as_u64().expect("a numeric createdAt");
+    let opened_at = opened_header["createdAt"]
+        .as_u64()
+        .expect("a numeric createdAt");
 
     assert_eq!(
         opened,
@@ -1228,14 +1270,21 @@ fn journal_write_path_matches_the_typescript_bytes() {
     // BOTH KEY ORDERS, built by this crate and compared to the fixture's captured lines.
     assert_eq!(
         journal::journal_line(&journal::journal_appended_line(&fixture_records[0])),
-        format!("{}\n", observations["appendOrderLine"].as_str().expect("the append-order line")),
+        format!(
+            "{}\n",
+            observations["appendOrderLine"]
+                .as_str()
+                .expect("the append-order line")
+        ),
         "`append`'s envelope is `{{type,v,turnId,index,at,event}}`"
     );
     assert_eq!(
         journal::journal_line(&journal::journal_compacted_line(&fixture_records[0])),
         format!(
             "{}\n",
-            observations["rewriteOrderLine"].as_str().expect("the rewrite-order line")
+            observations["rewriteOrderLine"]
+                .as_str()
+                .expect("the rewrite-order line")
         ),
         "`rewrite`'s envelope is `{{turnId,index,at,event,type,v}}`"
     );
@@ -1244,11 +1293,11 @@ fn journal_write_path_matches_the_typescript_bytes() {
     // `append` takes a contract event, so the byte comparison runs on the fixture's own record form,
     // which is the same envelope `append` writes around a serialized event.
     let appended: Vec<String> = std::iter::once(opened.trim_end_matches('\n').to_owned())
-        .chain(
-            fixture_records
-                .iter()
-                .map(|record| journal::journal_line(&journal::journal_appended_line(record)).trim_end_matches('\n').to_owned()),
-        )
+        .chain(fixture_records.iter().map(|record| {
+            journal::journal_line(&journal::journal_appended_line(record))
+                .trim_end_matches('\n')
+                .to_owned()
+        }))
         .collect();
     let fixture_appended: Vec<String> = seen["append"]["lines"]
         .as_array()
@@ -1262,8 +1311,7 @@ fn journal_write_path_matches_the_typescript_bytes() {
         .collect();
 
     assert_eq!(
-        appended,
-        fixture_appended,
+        appended, fixture_appended,
         "every appended line equals `journalLine({{type,v,...record}})` byte for byte"
     );
 
@@ -1300,8 +1348,10 @@ fn journal_write_path_matches_the_typescript_bytes() {
     let fixture_rewrite_source = seen["rewrite"]["bytes"]
         .as_str()
         .expect("the rewrite bytes");
-    let fixture_rewrite_bytes = fixture_rewrite_source
-        .replace(&fixture_stamp(fixture_rewrite_source), &rewrite_at.to_string());
+    let fixture_rewrite_bytes = fixture_rewrite_source.replace(
+        &fixture_stamp(fixture_rewrite_source),
+        &rewrite_at.to_string(),
+    );
 
     assert_eq!(
         rewritten, fixture_rewrite_bytes,
@@ -1373,7 +1423,9 @@ fn journal_write_path_matches_the_typescript_bytes() {
 #[test]
 fn journal_reader_matches_the_typescript_reader_case_by_case() {
     let observations: Value = read_fixture("journal-cases/ts-reader-observations.json");
-    let cases = observations["cases"].as_object().expect("the captured cases");
+    let cases = observations["cases"]
+        .as_object()
+        .expect("the captured cases");
 
     // The ten cases the fixture's MANIFEST names, in its order.
     let names: Vec<&str> = vec![
@@ -1446,12 +1498,10 @@ fn journal_reader_matches_the_typescript_reader_case_by_case() {
         );
 
         assert_eq!(
-            got.header
-                .as_ref()
-                .map(|header| json!({
-                    "sessionId": header.session_id,
-                    "createdAt": header.created_at,
-                })),
+            got.header.as_ref().map(|header| json!({
+                "sessionId": header.session_id,
+                "createdAt": header.created_at,
+            })),
             want["header"].as_object().map(|header| json!({
                 "sessionId": header["sessionId"],
                 "createdAt": header["createdAt"],
@@ -1511,7 +1561,9 @@ fn journal_reader_matches_the_typescript_reader_case_by_case() {
         // swapped fixture cannot silently weaken the record comparison above.
         assert_eq!(
             got.events.len(),
-            case["accepted"]["count"].as_u64().expect("the accepted count") as usize,
+            case["accepted"]["count"]
+                .as_u64()
+                .expect("the accepted count") as usize,
             "case {name}: the accepted count"
         );
         assert_eq!(
@@ -1537,7 +1589,8 @@ fn journal_reader_matches_the_typescript_reader_case_by_case() {
             .to_owned()
     };
 
-    let mut journal = HarnessJournal::open(&sessions, "healthy", None).expect("the healthy case opens");
+    let mut journal =
+        HarnessJournal::open(&sessions, "healthy", None).expect("the healthy case opens");
     assert_eq!(
         journal.read().problems,
         Vec::new(),

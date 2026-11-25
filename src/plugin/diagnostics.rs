@@ -152,7 +152,10 @@ impl DiagnosticEvent {
         event: impl Into<String>,
         message: impl Into<String>,
     ) -> Self {
-        debug_assert!(kind.is_failure(), "failure() is for the three failure kinds");
+        debug_assert!(
+            kind.is_failure(),
+            "failure() is for the three failure kinds"
+        );
 
         Self {
             kind,
@@ -347,7 +350,10 @@ impl RecordingDiagnosticSink {
     /// The `message` of every record, oldest first - the usual assertion target.
     #[must_use]
     pub fn messages(&self) -> Vec<String> {
-        self.records.iter().map(|entry| entry.message.clone()).collect()
+        self.records
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect()
     }
 
     /// The `kind` of every record, wire spelling, oldest first.
@@ -427,7 +433,10 @@ mod tests {
     fn the_four_wire_spellings_are_the_closed_set() {
         // `persistence.rs PLUGIN_DIAGNOSTIC_KINDS` accepts exactly these four, in this order.
         assert_eq!(DiagnosticKind::HandlerThrew.as_str(), "handler-threw");
-        assert_eq!(DiagnosticKind::HandlerTimedOut.as_str(), "handler-timed-out");
+        assert_eq!(
+            DiagnosticKind::HandlerTimedOut.as_str(),
+            "handler-timed-out"
+        );
         assert_eq!(DiagnosticKind::InvalidDecision.as_str(), "invalid-decision");
         assert_eq!(DiagnosticKind::Policy.as_str(), "policy");
         assert!(!DiagnosticKind::Policy.is_failure());

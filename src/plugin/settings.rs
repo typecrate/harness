@@ -175,10 +175,7 @@ impl SettingsProvider for MapSettingsProvider {
         // The store is the validator, so a plugin write is the SAME patch shape the HTTP surface
         // uses. `null` (i.e. `value == None`) is the reset; TS's `null` provider behaves the same.
         let mut patch = Map::new();
-        patch.insert(
-            key.to_owned(),
-            value.cloned().unwrap_or(Value::Null),
-        );
+        patch.insert(key.to_owned(), value.cloned().unwrap_or(Value::Null));
 
         let applied = {
             let mut store = self.lock();
@@ -288,7 +285,8 @@ impl<'a> SettingsView<'a> {
     /// look, without re-resolving keys.
     #[must_use]
     pub fn changed_since(&self, previous: u64) -> bool {
-        self.provider.map_or(previous != 0, |provider| provider.revision() != previous)
+        self.provider
+            .map_or(previous != 0, |provider| provider.revision() != previous)
     }
 
     /// The declared rule for one key, through the EFFECTIVE overlay, so the reserved `enabled` key of
@@ -313,7 +311,10 @@ impl<'a> SettingsView<'a> {
     /// ABSENT - it is the reset spelling, not a value (`settings.ts:47`, `data[key] ?? ...`).
     #[must_use]
     pub fn raw(&self, key: &str, fallback: Option<&Value>) -> Option<Value> {
-        if let Some(value) = self.data.and_then(|data| data.get(key)).filter(|value| !value.is_null())
+        if let Some(value) = self
+            .data
+            .and_then(|data| data.get(key))
+            .filter(|value| !value.is_null())
         {
             return Some((*value).clone());
         }
@@ -400,7 +401,11 @@ impl<'a> SettingsView<'a> {
     /// unknown owner is the `None` case.
     fn stored_raw(&self, key: &str) -> Option<Value> {
         let provider = self.provider?;
-        provider.stored().get(key).filter(|value| !value.is_null()).cloned()
+        provider
+            .stored()
+            .get(key)
+            .filter(|value| !value.is_null())
+            .cloned()
     }
 
     /// The declared default, already clamped the way the JS `fallbackSettings` builder clamps.
@@ -443,9 +448,9 @@ impl<'a> SettingsView<'a> {
 
                 match source {
                     // A real number is CLAMPED into the rule's range, never rejected.
-                    Value::Number(number) => number.as_f64().map_or(Value::Null, |value| {
-                        Value::from(clamp(value, min, max))
-                    }),
+                    Value::Number(number) => number
+                        .as_f64()
+                        .map_or(Value::Null, |value| Value::from(clamp(value, min, max))),
                     // Text goes through `Number(trimmed)`: a blank text falls to the rule-less
                     // default path (the JS `return fallbackSettings[key]`, i.e. the declared
                     // default), which the caller already resolved - so an unparsable text answers
@@ -456,9 +461,8 @@ impl<'a> SettingsView<'a> {
                             return Value::Null;
                         }
 
-                        number_from_text(trimmed).map_or(Value::Null, |value| {
-                            Value::from(clamp(value, min, max))
-                        })
+                        number_from_text(trimmed)
+                            .map_or(Value::Null, |value| Value::from(clamp(value, min, max)))
                     }
                     // A boolean/null/object for a number rule: JS `Number(..)` would give 0 / NaN.
                     // The JS branch returns the FALLBACK there, which the caller has already placed
