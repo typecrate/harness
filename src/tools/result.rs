@@ -264,6 +264,42 @@ fn is_json_document(content: &str) -> bool {
     serde_json::from_str::<Value>(content).is_ok()
 }
 
+/// The longest handle a refusal will QUOTE (`result-budget.ts` `REFUSAL_HANDLE_MAX_CHARS`). The
+/// refusal is itself a delivery, and the turn ledger books ITS bytes, so an unbounded quote would
+/// let a tool that puts a megabyte in `invocationId` make the honest error larger than the
+/// document it refused. A real id is a `branch-N` / `invocation-N` string, far under this; a
+/// longer value is read as "no handle", the conservative direction, because the sentence then
+/// names nothing rather than half a name.
+const REFUSAL_HANDLE_MAX_CHARS: usize = 120;
+
+/// The handle a refused document carries with it (`result-budget.ts` `retainedHandleOf`,
+/// finding C2, 2026-11-26). "Re-run the call" is only the truth for a result whose delivery WAS
+/// its only copy. A `threadFork` answer (`branchId`) and a `delegate` envelope or an
+/// `agentResult` page (`invocationId`) each name a record this harness keeps, pageable by that
+/// id, so the model that follows a re-run advice pays a second run for text it could have read.
+/// The rule keys on the HANDLES rather than on a tool name, so a record page, a grep body or a
+/// tool list - an array, or an object with neither key - keeps the historical sentence.
+///
+/// WHY THIS PARSES A SECOND TIME. [`is_json_document`] answers the boolean question and throws
+/// the value away; the TS reference keeps its parsed value because it asks both questions from
+/// one parse. Re-parsing here is the cheaper port: the only caller is the refusal path, which
+/// has already decided to discard a document larger than the budget, and the cost is one extra
+/// parse of a value the caller no longer holds.
+fn retained_handle(content: &str) -> Option<(&'static str, String)> {
+    let parsed: Value = serde_json::from_str(content).ok()?;
+    let map = parsed.as_object()?;
+
+    for key in ["branchId", "invocationId"] {
+        if let Some(id) = map.get(key).and_then(Value::as_str) {
+            if !id.trim().is_empty() && id.chars().count() <= REFUSAL_HANDLE_MAX_CHARS {
+                return Some((key, id.to_owned()));
+            }
+        }
+    }
+
+    None
+}
+
 /// The refusal sentence (`result-budget.ts:436` `refusalMessage`), worded byte for byte as
 /// the TS twin words it and sharing `spill_note`'s discipline: exact numbers, no
 /// locale-dependent prose, and the address the model can act on. It has to carry four things,
@@ -271,9 +307,18 @@ fn is_json_document(content: &str) -> bool {
 ///   * that the result is GONE rather than shortened, so a missing field is not read as an
 ///     empty one;
 ///   * both sizes, so the model can pick an argument set that fits;
-///   * the narrowing that fits (limit / ids / fields) - the actionable half;
+///   * the way back - either "re-run with narrower arguments", for a result whose delivery WAS
+///     its only copy, or the retained id plus the door that pages it, for a document that
+///     carries one (see [`retained_handle`], finding C2);
 ///   * the write-safety warning, because a discarded RESULT does not undo a completed WRITE:
 ///     the tool may have committed the change and only its receipt is missing.
+///
+/// THE TWO RECOVERY CLAUSES (finding C2, 2026-11-26), the same rule the TS twin ships: a refused
+/// document that carries `branchId`/`invocationId` names a record the harness KEPT, so it is told
+/// where the text still lives instead of being sent through a second fork or child run. Every
+/// other document keeps the sentence this function has always produced, byte for byte - the
+/// `None` arm below concatenates the same three pieces in the same order, which is what the
+/// pinned Rust refusals in this module's tests assert.
 ///
 /// Units follow [`spill_note`]: `original_bytes` is UTF-8 bytes of the tool's text, and
 /// `budget_bytes` is the budget that was applied - the aggregate case says out loud that it
@@ -285,6 +330,7 @@ fn refusal_message(
     reason: SpillReason,
     aggregate_bytes: Option<usize>,
     source: Option<&ToolResultSource>,
+    handle: Option<(&str, &str)>,
 ) -> String {
     let cap = match (reason, aggregate_bytes) {
         (SpillReason::Aggregate, Some(aggregate)) => format!(
@@ -293,13 +339,26 @@ fn refusal_message(
         _ => format!("against a {budget_bytes}-byte budget"),
     };
 
+    // Both arms end with a trailing space so the write-safety sentence below joins with no
+    // separator, exactly as the single-clause version of this function did.
+    let recovery = match handle {
+        Some((key, value)) => format!(
+            "What was discarded is retained under {key} \"{value}\": agentResult pages the full \
+             text by that id, so read it there instead of re-running {}. ",
+            source_phrase(source)
+        ),
+        None => format!(
+            "Re-run {} with narrower arguments (smaller limit, fewer ids, narrower fields) to \
+             fetch it. ",
+            source_phrase(source)
+        ),
+    };
+
     format!(
         "Tool result too large to deliver: {original_bytes} bytes {cap}. The result was \
-         discarded, not truncated: no part of it reached this transcript. Re-run {} with \
-         narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it. If this \
+         discarded, not truncated: no part of it reached this transcript. {recovery}If this \
          call could have written anything, that write may already be applied \u{2014} re-read \
-         before retrying.",
-        source_phrase(source)
+         before retrying."
     )
 }
 
@@ -499,12 +558,16 @@ fn bound_with_reason(
     // it answers every other tool failure with. Everything that does NOT parse keeps the
     // head/tail envelope exactly as before, because for prose both previews are real content.
     if is_json_document(content) {
+        // C2: the recovery clause is chosen from the document itself. A handle-free document
+        // produces `None` and the sentence below is the one every pinned Rust test asserts.
+        let handle = retained_handle(content);
         let message = refusal_message(
             original_bytes,
             budget_bytes,
             reason,
             aggregate_bytes,
             source,
+            handle.as_ref().map(|(key, id)| (*key, id.as_str())),
         );
 
         return BoundedResult {
@@ -1315,6 +1378,65 @@ mod tests {
     /// `content` string, the tail starts inside it) and the 1,398 bytes in the hole were gone
     /// with no cursor, so the "still valid JSON" claim was about the ENVELOPE and never about
     /// the document inside it. A structure that does not fit is now REFUSED.
+    /// C2 (2026-11-26) — the OTHER recovery clause, mirrored from the TS twin. A refused document
+    /// that carries its own retained address (`branchId`, or `invocationId`) is pointed AT that
+    /// address instead of at a re-run: the branch/ledger record still holds the answer and pages
+    /// it, so the old advice cost the model a second fork or child run. The second half of this
+    /// test is the half every pre-C2 test above depends on: an object with NEITHER key keeps the
+    /// historical sentence byte for byte.
+    #[test]
+    fn a_refused_document_that_names_a_retained_branch_is_pointed_at_that_branch() {
+        let doc =
+            json!({ "branchId": "branch-1", "threadId": "branch-1", "content": "x".repeat(80) })
+                .to_string();
+
+        assert_eq!(utf8_byte_length(&doc), 138);
+
+        let refusal = "Tool result too large to deliver: 138 bytes against a 40-byte budget. \
+                       The result was discarded, not truncated: no part of it reached this \
+                       transcript. What was discarded is retained under branchId \"branch-1\": \
+                       agentResult pages the full text by that id, so read it there instead of \
+                       re-running tool 'threadFork' (call f1). If this call could have written \
+                       anything, that write may already be applied \u{2014} re-read before retrying.";
+
+        let bounded = bound_tool_result_with_source(&doc, 40, Some(&source("threadFork", "f1")));
+
+        assert_eq!(bounded.content, refusal);
+        assert!(bounded.rejected.is_some());
+        // The re-run advice is GONE from this arm — it is the sentence that was wrong here.
+        assert!(!bounded.content.contains("narrower arguments"));
+
+        // THE ARM THAT DID NOT FIRE. Same shape (a JSON object over budget), no handle keys, and
+        // therefore the byte-identical sentence every test above pins.
+        let plain = json!({ "id": "thing-1", "body": "z".repeat(80) }).to_string();
+
+        assert_eq!(utf8_byte_length(&plain), 106);
+
+        let bounded = bound_tool_result_with_source(&plain, 40, Some(&source("read", "r1")));
+
+        assert_eq!(
+            bounded.content,
+            "Tool result too large to deliver: 106 bytes against a 40-byte budget. The result was \
+             discarded, not truncated: no part of it reached this transcript. Re-run tool 'read' \
+             (call r1) with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch \
+             it. If this call could have written anything, that write may already be applied \u{2014} re-read \
+             before retrying."
+        );
+        assert!(!bounded.content.contains("agentResult"));
+
+        // THE SIZE GUARD. The refusal is itself a delivery, so a handle longer than
+        // `REFUSAL_HANDLE_MAX_CHARS` is read as "no handle" rather than quoted whole.
+        let long = json!({ "branchId": "b".repeat(121), "content": "q".repeat(80) }).to_string();
+        let bounded = bound_tool_result_with_source(&long, 40, Some(&source("threadFork", "f2")));
+
+        assert!(
+            bounded
+                .content
+                .contains("Re-run tool 'threadFork' (call f2)")
+        );
+        assert!(!bounded.content.contains(&"b".repeat(121)));
+    }
+
     #[test]
     fn an_oversized_json_document_is_refused_instead_of_two_broken_halves() {
         let doc =
