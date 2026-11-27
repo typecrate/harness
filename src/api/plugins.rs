@@ -34,6 +34,7 @@
 
 use serde_json::{Map, Value};
 
+use crate::api::sessions;
 use crate::api::{self, ApiResult, Ctx};
 use crate::contract;
 use crate::error::ApiError;
@@ -188,4 +189,147 @@ fn haystack_of(row: &contract::PluginSummary) -> String {
         tags
     )
     .to_lowercase()
+}
+
+// ---------------------------------------------------------------------------
+// The session-scoped trio (`api.ts:3132-3231`)
+// ---------------------------------------------------------------------------
+
+/// `GET {root}/sessions/{session_id}/plugins` (`getSessionPlugins`, `api.ts:3134-3169`): this
+/// session's rows - the same catalogue, this session's values.
+///
+/// THE ROW SHAPE IS SHARED, ONLY THE SCOPE IS NOT: every row comes from the one `BUILTIN_PLUGINS`
+/// table, so a session can never advertise a plugin or a setting the template does not; what differs is
+/// the resolved `enabled` / `values` and the collection revision. Filter, order and paging are this
+/// module's rules unchanged (`api.ts:3145-3156` re-runs the same haystack).
+///
+/// THE HEADER IS STAMPED HERE, unlike [`get_plugins`]: `api.ts:3169` calls `json(200, result,
+/// record.plugins.revision())` with THREE arguments, because there the figure is a per-session
+/// staleness test the pane needs on the response as well as in the body. It is still not a hub counter -
+/// `plugins` is not a `StreamResourceKind` - it is THIS session's store counter, which no other
+/// session's edit and no template edit ever moves (`api.ts:3113-3131`).
+pub async fn get_session_plugins(ctx: &mut Ctx) -> ApiResult {
+    ctx.ignore_body().await;
+
+    let session_id = ctx.param("session_id").to_owned();
+
+    // Identity FIRST: an unknown session is a 404 before a single paging parameter is read
+    // (`api.ts:3135`), so `GET /sessions/nope/plugins?limit=o` is a 404, not a 400.
+    sessions::require_session(ctx, &session_id)?;
+
+    let limit = ctx.limit()?;
+    let cursor = ctx.cursor()?;
+    let search = api::param_of(&ctx.query, "q").map(str::to_lowercase);
+
+    // No `let store = ..` binding: `store_of` borrows `ctx`, and this handler has no `&mut ctx` work
+    // left, but taking the store per call keeps the borrow short like every other session handler.
+    let revision = sessions::store_of(ctx).session_plugin_revision(&session_id)?;
+    let mut rows = sessions::store_of(ctx).session_plugin_rows(&session_id)?;
+
+    if let Some(needle) = search {
+        rows.retain(|row| haystack_of(row).contains(&needle));
+    }
+
+    let total = rows.len();
+    let slice = paging::slice_page(rows, cursor, limit, Some(total));
+
+    let body = paging::page_slice_body(
+        ctx.runtime.hub.epoch(),
+        slice,
+        revision,
+        events::now_millis(),
+    );
+
+    Ok(api::with_revision(200, body, revision))
+}
+
+/// `GET {root}/sessions/{session_id}/plugins/{plugin_id}` (`getSessionPlugin`, `api.ts:3173-3187`):
+/// one row, this session's values.
+///
+/// Identity resolves session-first, then plugin. The plugin 404 is the IN-SESSION sentence
+/// (`Unknown plugin "x" in session "y".`, `api.ts:3182` via `missing('plugin', name, record.id)`) and
+/// NOT the global one that names the whole catalogue: on this route the caller's question is about this
+/// conversation, and its session id is the fact worth echoing back.
+pub async fn get_session_plugin(ctx: &mut Ctx) -> ApiResult {
+    ctx.ignore_body().await;
+
+    let session_id = ctx.param("session_id").to_owned();
+    let name = ctx.param("plugin_id").to_owned();
+    let store = sessions::store_of(ctx);
+
+    sessions::require_session(ctx, &session_id)?;
+
+    let row = store
+        .session_plugin_row(&session_id, &name)?
+        .ok_or_else(|| api::missing_in("plugin", &name, &session_id))?;
+
+    let revision = store.session_plugin_revision(&session_id)?;
+    let response = contract::PluginDetailResponse { plugin: row };
+
+    Ok(api::with_revision(
+        200,
+        serde_json::to_value(response).unwrap_or_default(),
+        revision,
+    ))
+}
+
+/// `PATCH {root}/sessions/{session_id}/plugins/{plugin_id}` (`patchSessionPlugin`,
+/// `api.ts:3197-3231`): edit one plugin's settings FOR THIS SESSION AND NO OTHER.
+///
+/// WRITE-ANYTIME, the same rule as [`patch_plugin`] and for the same reason: a settings write moves no
+/// registration and removes no schema the model was promised, so there is no 409 path here at all. The
+/// contrast is this session's TOOL switch (`assertIdleForToolMutation`), which mutates one live harness
+/// and does wait for the session to settle (`api.ts:3189-3196`).
+///
+/// DURABLE BEFORE THE ANSWER: the store applies the value, then the document carrying it is written
+/// before the 200 (`sessions.ts:2702-2720`). A failed write leaves the value applied and reports the
+/// 500, because this session is already running with it: rolling it back would claim a failure the
+/// conversation never had.
+pub async fn patch_session_plugin(ctx: &mut Ctx) -> ApiResult {
+    let session_id = ctx.param("session_id").to_owned();
+    let name = ctx.param("plugin_id").to_owned();
+
+    // Identity (session, then the store's own plugin check) resolves BEFORE the body is read, the order
+    // `patchTool` sets: a wrong id is a 404, never a 400 about a body the client has not sent.
+    sessions::require_session(ctx, &session_id)?;
+
+    let body = ctx.body_object().await?;
+
+    api::require_body_fields(&body, &["settings"])?;
+
+    let Some(submitted) = body.get("settings") else {
+        return Err(ApiError::bad_request(
+            "A plugin settings patch requires a \"settings\" object.",
+        ));
+    };
+
+    // The same `{ ...body.settings }` spread as the global route, so a non-object answers the sentence
+    // its spread produces rather than one invented for this route ([`settings_patch`]).
+    let patch = settings_patch(submitted);
+
+    // Validate + apply + bump this session's counter, in one guarded step. A refusal leaves this
+    // session's values and its revision exactly as they were, and never touches another session or the
+    // template.
+    sessions::store_of(ctx).update_session_plugin_settings(&session_id, &name, &patch)?;
+
+    if let Err(error) = ctx.runtime.save() {
+        return Err(ApiError::internal(error.message));
+    }
+
+    // Re-read the row, as TS does: nothing here replaces a session, but reading it again is what keeps
+    // the answer honest if a future write path does (`api.ts:3222-3229`).
+    let row = sessions::store_of(ctx)
+        .session_plugin_row(&session_id, &name)?
+        .ok_or_else(|| api::missing_in("plugin", &name, &session_id))?;
+
+    // The figure the header quotes is THIS session's counter after this write, which is also the figure
+    // its next `GET .../plugins` prints in its body.
+    let revision = sessions::store_of(ctx).session_plugin_revision(&session_id)?;
+    let response = contract::PluginDetailResponse { plugin: row };
+
+    Ok(api::with_revision(
+        200,
+        serde_json::to_value(response).unwrap_or_default(),
+        revision,
+    ))
 }

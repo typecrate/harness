@@ -120,6 +120,34 @@ const MISSING_CAPABILITY: [(&str, &str); 15] = [
     ),
 ];
 
+/// The capability one catalogued-only row is missing, or `None` when this build can execute the name.
+///
+/// A4: this is the single lookup for BOTH halves of the promise. `dispatch` refuses a call with
+/// [`missing_capability_hint`], and `availability_of` puts the very same sentence in the advertised
+/// row's `availability.hint`, so `GET /v1/harness/tools` and a call to that tool can never answer with
+/// two different stories about the same name (the audit finding this closes).
+#[must_use]
+pub fn missing_capability(name: &str) -> Option<&'static str> {
+    MISSING_CAPABILITY
+        .iter()
+        .find(|(entry, _)| *entry == name)
+        .map(|(_, capability)| *capability)
+}
+
+/// The sentence the runtime emits for one catalogued-only name, or `None` for an executable one.
+///
+/// Kept as ONE function rather than two copies of the string: the row's hint and the execution refusal
+/// are the same fact, and the pin in `tests/tools.rs` compares them directly.
+#[must_use]
+pub fn missing_capability_hint(name: &str) -> Option<String> {
+    missing_capability(name).map(|capability| {
+        format!(
+            "this server does not support {capability}, so \"{name}\" cannot run here. The capability \
+             is on the port list; use the tools that are executable to make progress."
+        )
+    })
+}
+
 /// The knobs a deployment decides, resolved when the registry is BUILT
 /// (`harnesses/index.ts:164-218` builds the catalogue after `.env` is loaded, so a
 /// registry constructed before the environment exists would advertise the wrong state).
@@ -195,13 +223,26 @@ impl ToolRegistry {
 
     /// The availability state of one row, or `None` when the row has nothing to add
     /// (`harnesses/core.ts:88`, `harnesses/{websearch,webfetch}.ts:54-70`).
+    ///
+    /// A4 — A CATALOGUED-ONLY ROW IS HONEST ABOUT WHAT IT CANNOT DO: the `?availability=` filter is a
+    /// two-value closed enum (`api.ts` `available` / `unconfigured`), so "listed but not executable"
+    /// cannot be a third STATE without inventing a wire value the contract does not carry. The state
+    /// therefore stays `available` — and the sentence the runtime answers a CALL with moves into the
+    /// row's `availability.hint`, which is the field that exists to say exactly this. A client reading
+    /// the row now learns the same thing it would learn from calling it.
     #[must_use]
     pub fn availability_of(&self, entry: &Entry) -> Option<ToolAvailability> {
         match entry.group {
             Group::Core => Some(ToolAvailability {
                 state: ToolAvailabilityState::Available,
                 environment: None,
-                hint: Some(CORE_TOOL_SESSION_HINT.to_owned()),
+                // A4: a name with no implementation says so, instead of borrowing the session-bound
+                // hint of a Core row that DOES run. `missing_capability_hint` is the same function
+                // `dispatch` refuses with, which is what keeps the two answers identical.
+                hint: Some(
+                    missing_capability_hint(entry.name)
+                        .unwrap_or_else(|| CORE_TOOL_SESSION_HINT.to_owned()),
+                ),
             }),
             Group::WebSearch => Some(if self.options.web_keys.has_search_key() {
                 ToolAvailability {
@@ -463,15 +504,11 @@ async fn dispatch(
     // A listed capability with no implementation in this build. This is checked BEFORE the
     // argument shape: a missing capability is not something the model can fix by re-sending
     // better arguments, and the answer must name the capability every time.
-    if let Some(capability) = MISSING_CAPABILITY
-        .iter()
-        .find(|(name, _)| *name == ctx.name)
-        .map(|(_, capability)| *capability)
-    {
-        return Err(ToolFailure::Failed(format!(
-            "this server does not support {capability}, so \"{name}\" cannot run here. The capability is on the port list; use the tools that are executable to make progress.",
-            name = ctx.name
-        )));
+    //
+    // A4: the sentence comes from `missing_capability_hint`, the same function the catalogue row's
+    // `availability.hint` is built from, so the advertised row and the refusal are one fact.
+    if let Some(reason) = missing_capability_hint(&ctx.name) {
+        return Err(ToolFailure::Failed(reason));
     }
 
     // A top-level required-property check, which is the schema rule that actually fires
@@ -604,6 +641,18 @@ fn unknown_tool_message(name: &str, policy: &ToolPolicy) -> String {
 /// A full JSON-Schema validator is not a dependency here, and the TS failure mode that
 /// matters to a model is a missing property (AJV reports exactly that). Everything else is
 /// the body's own validation, which carries the entry's precise wording.
+///
+/// The reference's reserved per-call `async` argument (`{"async":true}` = background launch,
+/// `false` = sync, absence = the tool's default) falls into the SAME category as any other
+/// unknown key here: this gate reads only `required`, so the key is accepted and ignored with
+/// no error text. That is the honest outcome rather than a shortcut — a background launch needs
+/// the scheduler this crate does not have, so every call settles with `pending: []`
+/// (`turn.rs:708`) and `HarnessPendingTool` is never minted (`contract.rs:891-896`); honouring
+/// `async` means porting that scheduler first. The key is therefore NOT stripped where the call's
+/// arguments enter the dispatcher (`dispatch`, at the `let arguments = ctx.arguments.clone();`
+/// binding above the name match) and NOT added to the advertised schema — both options, and why
+/// this pass took neither, are recorded in `docs/parity.md` ("Not ported, and not claimed"). Docs
+/// only: nothing in this function changed.
 fn missing_required(entry: &Entry, arguments: &Value) -> Option<String> {
     let Ok(schema) = serde_json::from_str::<Value>(entry.parameters_json) else {
         return None;
@@ -929,13 +978,39 @@ mod tests {
                  a name no preset, context pack or client sends anymore"
             );
         }
+        // A4: a catalogued-only row advertises the capability it lacks, verbatim, while an executable
+        // core row keeps the session-bound sentence. `toolRegistry` is row 0 of the catalogue, so this
+        // is also the pin that the FIRST row a client sees is honest about what it cannot do.
         assert_eq!(
             summaries[0].availability,
             Some(ToolAvailability {
                 state: ToolAvailabilityState::Available,
                 environment: None,
+                hint: missing_capability_hint("toolRegistry"),
+            })
+        );
+        assert_eq!(
+            missing_capability_hint("toolRegistry").as_deref(),
+            Some(
+                "this server does not support compiling and registering a tool from editable source (the runtime compiler), so \"toolRegistry\" cannot run here. The capability is on the port list; use the tools that are executable to make progress."
+            ),
+            "the capability sentence is pinned as a literal, not only through the helper"
+        );
+        assert_eq!(
+            summaries
+                .iter()
+                .find(|row| row.name == "toolRequest")
+                .expect("an executable core row")
+                .availability,
+            Some(ToolAvailability {
+                state: ToolAvailabilityState::Available,
+                environment: None,
                 hint: Some(CORE_TOOL_SESSION_HINT.to_owned()),
             })
+        );
+        assert!(
+            missing_capability_hint("toolRequest").is_none(),
+            "a row the runtime stage executes has no missing capability to advertise"
         );
 
         let rows: Vec<(String, String)> = summaries

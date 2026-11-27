@@ -99,6 +99,21 @@ impl SessionStore {
         // (`sessions.ts:1832` + `:1882`).
         let name = definition.name.clone();
 
+        // R1 — THE COPY-DOWN, before the record exists (`sessions.ts:2826-2832`, which builds the
+        // session's own store with `copyPluginSettingsStore(this.plugins)` BEFORE `buildHarness` can
+        // capture a provider reference). A new session starts at the process/template overrides as they
+        // read RIGHT NOW, and after that the two scopes never touch each other: a
+        // `PATCH {root}/plugins/{plugin_id}` changes what a session created after the write starts with,
+        // and changes nothing about a session that already exists.
+        //
+        // This port has no live provider for the harness to capture, so the seed rides on the RECORD and
+        // `Store::restore_session` builds the live store from it - the same decoder a restart uses
+        // (`sessions.ts:870-871`), which is why a create and a boot-from-document cannot disagree. The
+        // empty snapshot stays ABSENT rather than becoming `{}`: that is the shape the writer emits for
+        // "this session has changed nothing", and it keeps a fresh record byte-identical to one from
+        // before the feature (`sessions.ts:4140-4146`).
+        let plugin_seed = inner.plugins.snapshot();
+
         let record = crate::persistence::HarnessSessionRecord {
             id: session_id.clone(),
             harness: name.clone(),
@@ -108,6 +123,9 @@ impl SessionStore {
             // container is additive, and a session that never had one keeps the byte layout it had
             // before the feature (`persistence.ts:1335` writes the key only when there is a journal).
             plugin_diagnostics: None,
+            // R1: the seeded overrides, absent when the template has none (`plugin_seed` above).
+            plugin_settings: (!plugin_seed.is_empty())
+                .then(|| serde_json::Value::Object(plugin_seed)),
             settings: crate::persistence::HarnessSessionSettingsRecord {
                 base_url: settings.base_url.clone(),
                 model: settings.model.clone(),

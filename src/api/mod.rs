@@ -11,12 +11,34 @@
 //!
 //! WHAT THIS FILE IS THE SINGLE OWNER OF
 //! -------------------------------------
-//! 1. **The route table.** `HARNESS_PATH_TEMPLATES` (`shared/harness-api.ts:54-102`, 47 entries)
-//!    crossed with the 66 operations `api.ts` declares (the `plugins` pair arrived with the Harness
-//!    Plugin System). `api.ts:623-625` states why the table is compiled from the GENERATED template
-//!    strings rather than typed out by hand: "a
-//!    route cannot drift from the contract by being typed out by hand here". The same reason holds
-//!    here, so `ROUTES` below carries each template verbatim next to its operations.
+//! 1. **The route table.** `HARNESS_PATH_TEMPLATES` (`shared/harness-api.ts:54-108`) declares
+//!    **52** path templates and the `routes` object of `api.ts:6131-6198` declares **74** operations
+//!    over them (GET 42 / POST 14 / PATCH 11 / DELETE 6 / PUT 1). This crate mounts **all of them**:
+//!    `ROUTES` below is 52 templates and 74 operations, and the held-back set `tests/routes.rs` used to
+//!    pin is EMPTY. The last three to arrive were the session plugin trio
+//!    (`GET .../sessions/{session_id}/plugins`, `GET .../plugins/{plugin_id}` and its PATCH), which
+//!    needed the PER-SESSION settings store the contract describes - TS `liveSession(id).plugins`, a
+//!    `HarnessPluginSettingsStore` seeded from the process scope at session creation, with its own
+//!    revision and a durable commit before the answer (`sessions.ts:2702`
+//!    `updateSessionPluginSettings`) - and that store is now `SessionState::plugins`, durable as the
+//!    additive `pluginSettings` member of the session record (`src/persistence.rs`).
+//!
+//!    Earlier gaps that were closed the same way are worth naming for the next reader, because the
+//!    reason a route was missing was always "the state behind it does not exist here yet", never a
+//!    handler nobody wrote: the session agent PREFIX read answers from the FROZEN harness definition's
+//!    `agent_prefixes` plus the session's own preset copy (`src/store/agents.rs` `session_agent_prefix`),
+//!    which is what the rank/prefix wire vocabulary made possible, and its write half is the binding
+//!    PATCH's `prefix` field (`src/api/session_agents.rs`). What still has no counterpart here is the
+//!    in-process brain a live TS session runs - there is no live band to read, so the record is the
+//!    authority - and `rank` on the same PATCH body, which needs the contract's `SessionAgentBinding.rank`
+//!    projection that no read model here carries yet.
+//!
+//!    `api.ts:623-625` states why the table is compiled from the GENERATED template strings rather
+//!    than typed out by hand: "a route cannot drift from the contract by being typed out by hand
+//!    here". The same reason holds here, so `ROUTES` below carries each template verbatim next to its
+//!    operations, and the counts above are wire-visible facts pinned by `tests/routes.rs` (table
+//!    size, template list, operation list, per-verb split, and the reachability-of-every-operation
+//!    rule), so adding an operation on one side without the other moves a pin and names the side.
 //! 2. **`Ctx`.** Every handler - this stage's host handlers and T5b's session handlers - has the
 //!    one shape `async fn(&mut Ctx) -> ApiResult`. The route table maps a path + verb onto one of
 //!    those functions, so adding an operation never changes the dispatch mechanism.
@@ -558,9 +580,11 @@ pub struct Route {
     pub operations: &'static [(&'static str, Operation)],
 }
 
-/// The 66 operations of `api.ts:3925-3974`, one variant each.
+/// The 74 operations this crate mounts, one variant each - every operation the contract's `routes`
+/// table declares (`api.ts:6131-6198`), with nothing held back; the last three to arrive were the
+/// session plugin trio, described in this module's header.
 ///
-/// An enum rather than 66 function pointers so the table stays `static` (an `async fn`'s future
+/// An enum rather than 74 function pointers so the table stays `static` (an `async fn`'s future
 /// type cannot be named) while the call site stays one exhaustive `match` that cannot silently miss
 /// an operation when a variant is added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -620,6 +644,8 @@ pub enum Operation {
     DeleteSessionAgent,
     GetSessionAgentInstruction,
     PatchSessionAgentInstruction,
+    // U6: one member's preset history (`sessionsBySessionIdAgentsByAgentIdPrefix`), read-only.
+    GetSessionAgentPrefix,
     // ---- session tools --------------------------------------------------------
     GetSessionTools,
     PostSessionTool,
@@ -628,6 +654,13 @@ pub enum Operation {
     DeleteSessionTool,
     GetSessionToolSource,
     PostSessionToolExecution,
+    // ---- session plugins (R1: the session-scoped trio) --------------------------
+    // The same catalogue at session scope (`SessionState::plugins`), and the three operations that
+    // closed the C2 gap: `GET .../plugins`, `GET .../plugins/{plugin_id}`, and its PATCH
+    // (`harness-api.ts`'s `GetSessionPlugins` / `GetSessionPlugin` / `PatchSessionPlugin`).
+    GetSessionPlugins,
+    GetSessionPlugin,
+    PatchSessionPlugin,
     // ---- threads --------------------------------------------------------------
     GetSessionThreads,
     PostSessionThread,
@@ -663,12 +696,12 @@ const fn operations(
     items
 }
 
-/// The route table: all 49 generated templates and all 70 declared operations.
+/// The route table: all 52 generated templates and all 74 declared operations.
 ///
 /// ORDER IS LOAD-BEARING: `matchRoute` (`api.ts:657-687`) returns the FIRST pattern whose segment
 /// count and literal segments fit, in template-table order, so an ambiguous pair resolves the way
 /// the generated table lists it. The table below is in that exact order.
-pub static ROUTES: [Route; 49] = [
+pub static ROUTES: [Route; 52] = [
     Route {
         id: "root",
         template: contract::HARNESS_API_ROOT,
@@ -858,6 +891,15 @@ pub static ROUTES: [Route; 49] = [
         ]),
     },
     Route {
+        // The generated contract declares this template with ONE operation - the read. The write half
+        // of the feature is a field of the binding PATCH, so a client editing a band and a client
+        // reading one never disagree about which call owns the change (`getSessionAgentPrefix`,
+        // `api.ts:4442-4448`).
+        id: "sessionsBySessionIdAgentsByAgentIdPrefix",
+        template: "/v1/harness/sessions/{session_id}/agents/{agent_id}/prefix",
+        operations: operations(&[("GET", Operation::GetSessionAgentPrefix)]),
+    },
+    Route {
         id: "sessionsBySessionIdTools",
         template: "/v1/harness/sessions/{session_id}/tools",
         operations: operations(&[
@@ -883,6 +925,22 @@ pub static ROUTES: [Route; 49] = [
         id: "sessionsBySessionIdToolsByToolIdExecutions",
         template: "/v1/harness/sessions/{session_id}/tools/{tool_id}/executions",
         operations: operations(&[("POST", Operation::PostSessionToolExecution)]),
+    },
+    // R1 (the C2 gap, closed): the session-scoped plugin pair. Same generated row schema as the two
+    // global plugin routes above, one different scope - `SessionState::plugins` instead of
+    // `StoreInner::plugins` (`api.ts:6179-6183`).
+    Route {
+        id: "sessionsBySessionIdPlugins",
+        template: "/v1/harness/sessions/{session_id}/plugins",
+        operations: operations(&[("GET", Operation::GetSessionPlugins)]),
+    },
+    Route {
+        id: "sessionsBySessionIdPluginsByPluginId",
+        template: "/v1/harness/sessions/{session_id}/plugins/{plugin_id}",
+        operations: operations(&[
+            ("GET", Operation::GetSessionPlugin),
+            ("PATCH", Operation::PatchSessionPlugin),
+        ]),
     },
     Route {
         id: "sessionsBySessionIdThreads",
@@ -1491,6 +1549,9 @@ async fn dispatch_operation(operation: Operation, ctx: &mut Ctx) -> ApiResult {
         Operation::PatchSessionAgentInstruction => {
             self::session_agents::patch_session_agent_instruction(ctx).await
         }
+        Operation::GetSessionAgentPrefix => {
+            self::session_agents::get_session_agent_prefix(ctx).await
+        }
 
         Operation::GetSessionTools => self::session_tools::get_session_tools(ctx).await,
         Operation::PostSessionTool => self::session_tools::post_session_tool(ctx).await,
@@ -1501,6 +1562,13 @@ async fn dispatch_operation(operation: Operation, ctx: &mut Ctx) -> ApiResult {
         Operation::PostSessionToolExecution => {
             self::session_tools::post_session_tool_execution(ctx).await
         }
+
+        // R1: the session-scoped plugin trio. Same handlers' rules as the two global plugin routes,
+        // against THIS session's store (`api/plugins.rs`'s session section for the three differences:
+        // the in-session 404 sentence, the stamped header on the list, and the per-session counter).
+        Operation::GetSessionPlugins => self::plugins::get_session_plugins(ctx).await,
+        Operation::GetSessionPlugin => self::plugins::get_session_plugin(ctx).await,
+        Operation::PatchSessionPlugin => self::plugins::patch_session_plugin(ctx).await,
 
         Operation::GetSessionThreads => self::threads::get_session_threads(ctx).await,
         Operation::PostSessionThread => self::threads::post_session_thread(ctx).await,

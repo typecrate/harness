@@ -178,45 +178,82 @@ pub async fn get_sessions(ctx: &mut Ctx) -> ApiResult {
 /// resource moves (`session` row, `definition`, `turns`, `threads`, and the `session` COLLECTION).
 ///
 /// The handler-level validation is the whole of TS's: the field set, then `harness` as a non-empty
-/// string, then the `settings` block through `settingsInputOf` (`:534-564`) - whose three refusal
+/// string, then the `settings` block through `settingsInputOf` (`api.ts:599-631`) - whose refusal
 /// sentences name the block path, so a bad `api_key` type says `"body.settings.api_key" must be a
-/// string.` The credential MERGE and the endpoint requirement are the store's
-/// (`config::merge_settings` inside `create_session`), which is what keeps this route and a direct
-/// embedder from disagreeing about when a client key is honoured.
+/// string.` Every shape on this route is read BY HAND rather than through `contract::decode_body`, so
+/// no body here can answer serde's wording where the reference has a sentence (`docs/parity.md`
+/// "Body refusals that still quote the serialiser"). The credential MERGE and the endpoint
+/// requirement are the store's (`config::merge_settings` inside `create_session`), which is what keeps
+/// this route and a direct embedder from disagreeing about when a client key is honoured.
 pub async fn post_session(ctx: &mut Ctx) -> ApiResult {
     let body = ctx.body_object().await?;
 
     api::require_body_fields(&body, &CREATE_FIELDS)?;
 
-    match body.get("harness") {
-        Some(Value::String(name)) if !name.is_empty() => {}
+    // `harness` is the route's one required field, and its refusal is the reference's sentence
+    // (`api.ts:3321-3323`), which the store repeats for a name that only looks present
+    // (`store::create_session`, `sessions.ts:1828`).
+    let harness = match body.get("harness") {
+        Some(Value::String(name)) if !name.is_empty() => name.clone(),
         _ => {
             return Err(ApiError::bad_request("A session requires a harness name."));
         }
-    }
+    };
 
-    if let Some(settings) = body.get("settings") {
-        // `null` is "not supplied" (`settingsInputOf` returns early for `undefined`, and serde maps a
-        // JSON null to the same absence), so only a stated non-null block is validated.
-        if !settings.is_null() {
-            let block = api::require_block(settings, "body")?;
+    // THE `settings` BLOCK, sentence for sentence (`settingsInputOf`, `api.ts:599-631`).
+    //
+    // WHY NOT A SERDE DECODE HERE: `decode_body` puts the PARSER's wording in the body
+    // (`invalid type: integer \`7\`, expected a string`), and the reference has a SENTENCE for every
+    // refusal on this route. Each field is therefore read by hand, so every malformed shape answers
+    // the reference's own text:
+    //   * `"body.settings"` is the label the reference passes (`settingsInputOf(body.settings,
+    //     'body')` formats `` `"${where}.settings" must be an object.` ``), so the refusal is
+    //     `"body.settings" must be an object.` — the same path-qualified wording the discovery route
+    //     already quotes (`api/models.rs:144`);
+    //   * a JSON `null` block is a REFUSAL, not an absence: `settingsInputOf` returns early only for
+    //     `undefined` (`api.ts:605`) and its very next guard is `settings === null` (`:607-608`);
+    //   * a `null` FIELD is "not supplied" (`api.ts:615-627` sends non-null non-strings to the
+    //     sentence and lets `null` fall through untouched), which is why the match below treats
+    //     `None` and `Value::Null` alike.
+    let mut settings = None;
 
-            api::require_body_fields(block, &SETTINGS_FIELDS)?;
+    if let Some(block_value) = body.get("settings") {
+        let block = api::require_block(block_value, "body.settings")?;
 
-            for field in SETTINGS_FIELDS {
-                if let Some(value) = block.get(field)
-                    && !value.is_null()
-                    && !value.is_string()
-                {
+        api::require_body_fields(block, &SETTINGS_FIELDS)?;
+
+        let mut input = contract::RunnerSettingsInput::default();
+
+        for (field, slot) in [
+            ("base_url", &mut input.base_url),
+            ("api_key", &mut input.api_key),
+            ("model", &mut input.model),
+        ] {
+            match block.get(field) {
+                None | Some(Value::Null) => {}
+                Some(Value::String(value)) => *slot = Some(value.clone()),
+                Some(_) => {
                     return Err(ApiError::bad_request(format!(
                         "\"body.settings.{field}\" must be a string."
                     )));
                 }
             }
         }
+
+        settings = Some(input);
     }
 
-    let request: contract::CreateSessionRequest = contract::decode_body(Value::Object(body))?;
+    // `title` is OPTIONAL and TOLERANT: the reference tests it with `typeof body.title === 'string'`
+    // (`api.ts:3421`) and simply creates an untitled session when the value is a number, a boolean or
+    // `null`. A serde decode turned that into a 400 quoting serde, so the field is read the same way
+    // here — non-string is absence, and the trim/blank rules are the store's (`normalize_title`).
+    let title = body.get("title").and_then(Value::as_str).map(str::to_owned);
+
+    let request = contract::CreateSessionRequest {
+        harness,
+        title,
+        settings,
+    };
     let body = ctx.runtime.store.create_session(&request).await?;
 
     // The new session's own row counter, which the create bumped before this answer (`api.ts:2031`).

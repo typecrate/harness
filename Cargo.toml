@@ -70,6 +70,10 @@ tokio = { version = "1", features = [
     "sync",
     "signal",
     "fs",
+    # `io-std` is the standalone launcher's: the probe line goes through `tokio::io::stdout` so the
+    # write can be flushed before a probe connects. Without it the bin only compiles inside
+    # `cargo test`'s graph, where the dev-dependency's `full` feature turns it on.
+    "io-std",
     "io-util",
     "process",
 ] }

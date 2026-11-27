@@ -2297,3 +2297,433 @@ async fn the_action_channel_publishes_the_opened_and_closed_frames() {
     drop(stream);
     server.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// 17 - the registry kinds reach the wire (waves W1 and W3)
+// ---------------------------------------------------------------------------
+
+/// Acks are ignored on an ordered subscription, so an ack followed by a ping proves the pong is the
+/// next frame, which is the only honest way to say "exactly one frame arrived".
+async fn expect_one_frame(stream: &mut Stream, sequence: u64) {
+    stream
+        .expect_silence(
+            json!({"type": "ack", "subscription_id": "s1", "sequence": sequence}),
+            wall_now(),
+        )
+        .await;
+}
+
+/// `PATCH` the path, then read the ONE update frame the write owes, field by field.
+///
+/// Every expected key is compared against the frame, so the assertion covers the WHOLE receipt: a
+/// frame that carried an extra `ids` array, or a second kind behind the first, fails here rather than
+/// passing a "contains the kind" check.
+async fn patch_and_read(
+    server: &TestServer,
+    stream: &mut Stream,
+    path: &str,
+    body: Value,
+    expected: Value,
+) {
+    let reply = Reply::send(
+        client()
+            .patch(server.url(path))
+            .json(&body)
+            .header("content-type", "application/json"),
+    )
+    .await;
+
+    assert_eq!(
+        reply.status,
+        StatusCode::OK,
+        "`PATCH {path}`: {}",
+        reply.body
+    );
+
+    let frame = stream.expect_frame("update").await;
+
+    assert_eq!(
+        frame["kind"], expected["kind"],
+        "the write published the kind the contract names: {frame}"
+    );
+    assert_eq!(frame["subscription_id"], json!("s1"));
+
+    for (field, value) in expected.as_object().expect("an object") {
+        if field == "kind" {
+            continue;
+        }
+
+        assert_eq!(
+            frame[field], *value,
+            "the frame carries `{field}` verbatim: {frame}"
+        );
+    }
+
+    expect_one_frame(stream, frame["sequence"].as_u64().expect("a sequence")).await;
+}
+
+/// A1: every session roster write publishes `agent.registry_updated`, and the frame it publishes
+/// carries the reference's own invalidation receipt (`api.ts:4143-4146` for the binding PATCH,
+/// `:4323-4326` for the DELETE, `:4365` for the instruction subresource). One write, one frame, no
+/// second kind smuggled in behind it.
+#[tokio::test]
+async fn a_roster_write_arrives_as_one_agent_registry_frame() {
+    let root = Root::new("agent-registry-frames");
+    let server = TestServer::start(&root).await;
+    let (session_id, _created) = create_session(&server, "agent registry frames").await;
+    let mut stream = Stream::connect(&server, Some("harness.v1")).await;
+
+    // The handshake answer comes first on every connection, before any subscription ack.
+    stream.expect_frame("welcome").await;
+    subscribe(&mut stream, "s1", &session_id).await;
+
+    // THE BINDING PATCH. `fields` is the list of names the write applied, in the order the reference
+    // pushes them (rank, instruction, prefix, model), and it is absent when nothing publishable moved.
+    patch_and_read(
+        &server,
+        &mut stream,
+        &format!("/v1/harness/sessions/{session_id}/agents/general"),
+        json!({"rank": "C"}),
+        json!({"kind": "agent.registry_updated", "agent_id": "general", "fields": ["rank"]}),
+    )
+    .await;
+
+    // THE INSTRUCTION SUBRESOURCE: same kind, its own one-name field list (`api.ts:4365`).
+    patch_and_read(
+        &server,
+        &mut stream,
+        &format!("/v1/harness/sessions/{session_id}/agents/general/instruction"),
+        json!({"instruction": "answer in one line"}),
+        json!({"kind": "agent.registry_updated", "agent_id": "general", "fields": ["instruction"]}),
+    )
+    .await;
+
+    // THE DELETE: the reference reports `action: removed` rather than a field list, because there is
+    // no row left to name fields on (`api.ts:4323-4326`).
+    let removed = Reply::send(
+        client().delete(server.url(&format!("/v1/harness/sessions/{session_id}/agents/general"))),
+    )
+    .await;
+
+    assert_eq!(removed.status, StatusCode::OK, "{}", removed.body);
+
+    let frame = stream.expect_frame("update").await;
+
+    assert_eq!(frame["kind"], json!("agent.registry_updated"));
+    assert_eq!(frame["agent_id"], json!("general"));
+    assert_eq!(frame["action"], json!("removed"));
+    assert_eq!(
+        frame.get("fields"),
+        None,
+        "a removal names no fields: {frame}"
+    );
+
+    expect_one_frame(&mut stream, frame["sequence"].as_u64().expect("a sequence")).await;
+
+    // A read publishes nothing: the roster is now one member shorter, and the stream says nothing
+    // more about it.
+    let roster =
+        Reply::send(client().get(server.url(&format!("/v1/harness/sessions/{session_id}/agents"))))
+            .await;
+
+    assert_eq!(roster.status, StatusCode::OK);
+
+    // A read publishes nothing: with the removal already delivered, the very next frame is the pong of
+    // a ping sent now, so nothing was queued behind it.
+    let probe = wall_now();
+
+    stream.send(json!({"type": "ping", "at": probe})).await;
+
+    let pong = stream.expect_frame("pong").await;
+
+    assert_eq!(
+        pong["at"],
+        json!(probe),
+        "the pong answers THIS ping, and nothing came first"
+    );
+
+    stream.disconnect().await;
+    server.stop().await;
+}
+
+/// A2: the four session-tool verbs publish `tool.registry_updated` with the reference's receipts
+/// (`api.ts:4686` create, `:4841` declaration PATCH and enable, `:5085` unregister), and the
+/// combined PATCH - a new declaration AND an `enabled` flip in one request - publishes ONE frame,
+/// not two.
+#[tokio::test]
+async fn a_tool_verb_arrives_as_one_tool_registry_frame() {
+    let root = Root::new("tool-registry-frames");
+    let server = TestServer::start(&root).await;
+    let (session_id, _created) = create_session(&server, "tool registry frames").await;
+    let mut stream = Stream::connect(&server, Some("harness.v1")).await;
+
+    // The handshake answer comes first on every connection, before any subscription ack.
+    stream.expect_frame("welcome").await;
+    subscribe(&mut stream, "s1", &session_id).await;
+
+    let path = format!("/v1/harness/sessions/{session_id}/tools");
+    let source = "export const meta = { name: 'toolFrameCount' };\n\
+                  export async function run(args) { return { count: String(args.text || '').length }; }";
+
+    // CREATE: 201, and the frame says `created` because the row did not exist before (`api.ts:4686`).
+    let created = Reply::send(client().post(server.url(&path)).json(&json!({
+        "name": "toolFrameCount",
+        "description": "Counts the words in a string.",
+        "parameters": {"type": "object", "properties": {"text": {"type": "string"}}},
+        "tags": ["frames"],
+        "source": source,
+    })))
+    .await;
+
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    assert_eq!(created.body["registration"]["created"], json!(true));
+
+    let frame = stream.expect_frame("update").await;
+
+    assert_eq!(frame["kind"], json!("tool.registry_updated"));
+    assert_eq!(frame["name"], json!("toolFrameCount"));
+    assert_eq!(frame["created"], json!(true));
+
+    expect_one_frame(&mut stream, frame["sequence"].as_u64().expect("a sequence")).await;
+
+    // THE COMBINED PATCH: a declaration change AND an enable flip. The declaration half publishes
+    // `{name, created: false}` and the enable half is told not to publish, so the connection sees ONE
+    // frame for one mutation.
+    let combined = Reply::send(
+        client()
+            .patch(server.url(&format!("{path}/toolFrameCount")))
+            .json(&json!({
+                "description": "Counts words, now switched on.",
+                "enabled": true,
+            })),
+    )
+    .await;
+
+    assert_eq!(combined.status, StatusCode::OK, "{}", combined.body);
+
+    let frame = stream.expect_frame("update").await;
+
+    assert_eq!(frame["kind"], json!("tool.registry_updated"));
+    assert_eq!(frame["name"], json!("toolFrameCount"));
+    assert_eq!(
+        frame["created"],
+        json!(false),
+        "an update is not a create, and the frame says so: {frame}"
+    );
+    assert_eq!(
+        frame.get("enabled"),
+        None,
+        "the combined PATCH publishes ONE receipt, not a second one for the enable half: {frame}"
+    );
+
+    expect_one_frame(&mut stream, frame["sequence"].as_u64().expect("a sequence")).await;
+
+    // ENABLE ALONE: the verb the toolbox pane drives, and the only shape it sends (`api.ts:4841`).
+    let enabled = Reply::send(
+        client()
+            .patch(server.url(&format!("{path}/toolFrameCount")))
+            .json(&json!({"enabled": false})),
+    )
+    .await;
+
+    assert_eq!(enabled.status, StatusCode::OK, "{}", enabled.body);
+
+    let frame = stream.expect_frame("update").await;
+
+    assert_eq!(frame["kind"], json!("tool.registry_updated"));
+    assert_eq!(frame["name"], json!("toolFrameCount"));
+    assert_eq!(frame["enabled"], json!(false));
+
+    expect_one_frame(&mut stream, frame["sequence"].as_u64().expect("a sequence")).await;
+
+    // UNREGISTER: `removed: true` is what separates "the name is gone" from "the name is off"
+    // (`api.ts:5085-5088`).
+    let removed = Reply::send(client().delete(server.url(&format!("{path}/toolFrameCount")))).await;
+
+    assert_eq!(removed.status, StatusCode::OK, "{}", removed.body);
+
+    let frame = stream.expect_frame("update").await;
+
+    assert_eq!(frame["kind"], json!("tool.registry_updated"));
+    assert_eq!(frame["name"], json!("toolFrameCount"));
+    assert_eq!(frame["removed"], json!(true));
+
+    expect_one_frame(&mut stream, frame["sequence"].as_u64().expect("a sequence")).await;
+
+    stream.disconnect().await;
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// 18 - the GLOBAL agent routes publish, and no scope receives (wave W8)
+// ---------------------------------------------------------------------------
+
+/// Subscribes one `global` scope (`HARNESS_WS_SCOPES`, `stream/protocol.ts:73`: it names no ids and
+/// forbids every other id).
+async fn subscribe_global(ws: &mut Stream, subscription_id: &str) -> Value {
+    ws.send(json!({
+        "type": "subscribe",
+        "subscription_id": subscription_id,
+        "scope": "global",
+    }))
+    .await;
+
+    ws.expect_frame("subscription_state").await
+}
+
+/// Proves the stream is IDLE: a `ping` probe must be answered by its `pong` as the very NEXT frame, so
+/// any `update` that arrived after the last assertion would land first and fail here. This is the
+/// frame-count barrier for the "zero frames" case — `expect_silence` is for "a client frame earns no
+/// reply", which is a different claim.
+async fn expect_no_frame(stream: &mut Stream, probe_at: u64) {
+    stream.send(json!({"type": "ping", "at": probe_at})).await;
+
+    let pong = stream.next_frame().await;
+
+    assert_eq!(
+        pong,
+        json!({"type": "pong", "at": probe_at}),
+        "nothing was delivered between the write and the probe, got: {pong}"
+    );
+}
+
+/// The two GLOBAL agent verbs publish the reference's own receipt (`api.ts:2746-2750` PATCH →
+/// `{agent_id}`, `:2773-2777` DELETE → `{agent_id, retired: true}`) and the crate sends the same two
+/// payloads (`src/api/agents.rs:214-224`, `:320-330`). What neither implementation does is DELIVER
+/// them: `agent.registry_updated` is in the `session` scope's publish set only
+/// (`stream/protocol.ts:74-86` — the `global` scope publishes just `catalogue.updated` and
+/// `config.updated`, `:73`), and the event carries NO session id, so `matches` rejects a session
+/// subscription on `subscription.ids.session_id !== event.session_id` (`broker.ts:489-491`,
+/// `src/stream/broker.rs:1104-1110`). A `global` subscription is refused one step earlier, by the kind.
+///
+/// So the honest wire claim is "the write publishes, and no subscription receives it", pinned on both
+/// scopes at once. The session ROSTER write in the middle is the control: the same kind DOES arrive
+/// when the event names a session, which is what makes the two zeros evidence rather than a dead stream.
+#[tokio::test]
+async fn a_global_agent_write_publishes_a_frame_that_no_scope_receives() {
+    let root = Root::new("global-agent-registry-frames");
+    let server = TestServer::start(&root).await;
+    let (session_id, _created) = create_session(&server, "global agent frames").await;
+    let mut stream = Stream::connect(&server, Some("harness.v1")).await;
+
+    stream.expect_frame("welcome").await;
+
+    // The session scope is `s1` so the shared `expect_one_frame` barrier applies to the control, and
+    // the `global` scope is `s2`.
+    subscribe(&mut stream, "s1", &session_id).await;
+    let global_state = subscribe_global(&mut stream, "s2").await;
+
+    assert_eq!(
+        global_state["publishes"],
+        json!(["catalogue.updated", "config.updated"]),
+        "the global scope's publish set is the contract's two kinds, which is why the agent kind \
+         cannot reach it: {global_state}"
+    );
+
+    // THE GLOBAL PATCH: a 200 with the renamed profile, and a stream that stays silent.
+    let patched = Reply::send(
+        client()
+            .patch(server.url("/v1/harness/agents/general"))
+            .json(&json!({"title": "Renamed globally"})),
+    )
+    .await;
+
+    assert_eq!(patched.status, StatusCode::OK, "{}", patched.body);
+    assert_eq!(
+        patched.body["agent"]["title"],
+        json!("Renamed globally"),
+        "the write itself is real, so the silence below is routing and not a no-op"
+    );
+
+    expect_no_frame(&mut stream, wall_now()).await;
+
+    // THE CONTROL: the same kind, published with a session id, arrives once on `s1` and only there.
+    let roster = Reply::send(
+        client()
+            .patch(server.url(&format!("/v1/harness/sessions/{session_id}/agents/general")))
+            .json(&json!({"rank": "C"})),
+    )
+    .await;
+
+    assert_eq!(roster.status, StatusCode::OK, "{}", roster.body);
+
+    let frame = stream.expect_frame("update").await;
+
+    assert_eq!(frame["kind"], json!("agent.registry_updated"));
+    assert_eq!(frame["subscription_id"], json!("s1"));
+    assert_eq!(frame["agent_id"], json!("general"));
+    assert_eq!(frame["fields"], json!(["rank"]));
+
+    expect_one_frame(&mut stream, frame["sequence"].as_u64().expect("a sequence")).await;
+
+    // THE GLOBAL DELETE: the retirement receipt the route owes, and the same undelivered publish
+    // (`{agent_id, retired: true}` never names a session either).
+    let removed = Reply::send(client().delete(server.url("/v1/harness/agents/general"))).await;
+
+    assert_eq!(removed.status, StatusCode::OK, "{}", removed.body);
+    assert_eq!(
+        removed.body,
+        json!({
+            "deleted": true,
+            "agent_id": "general",
+            "tombstoned": true,
+            "restored_by_restart": false
+        }),
+        "the DELETE receipt is the contract's, frame or no frame"
+    );
+
+    expect_no_frame(&mut stream, wall_now()).await;
+
+    stream.disconnect().await;
+    server.stop().await;
+}
+
+/// A3: the update-kind set exists ONCE, in `contract::HARNESS_WS_UPDATE_KINDS`, and this pins it
+/// against the reference's own array (`harness-stream.ts:62`), in the reference's order.
+/// `events.rs::publish_with_ops` asserts every publish against it, so an invented kind fails in a
+/// debug build rather than reaching a client as a frame its `publishes` table never named.
+#[test]
+fn the_update_kind_set_is_the_contracts_list_in_the_contracts_order() {
+    assert_eq!(
+        typecrate_harness::contract::HARNESS_WS_UPDATE_KINDS,
+        [
+            "session.updated",
+            "turn.upsert",
+            "turn.removed",
+            "display.ops",
+            "usage.updated",
+            "action.opened",
+            "action.closed",
+            "thread.upsert",
+            "thread.removed",
+            "transcript.updated",
+            "records.updated",
+            "tool.registry_updated",
+            "agent.registry_updated",
+            "run.event",
+            "catalogue.updated",
+            "config.updated",
+        ],
+        "`harness-stream.ts:62` is one array literal; a rename here is a wire change"
+    );
+
+    for kind in SESSION_PUBLISHES {
+        assert!(
+            typecrate_harness::contract::is_update_kind(kind),
+            "the session scope publishes `{kind}`, so it must be a kind"
+        );
+    }
+
+    // Baseline entries are COUNTER names, not kinds: the two vocabularies never overlap.
+    for resource in SESSION_BASELINE {
+        assert!(
+            !typecrate_harness::contract::is_update_kind(resource),
+            "`{resource}` is a counter, not an update kind"
+        );
+    }
+
+    assert!(!typecrate_harness::contract::is_update_kind(
+        "agent.updated"
+    ));
+    assert!(!typecrate_harness::contract::is_update_kind(""));
+}

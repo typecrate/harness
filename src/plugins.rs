@@ -434,6 +434,184 @@ pub static BUILTIN_PLUGINS: [PluginMetadata; 3] = [
     },
 ];
 
+// ---------------------------------------------------------------------------
+// The DISPLAY metadata a row projects and nothing in this crate reads
+// ---------------------------------------------------------------------------
+//
+// C1/R2 added `PluginSetting.group`, `PluginSetting.parentKey` and `PluginSummary.system_prompt` to the
+// contract's DTOs (`harness-server.swagger.yaml:5385-5445`); they say WHERE a row is drawn and WHAT the
+// plugin sends to the model, and the validator, the store and the durable document never consult them
+// (`harness-api.ts:1096-1112`). The TypeScript build declares them INLINE on each descriptor
+// (`src/engine/plugins/context-trimmer.plugin.ts:463-760`'s settings array and
+// `src/engine/plugins/context-compaction.plugin.ts:414-441`'s `systemPrompt`). This crate cannot do the
+// same thing without touching a struct two NON-OWNED places construct (`tests/plugin_host.rs:1107-1378`
+// builds `PluginMetadata`/`PluginSettingDescriptor` literals, and `src/plugin/async_ping.rs:209` returns
+// a `&'static PluginMetadata`), so the hints live HERE, beside the catalogue, as a keyed side table.
+// One table per concern is also the honest shape: these values belong to the plugin METADATA half of the
+// upstream port, which this stage is closing, and they are consulted by exactly one projection
+// ([`plugin_setting_row_of`]).
+//
+// THE ONE DELIBERATE DIFFERENCE FROM UPSTREAM'S WORDING, and it is a correctness difference: upstream
+// parents the `invalidOutcomes` row under `trimInvalidTools` and the thinking rows under `trimThoughts`,
+// two toggles THIS catalogue does not ship - the trimmer rows here are the pre-2026-11-13 set
+// (`dropInvalidToolCallsOnceAnswered` / `dropOldThoughts` / `thoughtKeepUnits`). A `parentKey` names a
+// row that must exist, because the pane hides a nested row while its parent checkbox is off, so a verbatim
+// `trimInvalidTools` here would hide `invalidOutcomes` forever rather than nest it. Each of the two
+// therefore names the toggle this catalogue ACTUALLY holds for that category, and the three rows whose
+// upstream parent has no boolean counterpart here (`dropOldThoughts` is a STRING tier, and
+// `thoughtKeepUnits`/`minThoughtChars` are gated by it) carry NO parent at all. Contract rule
+// (`harness-api.ts:1104`): `parentKey` is the key of the BOOLEAN setting that gates the row.
+
+/// The section headings the trimmer files its rows under, `(id, title)` in upstream's first-appearance
+/// order (`context-trimmer.plugin.ts:529-749`). `id` is the stable key a renderer opens one section per
+/// id with, in first-appearance order; `title` is printed verbatim.
+///
+/// Upstream declares a sixth group, `tool-requests` / "Tool Requests", for the `truncateToolRequests`
+/// family; this catalogue holds no row of that family, so the group is not declared here - an unused
+/// heading would be dead data that a reader assumes some row uses.
+const PLUGIN_SETTING_GROUPS: [(&str, &str); 5] = [
+    ("invalid-tools", "Invalid Tools"),
+    ("chain-of-thoughts", "Chain of Thoughts"),
+    ("superseded-tools", "Superseded Tools"),
+    ("duplicate-tools", "Duplicate Tools"),
+    ("global-limits", "Global Limits"),
+];
+
+/// One row's display hints: `(plugin, key, group id, parent key)`, in the plugin's DECLARATION order so
+/// the table reads like upstream's settings array. A row absent here is ungrouped and unnested, which is
+/// what the flat top-level run always was.
+///
+/// Keyed by plugin because `minTokens` exists in BOTH context plugins and only the trimmer's copy is
+/// filed under "Global Limits" (`context-trimmer.plugin.ts:719`).
+const SETTING_DISPLAY: [(&str, &str, Option<&str>, Option<&str>); 11] = [
+    // CATEGORY: INVALID TOOLS. `dropInvalidToolCallsOnceAnswered` is this catalogue's invalid-tools
+    // toggle (upstream's toggle for the same category is `trimInvalidTools`), so it files the category
+    // and is not filed under anything.
+    (
+        "context-trimmer",
+        "dropInvalidToolCallsOnceAnswered",
+        Some("invalid-tools"),
+        None,
+    ),
+    (
+        "context-trimmer",
+        "invalidOutcomes",
+        Some("invalid-tools"),
+        Some("dropInvalidToolCallsOnceAnswered"),
+    ),
+    // CATEGORY: CHAIN OF THOUGHTS. Three rows, and no parent: the row that gates them here
+    // (`dropOldThoughts`) is a string tier, not the boolean a `parentKey` has to name.
+    (
+        "context-trimmer",
+        "dropOldThoughts",
+        Some("chain-of-thoughts"),
+        None,
+    ),
+    (
+        "context-trimmer",
+        "thoughtKeepUnits",
+        Some("chain-of-thoughts"),
+        None,
+    ),
+    (
+        "context-trimmer",
+        "minThoughtChars",
+        Some("chain-of-thoughts"),
+        None,
+    ),
+    // CATEGORY: SUPERSEDED TOOLS.
+    (
+        "context-trimmer",
+        "dropSupersededToolCalls",
+        Some("superseded-tools"),
+        None,
+    ),
+    (
+        "context-trimmer",
+        "supersedeMatch",
+        Some("superseded-tools"),
+        Some("dropSupersededToolCalls"),
+    ),
+    // CATEGORY: DUPLICATE TOOLS.
+    (
+        "context-trimmer",
+        "dropDuplicateCalls",
+        Some("duplicate-tools"),
+        None,
+    ),
+    // CATEGORY: GLOBAL LIMITS. The three knobs that gate no policy of their own, so they carry no
+    // parent and apply whatever every switch above says (`context-trimmer.plugin.ts:717-760`).
+    ("context-trimmer", "minTokens", Some("global-limits"), None),
+    (
+        "context-trimmer",
+        "safetyUnits",
+        Some("global-limits"),
+        None,
+    ),
+    ("context-trimmer", "maxUnits", Some("global-limits"), None),
+];
+
+/// The prompt the compaction plugin commits into the transcript when a conversation reaches its limit,
+/// shown READ-ONLY in the plugin details pane (`context-compaction.plugin.ts:414-441`), verbatim.
+///
+/// Upstream writes this text TWICE - once as `metadata.systemPrompt` and once as the runtime's
+/// `COMPACTION_INSTRUCTION` - because `metadata` must stay a plain object literal, and its own test
+/// pins the two copies byte-identical. This crate has no runtime copy yet (the compaction machine is
+/// the plugin-host stage), so there is ONE copy here and that duplication rule cannot drift.
+const COMPACTION_SYSTEM_PROMPT: &str = "[context compaction] Automated system prompt (not from the user): your context window has reached its limit. Compact your knowledge now. Reply with one structured summary and nothing else, using these headings (omit any that does not apply):
+## Objective
+- [one or two sentences on what you are trying to accomplish]
+## Requirements
+- [constraints, preferences and scope the user stated, or \"(none)\"]
+## Decisions
+- [decisions made and why, or \"(none)\"]
+## Work State
+### Completed
+- [goals completed that still matter to the current or pending work; otherwise \"(none)\"]
+### Active
+- [what you are working on right now and exactly where you left off, with the details needed to resume; otherwise \"(none)\"]
+### Blocked
+- [what is blocking progress, and why; otherwise \"(none)\"]
+## Next Move
+1. [ordered next actions, or \"(none)\"]
+## Relevant Files
+- [at most 15 paths, most important first, each with a brief reason; or \"(none)\"]
+## Important Context
+- [facts you cannot recover from the code or the files listed; or \"(none)\"]
+Keep each section terse: single-line bullets, not prose. Preserve exact file paths, symbols, commands, error strings, URLs and identifiers. Carry forward only unanswered questions or work still requiring action, in the user's own words. Preserve consequential workflow state: uncommitted, committed, pushed, under review, merged. Summarize only what the user and you said and did — leave out instruction files such as AGENTS.md, repository conventions and environment details: the next turn gets current versions of those. This summary will be your only retained memory of the earlier conversation: be specific but compact. Do not call tools and do not start any other work in this reply.";
+
+/// The section and parent one row is drawn under: `(group id, group title, parent key)`.
+///
+/// TOTAL: an ungrouped row answers `None`, and a row whose group id is not in
+/// [`PLUGIN_SETTING_GROUPS`] answers `None` too - a heading this table cannot print is worse than no
+/// heading, because the renderer would open an unnamed section.
+#[must_use]
+fn setting_display_of(
+    plugin: &str,
+    key: &str,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    let (_, _, group, parent) = SETTING_DISPLAY
+        .iter()
+        .find(|(row_plugin, row_key, _, _)| *row_plugin == plugin && *row_key == key)?;
+
+    let (id, title) = PLUGIN_SETTING_GROUPS
+        .iter()
+        .find(|(row_id, _)| Some(*row_id) == *group)?;
+
+    Some((id, title, parent.unwrap_or("")))
+}
+
+/// The prompt one plugin sends to the model, or `None` for a plugin that never prompts
+/// (`context-compaction.plugin.ts:414`; the other two built-ins declare no `systemPrompt` at all, which
+/// is the contract's ABSENT case, not an empty string).
+#[must_use]
+pub fn system_prompt_of(plugin: &str) -> Option<&'static str> {
+    match plugin {
+        "context-compaction" => Some(COMPACTION_SYSTEM_PROMPT),
+        _ => None,
+    }
+}
+
 /// Every known plugin name, in catalogue order - the list the 404 sentence prints.
 #[must_use]
 pub fn plugin_names() -> Vec<&'static str> {
@@ -981,6 +1159,11 @@ impl PluginSettingsStore {
             // `null` and never `[]`: `pluginRowOf` filters on presence, so a row that lost one is a
             // catalogue bug the absence makes visible instead of hiding.
             description: non_blank(Some(metadata.description)),
+            // The prompt this plugin commits into the transcript, shown read-only in the details pane
+            // (`api.ts:2971-2981` builds the row from `metadata.systemPrompt`). A plugin that never
+            // prompts sends NEITHER key nor `null` ([`non_blank`]'s rule, and the reason
+            // `tests/plugins.rs` pins the other two rows without it).
+            system_prompt: non_blank(system_prompt_of(metadata.name)),
             version: non_blank(Some(metadata.version)),
             tags: (!metadata.tags.is_empty())
                 .then(|| metadata.tags.iter().map(|tag| (*tag).to_owned()).collect()),
@@ -1001,7 +1184,7 @@ impl PluginSettingsStore {
             enabled: self.enabled(metadata.name),
             settings: settings_of(metadata.name)
                 .iter()
-                .map(plugin_setting_of)
+                .map(|entry| plugin_setting_row_of(metadata.name, entry))
                 .collect(),
             values: self.values(metadata.name),
         })
@@ -1211,6 +1394,9 @@ impl PluginSettingsStore {
 ///
 /// The spellings already match - the contract copied them from the descriptor - so this is a
 /// presence filter, not a rename: an unset optional stays ABSENT rather than becoming `null`.
+///
+/// This is the FLAT projection: it carries no display hints, because a descriptor is the wrong key for
+/// them (two plugins ship a `minTokens`). A row asks for [`plugin_setting_row_of`] instead.
 #[must_use]
 pub fn plugin_setting_of(entry: &PluginSettingDescriptor) -> contract::PluginSetting {
     contract::PluginSetting {
@@ -1222,7 +1408,44 @@ pub fn plugin_setting_of(entry: &PluginSettingDescriptor) -> contract::PluginSet
         max: entry.max.map(number_to_json),
         step: entry.step.map(number_to_json),
         description: non_blank(entry.description),
+        // Both display hints are ABSENT here by construction; the section and the nesting come from
+        // [`SETTING_DISPLAY`], which a caller that knows the PLUGIN name attaches
+        // ([`plugin_setting_row_of`]).
+        group: None,
+        parent_key: None,
     }
+}
+
+/// One declared descriptor -> one wire `PluginSetting`, WITH the section and the parent the plugin files
+/// it under (`api.ts:2971-2981`, which projects the row from `metadata` including `group`/`parentKey`).
+///
+/// DISPLAY ONLY, and read-only in every direction: nothing in the validator, the store or the durable
+/// document consults either hint, so a row that gained one validates, stores and restores exactly as it
+/// did before ([`SETTING_DISPLAY`]'s header states why the table is keyed by plugin name rather than
+/// carried on the descriptor).
+#[must_use]
+pub fn plugin_setting_row_of(
+    plugin: &str,
+    entry: &PluginSettingDescriptor,
+) -> contract::PluginSetting {
+    let mut row = plugin_setting_of(entry);
+
+    if let Some((id, title, parent)) = setting_display_of(plugin, entry.key) {
+        row.group = Some(contract::PluginSettingGroup {
+            id: id.to_owned(),
+            title: title.to_owned(),
+        });
+
+        // The parent is the empty string when the row is filed in a section but nested under nothing,
+        // and the contract's absent-not-null rule turns that back into an absent key.
+        row.parent_key = non_blank(if parent.is_empty() {
+            None
+        } else {
+            Some(parent)
+        });
+    }
+
+    row
 }
 
 /// The contract's "absent, never empty" rule for one optional declared string.

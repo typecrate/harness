@@ -148,7 +148,12 @@ impl Store {
                 .into_iter()
                 .map(|tool| tool.name.clone())
                 .collect(),
-            subagents: definition.subagents.clone(),
+            // The DELEGATION TARGETS of this session's definition: the entry agent's strictly-lower-
+            // ranked members, derived from `ranks` (`registry/descriptor.rs::subagents`). The tool plane
+            // keeps a NAME LIST because `delegate` resolves a target by name and must refuse a target the
+            // rank map does not allow; an empty list is what keeps the tool unregistered on a flat team
+            // (`tools/mod.rs`'s `subagents.is_empty()` gate), matching `ranks_declare_delegation`.
+            subagents: definition.subagents(),
         }
     }
 
@@ -375,8 +380,18 @@ impl Store {
         // as a capability (`api.ts:3163-3168`), which is what the handler does before calling here.
         let replacing = existing.is_some();
         if !replacing && state.created_tools.len() >= MAX_CREATED_TOOLS {
-            return Err(ApiError::conflict(format!(
-                "This session can create at most {MAX_CREATED_TOOLS} tools. Remove one first."
+            // THE SENTENCE AND THE STATUS (C1/R7). TS throws this refusal from the same kernel
+            // path this route calls (`harness.ts:3098-3102`, `HarnessError`), and the route maps
+            // it by CONTENT (`api.ts:4869-4878`): `if (/budget|limit/i.test(message)) 409 else
+            // 400`. The shipped sentence names no "budget" and no "limit", so it falls to the
+            // 400 arm — which is what the contract documents:
+            // `harness-server.swagger.yaml` ("Creation stops at the created-tool budget ... and
+            // that refusal is a 400 carrying the runtime's own advice to reuse an existing tool,
+            // not a 409") and `harness-api.ts:433-437` (same rule, quoting this exact sentence).
+            // The text is VERBATIM TS, `maxCreatedTools` interpolated; this crate's limit is the
+            // same 32 (`core/creation.ts:73` `DEFAULT_CREATED_TOOLS_LIMIT`).
+            return Err(ApiError::bad_request(format!(
+                "This harness already created {MAX_CREATED_TOOLS} tools; reuse an existing tool instead of creating more."
             )));
         }
 

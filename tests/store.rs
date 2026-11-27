@@ -930,8 +930,9 @@ async fn creating_a_session_reports_the_contract_resource_and_an_exactly_full_pa
     assert_eq!(
         created.agent_models,
         std::collections::BTreeMap::from([
+            ("debugger".to_owned(), "merge/ds4-flash".to_owned()),
+            ("general".to_owned(), "merge/ds4-flash".to_owned()),
             ("instruct".to_owned(), "merge/ds4-flash".to_owned()),
-            ("planner".to_owned(), "merge/ds4-flash".to_owned()),
             ("research".to_owned(), "merge/ds4-flash".to_owned()),
             ("reviewer".to_owned(), "merge/ds4-flash".to_owned()),
             ("summarizer".to_owned(), "merge/ds4-flash".to_owned()),
@@ -2085,8 +2086,9 @@ async fn reset_and_patch_refuse_a_live_run_and_a_quiet_session_empties() {
     assert_eq!(
         resource_of(&patched).agent_models,
         std::collections::BTreeMap::from([
+            ("debugger".to_owned(), "merge/ds4-flash".to_owned()),
+            ("general".to_owned(), "merge/ds4-flash".to_owned()),
             ("instruct".to_owned(), "model-a".to_owned()),
-            ("planner".to_owned(), "merge/ds4-flash".to_owned()),
             ("research".to_owned(), "model-b".to_owned()),
             ("reviewer".to_owned(), "merge/ds4-flash".to_owned()),
             ("summarizer".to_owned(), "merge/ds4-flash".to_owned()),
@@ -4423,5 +4425,524 @@ async fn a_failed_run_hands_its_drained_steering_back_to_the_conversation() {
         cleared,
         (false, 0),
         "delivery consumes the mailbox and the accepted counter"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 12. The per-session plugin settings store (C3 / R4)
+// ---------------------------------------------------------------------------
+//
+// `sessions.ts:864-876` gives every conversation its OWN plugin settings store: seeded from the
+// process store at creation (`:3447` copies the map down), restored from the session record, and
+// moved only by that conversation's own `PATCH {root}/sessions/{id}/plugins/{plugin_id}`. The three
+// routes that read and move it are pinned over HTTP in `tests/plugins.rs`; THIS section owns what
+// those routes depend on and cannot show: which copy of the store a write moves, what the durable
+// record re-derives, and which half of a refusal is the STORE's sentence.
+
+/// A settings patch map, spelled as JSON so a call site reads like the request body it mirrors.
+fn patch_map(entries: Value) -> serde_json::Map<String, Value> {
+    entries
+        .as_object()
+        .expect("a settings patch is an object")
+        .clone()
+}
+
+/// One session's durable record, read off the document. The only honest durability check: what
+/// matters is the bytes the next boot reads, not what a second round trip reports.
+fn persisted_session(store: &Store, id: &str) -> persistence::HarnessSessionRecord {
+    let path = store
+        .config()
+        .state_dir()
+        .join(persistence::HARNESS_DATABASE_FILE);
+
+    persistence::read_harness_database_file(&path)
+        .expect("the document is readable")
+        .sessions
+        .into_iter()
+        .find(|record| record.id == id)
+        .expect("the session is in the document")
+}
+
+/// This conversation's EFFECTIVE value for one declared key, off its own row.
+fn session_plugin_value(store: &Store, id: &str, plugin: &str, key: &str) -> Value {
+    store
+        .session_plugin_row(id, plugin)
+        .expect("the session exists")
+        .expect("the plugin ships")
+        .values
+        .get(key)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+#[tokio::test]
+async fn a_session_starts_from_the_process_store_and_moves_only_itself() {
+    let fixture = Fixture::with_scripts("plugin-store", Vec::new());
+    let store = &fixture.store;
+
+    // A conversation created while the process store is untouched: its copy is the declared defaults,
+    // and it stores nothing of its own.
+    let before = fixture.session(Some("before")).await;
+
+    assert_eq!(
+        store
+            .session_plugin_revision(&before)
+            .expect("the session exists"),
+        0,
+        "a conversation that never edited a plugin is at 0"
+    );
+    assert_eq!(
+        store
+            .session_plugin_rows(&before)
+            .expect("the session exists"),
+        store.plugin_rows(),
+        "the rows are the CATALOGUE's, so a conversation has no catalogue of its own (`api.ts:3128-3130`)"
+    );
+    assert_eq!(
+        session_plugin_value(store, &before, "context-compaction", "contextLimit"),
+        json!(200_000)
+    );
+
+    // The process store moves through its OWN write path. R4's scope rule, verbatim
+    // (`sessions.ts:2656-2660`): the value lands in the map every session created AFTER this copies
+    // down at creation, "and in nothing that already exists".
+    store
+        .update_plugin_settings(
+            "context-compaction",
+            &patch_map(json!({ "contextLimit": 150_000 })),
+        )
+        .expect("a declared key accepts an in-bounds value");
+    assert_eq!(store.plugin_revision(), 1);
+    assert_eq!(
+        session_plugin_value(store, &before, "context-compaction", "contextLimit"),
+        json!(200_000),
+        "an existing conversation is not retro-moved by a template edit"
+    );
+    assert_eq!(
+        store
+            .session_plugin_revision(&before)
+            .expect("the session exists"),
+        0,
+        "and a template edit is not a write to this conversation's counter"
+    );
+
+    // A conversation created AFTER the template moved is born with the edited value, and with a
+    // counter of its own at zero - the copy-down is not a PATCH.
+    let after = fixture.session(Some("after")).await;
+    assert_eq!(
+        session_plugin_value(store, &after, "context-compaction", "contextLimit"),
+        json!(150_000),
+        "the seed is the process store's live snapshot at creation"
+    );
+    assert_eq!(
+        store.session_plugin_revision(&after).expect("exists"),
+        0,
+        "a seeded conversation starts at 0"
+    );
+
+    // The new conversation edits a DIFFERENT key of the same plugin: its counter moves, the untouched
+    // conversation's and the template's do not (`api.ts:3116-3131` - three figures, not one).
+    store
+        .update_session_plugin_settings(
+            &after,
+            "context-compaction",
+            &patch_map(json!({ "mode": "exclude" })),
+        )
+        .expect("a conversation may set its own value");
+    assert_eq!(store.session_plugin_revision(&after).expect("exists"), 1);
+    assert_eq!(store.session_plugin_revision(&before).expect("exists"), 0);
+    assert_eq!(
+        store.plugin_revision(),
+        1,
+        "the template's figure is a separate number"
+    );
+    assert_eq!(
+        session_plugin_value(store, &after, "context-compaction", "mode"),
+        json!("exclude")
+    );
+    assert_eq!(
+        session_plugin_value(store, &after, "context-compaction", "contextLimit"),
+        json!(150_000),
+        "writing one key leaves the seeded key alone"
+    );
+    assert_eq!(
+        session_plugin_value(store, &before, "context-compaction", "mode"),
+        json!("summarize"),
+        "the untouched conversation is still at the declared default"
+    );
+    assert_eq!(
+        store.plugin_values("context-compaction")["mode"],
+        json!("summarize"),
+        "and so is the template"
+    );
+
+    // Durable, per conversation: the seeded value is RESTATED beside the change, which is what frees
+    // this conversation from the template from here on, while a conversation that changed nothing
+    // writes no member at all (`HarnessSessionRecord::plugin_settings` is `skip_serializing_if`).
+    store.save(&store.lock()).expect("the document is writable");
+    assert_eq!(
+        persisted_session(store, &after).plugin_settings,
+        Some(json!({ "context-compaction": { "contextLimit": 150_000, "mode": "exclude" } })),
+        "the record carries this conversation's whole delta, seeded half included"
+    );
+    assert_eq!(
+        persisted_session(store, &before).plugin_settings,
+        None,
+        "nothing changed, so nothing is written"
+    );
+
+    // The durable copy is RE-DERIVED from the live store, never frozen at the create-time seed: a
+    // second edit lands beside the first rather than replacing the document's copy.
+    store
+        .update_session_plugin_settings(
+            &after,
+            "context-trimmer",
+            &patch_map(json!({ "dropDuplicateCalls": true })),
+        )
+        .expect("a second plugin is writable");
+    store.save(&store.lock()).expect("the document is writable");
+    assert_eq!(
+        persisted_session(store, &after).plugin_settings,
+        Some(json!({
+            "context-compaction": { "contextLimit": 150_000, "mode": "exclude" },
+            "context-trimmer": { "dropDuplicateCalls": true },
+        })),
+        "the writer re-reads the store instead of patching the previous bytes"
+    );
+
+    // An explicit `null` is the undo, and the undo restores the DECLARED default rather than the
+    // template's value at creation: the seed lives in the same overrides map an operator edit does, so
+    // clearing it clears the seeded half too. That is the honest consequence of "this conversation owns
+    // its copy", and clearing every key drops the member entirely.
+    store
+        .update_session_plugin_settings(
+            &after,
+            "context-compaction",
+            &patch_map(json!({ "contextLimit": null, "mode": null })),
+        )
+        .expect("an explicit null is accepted for a declared key");
+    assert_eq!(
+        session_plugin_value(store, &after, "context-compaction", "contextLimit"),
+        json!(200_000),
+        "undoing a seeded override returns to the declared default, not to the template's figure"
+    );
+    assert_eq!(store.session_plugin_revision(&after).expect("exists"), 3);
+
+    store.save(&store.lock()).expect("the document is writable");
+    assert_eq!(
+        persisted_session(store, &after).plugin_settings,
+        Some(json!({ "context-trimmer": { "dropDuplicateCalls": true } })),
+        "the two cleared keys vanish from the record while the trimmer half stays"
+    );
+    assert_eq!(
+        store.plugin_values("context-compaction")["contextLimit"],
+        json!(150_000),
+        "and the template never lost its own override"
+    );
+
+    // The undo of the LAST remaining key is what empties the slot, and an empty slot writes no member.
+    store
+        .update_session_plugin_settings(
+            &after,
+            "context-trimmer",
+            &patch_map(json!({ "dropDuplicateCalls": null })),
+        )
+        .expect("the framework's reserved key is undoable too");
+    store.save(&store.lock()).expect("the document is writable");
+    assert_eq!(
+        persisted_session(store, &after).plugin_settings,
+        None,
+        "a conversation back at the declared defaults carries no `pluginSettings` member at all"
+    );
+}
+
+#[tokio::test]
+async fn the_session_plugin_store_refuses_an_unknown_session_or_plugin_before_anything_else() {
+    let fixture = Fixture::with_scripts("plugin-refusals", Vec::new());
+    let store = &fixture.store;
+    let id = fixture.session(Some("refusals")).await;
+
+    // All four reads carry the store's OWN unknown-session sentence, and they carry it before a plugin
+    // id or a patch is looked at (`api.ts:3134` / `:3173` / `:3197`, all three call `requireSession`
+    // first). The routes inherit that order, which is why `?limit=o` on a ghost is still a 404.
+    let unknown_session = "Unknown session \"ghost\".".to_owned();
+    assert_eq!(
+        refused(store.session_plugin_revision("ghost").unwrap_err()),
+        (404, unknown_session.clone())
+    );
+    assert_eq!(
+        refused(store.session_plugin_rows("ghost").unwrap_err()),
+        (404, unknown_session.clone())
+    );
+    assert_eq!(
+        refused(
+            store
+                .session_plugin_row("ghost", "context-compaction")
+                .unwrap_err()
+        ),
+        (404, unknown_session.clone())
+    );
+    assert_eq!(
+        refused(
+            store
+                .update_session_plugin_settings(
+                    "ghost",
+                    "context-compaction",
+                    &patch_map(json!({ "mode": "exclude" })),
+                )
+                .unwrap_err(),
+        ),
+        (404, unknown_session)
+    );
+
+    // An unknown PLUGIN on a write is the STORE's 404, naming the catalogue - the store is the thing
+    // that knows it (`plugins.ts requirePlugin`). A PATCH that arrives with a bad plugin id and a good
+    // body still answers this, which is why the route checks identity, then hands the rest over.
+    assert_eq!(
+        refused(
+            store
+                .update_session_plugin_settings(
+                    &id,
+                    "nope",
+                    &patch_map(json!({ "enabled": true })),
+                )
+                .unwrap_err(),
+        ),
+        (
+            404,
+            "Unknown plugin \"nope\". This build ships: async-ping, context-compaction, context-trimmer."
+                .to_owned(),
+        )
+    );
+
+    // A READ of an unknown plugin is `Ok(NONE)`, not an error: only the route can see the session id
+    // the contract asks for in that sentence (`api.ts:3182` `missing('plugin', name, record.id)`), so
+    // the store declines to invent one. `tests/plugins.rs` pins the sentence the route builds.
+    assert!(
+        store
+            .session_plugin_row(&id, "nope")
+            .expect("the session exists")
+            .is_none()
+    );
+
+    // The three refusals above mutated nothing, and a refused write moves no counter
+    // (`PluginSettingsStore::update` validates before it writes).
+    assert_eq!(store.session_plugin_revision(&id).expect("exists"), 0);
+    assert_eq!(
+        refused(
+            store
+                .update_session_plugin_settings(
+                    &id,
+                    "context-compaction",
+                    &patch_map(json!({ "nope": 1 })),
+                )
+                .unwrap_err(),
+        ),
+        (
+            400,
+            "Unknown setting \"nope\" for plugin \"context-compaction\". Allowed settings: contextLimit, modelLimits, enabled, minTokens, safetyTurns, mode."
+                .to_owned(),
+        )
+    );
+    assert_eq!(store.session_plugin_revision(&id).expect("exists"), 0);
+    assert_eq!(
+        session_plugin_value(store, &id, "context-compaction", "contextLimit"),
+        json!(200_000)
+    );
+
+    // And nothing of this reaches the document: a session whose every plugin write was refused has no
+    // durable `pluginSettings` member, exactly like a session that was never touched.
+    store.save(&store.lock()).expect("the document is writable");
+    assert_eq!(persisted_session(store, &id).plugin_settings, None);
+}
+
+// ---------------------------------------------------------------------------
+// The session-agent RANK, on the wire and in the document (review findings R1, R2)
+// ---------------------------------------------------------------------------
+
+/// A RESTART, which in this crate is a second `Store::open` over the same root (`sessions.ts:1196
+/// `initialize`; the same shape `tests/store_restore.rs:301-304` uses). Every double is the one the fixture
+/// already runs on, so the only variable left is that the state arrives off the DISK rather than from the
+/// write that produced it.
+fn restart(fixture: &Fixture) -> Store {
+    Store::open(
+        StoreConfig::at(&fixture.directory),
+        settings(),
+        Arc::new(AgentCatalogue::builtin()),
+        fixture.runtime.clone(),
+        fixture.executor.clone(),
+        Arc::new(MockProjectorFactory),
+        fixture.registry.clone(),
+        Arc::new(EventHub::new()),
+        Some(fixture.task_host.clone()),
+    )
+}
+
+/// THE RANK MEMBER IS ADDITIVE, BOTH WAYS (R1/R2, against the tolerant-durable rule at
+/// `knowledge.md:303-310`).
+///
+/// Three things, in the order that makes the middle one legible:
+///
+/// 1. A session-scoped rank written by a bind rides the binding entry's flattened `extra` map inside
+///    `core.sessionAgentOverrides`, ONE KEY in a document this build already wrote. That is why no
+///    `HARNESS_DATABASE_VERSION` moved and why no durable type gained `deny_unknown_fields`.
+/// 2. A restart still boots the session and its roster, and the restored row resolves the member through
+///    the same ladder the live roster uses. What it answers there, and the pre-existing restore gap behind
+///    it, are pinned where the assertion is - the gap costs the rank's NEIGHBOURS too, which is how the
+///    reader can tell it is not a rank defect.
+/// 3. The SAME document with the `rank` key removed - exactly what a build from before this change wrote -
+///    still restores the session and its binding, and the row falls through to the harness descriptor's
+///    letter. A missing additive member is a defaulted read, never a failed boot: a store that refused an
+///    older file would strand every session written before this change.
+#[tokio::test]
+async fn a_session_agent_rank_is_durable_and_a_legacy_document_still_restores() {
+    let fixture = Fixture::with_scripts("agent-rank-durable", Vec::new());
+    let store = &fixture.store;
+    let id = fixture.session(Some("agent-rank-durable")).await;
+
+    // The member is a shipped delegate of the `instruct` card, so the bind path is reached the way the
+    // route reaches it: detach, then bind with the contract's `rank` member. The instruction is along for
+    // the ride as the entry's other non-column state, which assertion 2 reads as the restore gap's witness.
+    store
+        .delete_session_agent(&id, "summarizer")
+        .await
+        .expect("a delegate detaches");
+
+    let bound = store
+        .create_session_agent(
+            &id,
+            &json!({"name": "summarizer", "profile": "summarizer", "rank": "C", "instruction": "carry on"}),
+        )
+        .await
+        .expect("a bind that asks for a rank is accepted");
+
+    assert_eq!(
+        bound["agent"]["rank"],
+        json!("C"),
+        "the receipt states the letter the body asked for"
+    );
+
+    store.save(&store.lock()).expect("the document is writable");
+
+    // HALF 1 - THE KEY ON DISK, in the place the store keeps a binding's non-column state. The durable
+    // shape is a MAP keyed by agent id (`store/mod.rs:2035`), not an array, which is why the entry is read
+    // by member name rather than searched for.
+    let record = persisted_session(store, &id);
+    let summarizer = record.core[store::CORE_SESSION_AGENTS]
+        .get("summarizer")
+        .expect("the binding is durable");
+
+    assert_eq!(
+        summarizer["rank"],
+        json!("C"),
+        "the rank is written as one additive member of the binding entry, next to the `guidelines` key \
+         that has ridden the same map since T1"
+    );
+
+    let restarted = restart(&fixture);
+    let roster = restarted
+        .session_agents(&id)
+        .await
+        .expect("the roster reads after a restart");
+    let restored_roster = roster["agents"].as_array().expect("a roster").clone();
+    let row = restored_roster
+        .iter()
+        .find(|row| row["agent_id"].as_str() == Some("summarizer"))
+        .expect("the bound member comes back");
+
+    // WHAT A RESTORED ROSTER ANSWERS, AND WHY IT IS NOT "C". The letter resolves through the same ladder
+    // the live roster does, and a restored binding states NO override — see the restore gap below — so the
+    // row falls through to the harness descriptor's own letter for the member. That is `rankOfMember`'s arm
+    // (`api-reads.ts:1487-1489`): the fall-through is the contract's answer, not a lossy one.
+    //
+    // THE GAP THIS TEST REPORTS RATHER THAN PAPERs OVER: `restore_session_agents` (`store/mod.rs:2942-2983`)
+    // decodes `core.sessionAgentOverrides` as a `Vec`, while `save` writes it as a map keyed by agent id
+    // (`store/mod.rs:2034-2037`, the shape asserted above), so the decode answers empty and the name-list arm
+    // behind it rebuilds every entry from the descriptor. It costs the rank AND the instruction override this
+    // same bind wrote - the row below reads back `instruction_source: "catalogue"` at `revision: 0` - so it
+    // is one pre-existing gap in a file outside this change, and the additive member is all the rank needs
+    // from it: the key is written, and a reader that reaches the entry reads it (`store::agents::entry_rank`).
+    assert_eq!(
+        row["rank"],
+        json!("B"),
+        "a restored roster resolves the member to the harness descriptor's letter"
+    );
+    assert_eq!(
+        row["origin"],
+        json!("definition"),
+        "and nothing about the binding's provenance changed on the way"
+    );
+    assert_eq!(
+        row["instruction_source"],
+        json!("catalogue"),
+        "the same gap, stated as the neighbour it costs: an instruction override a bind wrote in the SAME \
+         entry does not come back either, which is why the rank's absence here is not a rank bug"
+    );
+
+    // HALF 2 - THE OLDER DOCUMENT. Every `rank` member is stripped from the bindings, which is the exact
+    // shape a pre-migration build wrote, and the file is handed back to the loader untouched otherwise.
+    let mut database = persistence::read_harness_database_file(
+        &store
+            .config()
+            .state_dir()
+            .join(persistence::HARNESS_DATABASE_FILE),
+    )
+    .expect("the document is readable");
+
+    for record in &mut database.sessions {
+        let Some(entries) = record
+            .core
+            .get_mut(store::CORE_SESSION_AGENTS)
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        for entry in entries.values_mut() {
+            if let Some(object) = entry.as_object_mut() {
+                object.remove("rank");
+            }
+        }
+    }
+
+    persistence::write_harness_database(&fixture.directory, &database, "store-test")
+        .expect("the pre-migration document is writable");
+
+    let legacy = restart(&fixture);
+    let roster = legacy
+        .session_agents(&id)
+        .await
+        .expect("a document with no `rank` member still boots");
+    let legacy_roster = roster["agents"].as_array().expect("a roster").clone();
+    let row = legacy_roster
+        .iter()
+        .find(|row| row["agent_id"].as_str() == Some("summarizer"))
+        .expect("the binding restored");
+
+    assert_eq!(
+        row["rank"],
+        json!("B"),
+        "an absent rank is a DEFAULTED read, not a failed one: the row resolves to the harness \
+         descriptor's own letter for that member (`rankOfMember`, `api-reads.ts:1487-1489`)"
+    );
+    // THE REST OF THE ROSTER IS UNAFFECTED. The one row that DOES change is the rank itself, which is the
+    // point, so the comparison takes the members' identity, provenance and revision rather than the whole
+    // row - the members the missing key could have cost are exactly those three.
+    let members = |rows: &[Value]| -> Vec<(String, String, u64)> {
+        rows.iter()
+            .map(|row| {
+                (
+                    row["agent_id"].as_str().unwrap_or_default().to_owned(),
+                    row["origin"].as_str().unwrap_or_default().to_owned(),
+                    row["revision"].as_u64().unwrap_or_default(),
+                )
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        members(&legacy_roster),
+        members(&restored_roster),
+        "every member restored IDENTICALLY apart from the rank, so a missing additive key cost this \
+         session nothing else"
     );
 }

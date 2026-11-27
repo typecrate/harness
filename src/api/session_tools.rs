@@ -167,10 +167,23 @@ pub async fn post_session_tool(ctx: &mut Ctx) -> ApiResult {
 
     let request: contract::CreateSessionToolRequest = contract::decode_body(Value::Object(body))?;
 
+    let tool_name = request.name.clone();
     let registration = mutate_tool(ctx, &session_id, move |state, host| {
         Store::create_session_tool(state, host, &request, None)
             .map(|registration| serde_json::to_value(registration).unwrap_or(Value::Null))
     })?;
+
+    // THE FRAME (`api.ts:4839-4844`, the create arm of `registerSessionTool`): `{name, created}`, after
+    // the counter and the document. A refused candidate throws above and never reaches this line, which
+    // is the reference's own ordering and the reason a 400/409 posts nothing.
+    publish_tool_update(
+        ctx,
+        &session_id,
+        json!({
+            "name": registration_name(&registration, &tool_name),
+            "created": registration_created(&registration),
+        }),
+    );
 
     let revision = ctx.revision("session_tools", Some(&session_id));
 
@@ -274,7 +287,7 @@ pub async fn patch_session_tool(ctx: &mut Ctx) -> ApiResult {
     if body.keys().all(|key| key == "enabled") {
         let enabled = body_enabled(&body).unwrap_or(false);
 
-        return set_session_tool_enabled(ctx, &session_id, &name, enabled);
+        return set_session_tool_enabled(ctx, &session_id, &name, enabled, true);
     }
 
     let request: contract::UpdateSessionToolRequest =
@@ -289,10 +302,25 @@ pub async fn patch_session_tool(ctx: &mut Ctx) -> ApiResult {
         }
     })?;
 
+    // THE FRAME (`api.ts:4839-4844`, the update arm of `registerSessionTool`): ONE frame for this verb,
+    // `{name, created}` — and it is published BEFORE the gate half runs, exactly as the reference publishes
+    // inside `registerSessionTool` and only then applies `enabled` (`api.ts:4947` then `:4962-4980`). A
+    // patch that restates BOTH therefore moves the toolbox counter twice and publishes ONCE: the combined
+    // arm's own `bumpRevision('session_tools', ...)` at `:4977` carries no `publish` call, so a second
+    // frame here would be a kind the reference never emits for this request.
+    publish_tool_update(
+        ctx,
+        &session_id,
+        json!({
+            "name": registration_name(&registration, &name),
+            "created": registration_created(&registration),
+        }),
+    );
+
     // A patch that restates both applies the gate after the registration (`api.ts:3207-3229`), and the
     // gate's own bump is the figure the header quotes.
     if let Some(enabled) = body_enabled(&body) {
-        set_session_tool_enabled(ctx, &session_id, &name, enabled)?;
+        set_session_tool_enabled(ctx, &session_id, &name, enabled, false)?;
     }
 
     let revision = ctx.revision("session_tools", Some(&session_id));
@@ -349,12 +377,23 @@ pub async fn delete_session_tool(ctx: &mut Ctx) -> ApiResult {
         ),
     )?;
 
+    // The frame's name, taken BEFORE the write closure moves it: the reference's payload names the route's
+    // own `name` figure (`api.ts:5085-5088`), not the receipt's.
+    let tool_name = name.clone();
     let removed = mutate_tool(ctx, &session_id, move |state, host| {
         Store::delete_session_tool(state, host, &name)
             .map(|result| serde_json::to_value(result).unwrap_or(Value::Null))
     })?;
 
     let revision = ctx.revision("session_tools", Some(&session_id));
+
+    // THE FRAME (`api.ts:5085-5088`): an unregister publishes `{name, removed: true}` — the shape that says
+    // the name is GONE rather than switched off, which is the difference a warm lane acts on.
+    publish_tool_update(
+        ctx,
+        &session_id,
+        json!({ "name": tool_name, "removed": true }),
+    );
 
     // `restored_inherited` is the store's honest `false` (the T27 disclosure, `api.ts:3296-3306`).
     Ok(api::with_revision(200, removed, revision))
@@ -525,14 +564,71 @@ where
     Ok(value)
 }
 
-/// `setSessionToolEnabled` (`api.ts:2926-2989`): one enabled switch, answered in the SAME registration
+/// Publishes one toolbox change on the live hub: `publish('tool.registry_updated',
+/// [{resource: 'session_tools', id}], payload)` (`api.ts:4686`, `:4841`, `:5085`).
+///
+/// WHY IT IS A SEPARATE STEP AND NOT PART OF [`mutate_tool`]: the reference publishes AFTER the durable
+/// commit and after the counter bump (`bumpRevision` at `:4684`/`:4839`/`:5083`, then `publish` on the
+/// next lines), which is the hub's standing rule that a publisher bumps first and publishing only reports
+/// (`api-events.ts:302-306`, ported at `events.rs` and enforced by `Store::commit`). It also publishes
+/// from ONE arm of the PATCH, never twice: a patch that restates the declaration AND the gate runs the
+/// gate without a second frame (the reference's combined arm at `api.ts:4962-4980` bumps `session_tools`
+/// and pushes tool state but calls no `publish`), so the payload — and only the payload — decides which
+/// of the three shapes this becomes.
+///
+/// The kind is one of the two the `session` scope publishes
+/// (`harness-stream.ts HARNESS_WS_SCOPE_PUBLISHES`, `stream/protocol::scope_publishes`), and its counter
+/// set is `session_tools` (`protocol::kind_resources`). Payloads are the reference's three invalidation
+/// receipts — `{name, enabled}`, `{name, created}`, `{name, removed: true}` — not the registration
+/// envelope: the swagger's `WsUpdateToolRegistry` is PURE INVALIDATION with `additionalProperties: false`.
+fn publish_tool_update(ctx: &Ctx, session_id: &str, payload: Value) {
+    store_of(ctx).publish(
+        "tool.registry_updated",
+        &[("session_tools", Some(session_id))],
+        session_id,
+        None,
+        None,
+        payload,
+    );
+}
+
+/// The `created` member of one registration envelope, which is what the reference puts in the frame next
+/// to the name (`api.ts:4841-4844` reads `registered.created`). Absent reads as `false`: a replaced
+/// registration and a gate change both state `created: false`.
+fn registration_created(registration: &Value) -> bool {
+    registration
+        .get("created")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// The name the frame carries: the name the registration row reports, i.e. the trimmed name the kernel
+/// installed (`api.ts:4841` uses the route's own `name` figure, which is the same string).
+fn registration_name(registration: &Value, fallback: &str) -> String {
+    registration
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
 /// envelope a source update uses. A gate change never mints a source revision, so `source_revision`
 /// restates the installed one and `created`/`replaced` are both false.
 ///
 /// It is NOT `async`: `Ctx` is `Send` but not `Sync` (its body reader is a boxed `HttpBody`, which is
 /// `Send` only), so an async helper holding `&Ctx` across an await would make the dispatcher's future
 /// non-`Send` - the exact bound axum's `Handler` impl requires. Nothing here awaits.
-fn set_session_tool_enabled(ctx: &Ctx, session_id: &str, name: &str, enabled: bool) -> ApiResult {
+///
+/// `publish` says whether THIS call owns the frame. The `enabled`-only route does (`api.ts:4684-4688`
+/// publishes `{name, enabled}`); the combined PATCH arm does NOT (`api.ts:4962-4980` bumps and reconciles
+/// without publishing, because `registerSessionTool` already published this request's one frame).
+fn set_session_tool_enabled(
+    ctx: &Ctx,
+    session_id: &str,
+    name: &str,
+    enabled: bool,
+    publish: bool,
+) -> ApiResult {
     let row =
         tool_row(ctx, session_id, name).ok_or_else(|| missing_in("tool", name, session_id))?;
 
@@ -564,6 +660,12 @@ fn set_session_tool_enabled(ctx: &Ctx, session_id: &str, name: &str, enabled: bo
     })?;
 
     let revision = ctx.revision("session_tools", Some(session_id));
+
+    // THE FRAME (`api.ts:4686-4689`): the switch is published AFTER the counter moved and the document
+    // wrote, with the gate's own value. Only when this call is the verb itself — see the `publish` arm.
+    if publish {
+        publish_tool_update(ctx, session_id, json!({ "name": name, "enabled": enabled }));
+    }
 
     Ok(api::with_revision(
         200,

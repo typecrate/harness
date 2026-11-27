@@ -26,29 +26,47 @@ use crate::events::ResourceRef;
 use crate::read;
 use crate::registry::{self, HarnessDescriptor};
 
-/// The eight body fields `POST /harnesses` accepts (`api.ts:1515-1524`).
-const CREATE_FIELDS: [&str; 8] = [
+/// The ten body fields `POST /harnesses` accepts (`api.ts:2372-2383`).
+///
+/// THE ORDER IS THE MESSAGE: an unknown field is refused with this list verbatim ("Unknown field
+/// ... Allowed fields: ..."), so a client reading the refusal sees the contract's own order.
+///
+/// `primary` and `subagents` are GONE, and deliberately NOT accepted as aliases: a client still
+/// sending them lands in that refusal, which is the intended migration signal rather than a
+/// regression - silently accepting the old pair would invent authority for a roster the client never
+/// ranked (`api.ts:2372-2377`).
+const CREATE_FIELDS: [&str; 10] = [
     "name",
     "title",
     "description",
-    "primary",
-    "subagents",
+    // THE ROSTER, in declaration order - the only roster field.
+    "agents",
+    // ROUTING.
+    "entry",
+    // AUTHORITY: agent id -> rank letter.
+    "ranks",
     "agent_models",
     "agent_instructions",
-    // `api.ts:1523`: display colors ride the same edge as the other two maps; membership and the
-    // hex shape are the registry's decision (`registry.ts:604-629`).
+    // U6: preset-history bands ride the same edge as the other maps - membership, band shape, roles
+    // and the turn/character bounds are the registry's decision (`registry.ts:946-970`), which is
+    // where a 400 naming the agent AND the turn index comes from.
+    "agent_prefixes",
+    // `api.ts:2422`: display colors ride the same edge as the other maps; membership and the hex
+    // shape are the registry's decision (`registry.ts:817-840`).
     "agent_colors",
 ];
 
-/// The seven body fields `PATCH /harnesses/{name}` accepts (`api.ts:1572-1580`), the same set as
-/// the create minus the immutable `name`.
-const UPDATE_FIELDS: [&str; 7] = [
+/// The nine body fields `PATCH /harnesses/{name}` accepts (`api.ts:2444-2453`), the same set as the
+/// create minus the immutable `name`.
+const UPDATE_FIELDS: [&str; 9] = [
     "title",
     "description",
-    "primary",
-    "subagents",
+    "agents",
+    "entry",
+    "ranks",
     "agent_models",
     "agent_instructions",
+    "agent_prefixes",
     "agent_colors",
 ];
 
@@ -111,15 +129,12 @@ pub async fn post_harness(ctx: &mut Ctx) -> ApiResult {
 
     api::require_body_fields(&body, &CREATE_FIELDS)?;
 
-    // The two presence checks the route owns (`api.ts:1526-1532`): the contract's own sentences,
-    // which the registry repeats for a blank value. They run BEFORE the decode because a missing
-    // field must print the contract's wording, not serde's.
+    // The ONE presence check the route owns (`api.ts:2385-2387`): the contract's own sentence, which
+    // runs BEFORE the decode because a missing field must print the contract's wording, not serde's.
+    // There is no `primary` check any more - `entry` is optional with one legitimate default, so the
+    // field that could ever be missing-and-fatal is the roster, and the registry refuses that with the
+    // sentence that explains why a memberless harness cannot run a turn (`registry.ts:524-530`).
     require_text_field(&body, "name", "A harness definition requires a \"name\".")?;
-    require_text_field(
-        &body,
-        "primary",
-        "A harness definition requires a \"primary\" agent.",
-    )?;
 
     let request: CreateHarnessRequest = contract::decode_body(Value::Object(body))?;
 

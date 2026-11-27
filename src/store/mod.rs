@@ -980,6 +980,22 @@ pub struct SessionState {
     /// (`api-reads.ts:460 tasks: taskPage.tasks`).
     pub tasks: Vec<TaskRow>,
 
+    /// THIS SESSION'S OWN plugin settings store (`sessions.ts:864-876 Session.plugins`, the R4
+    /// copy-down), and the ONLY store the three session plugin routes read or write.
+    ///
+    /// Seeded from the process scope at creation (`Store::create_session` puts
+    /// `StoreInner::plugins.snapshot()` on the record and `Store::restore_session` seeds the store from
+    /// that record, so create and restart share one mechanism), re-seeded from the SESSION's durable
+    /// copy on every restore, and never written by the global `PATCH {root}/plugins/{plugin_id}`. That
+    /// separation is the feature: an operator editing the template moves what a LATER session starts
+    /// with, and a session's own edit moves nothing else.
+    ///
+    /// The counter is per-session and epoch-local (`revision()` is 0 until this session accepts a PATCH,
+    /// one bump per accepted PATCH), which is what makes the header on those three routes a staleness
+    /// test for THIS session's pane only — never a hub counter, because `plugins` is not a
+    /// `StreamResourceKind` (`api.ts:3113-3131`).
+    pub plugins: crate::plugins::PluginSettingsStore,
+
     /// The credential of a session-scoped provider override, held in memory ONLY
     /// (`sessions.ts:1618-1634 providerConnections`, which is a side map for exactly this reason).
     pub provider_key: Option<String>,
@@ -1169,6 +1185,110 @@ impl Store {
         let mut inner = self.lock();
 
         inner.plugins.update(plugin, patch)
+    }
+
+    // ------------------------------------------------------------------
+    // Session-scoped plugin settings (the session plugin trio)
+    // ------------------------------------------------------------------
+    //
+    // The same store, one copy per session (`sessions.ts:864-876` + `:3447`), and the reason the three
+    // `{root}/sessions/{session_id}/plugins*` routes exist: a template edit and a session edit are two
+    // different decisions. Everything the rows are built from - the catalogue, the descriptors, the
+    // declared defaults, the validation sentences - is SHARED with the two global routes, because
+    // `PluginSettingsStore::rows` reads the same `BUILTIN_PLUGINS` table for every copy; only the stored
+    // overrides and the counter differ. That is what keeps the two scopes from growing a second
+    // catalogue that can drift (`api.ts:3136-3139`).
+    //
+    // Every method here refuses an unknown session FIRST with the store's own sentence
+    // (`Unknown session "<id>".`), exactly as TS's `requireSession` runs before a paging parameter, a
+    // plugin id, or a body is read (`api.ts:3134` / `:3173` / `:3197`).
+
+    /// This session's plugin collection revision - the figure its three routes stamp, and the figure a
+    /// client of THIS session's pane compares against (`sessions.ts` `record.plugins.revision()`).
+    ///
+    /// Per-session and epoch-local: 0 until this session has accepted a `PATCH`, one bump per accepted
+    /// PATCH, and never moved by another session's edit or by the template's counter
+    /// (`api.ts:3116-3131`).
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::not_found`] `Unknown session "<id>".`
+    pub fn session_plugin_revision(&self, session_id: &str) -> Result<u64, ApiError> {
+        let inner = self.lock();
+        let state = inner
+            .session(session_id)
+            .ok_or_else(|| self.unknown_session(session_id))?;
+
+        Ok(state.plugins.revision())
+    }
+
+    /// Every built-in this build ships, in catalogue order, with THIS session's values in force
+    /// (`api.ts:3144-3163`, which builds each row through `pluginRowOf(record.plugins, metadata)`).
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::not_found`] `Unknown session "<id>".`
+    pub fn session_plugin_rows(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::contract::PluginSummary>, ApiError> {
+        let inner = self.lock();
+        let state = inner
+            .session(session_id)
+            .ok_or_else(|| self.unknown_session(session_id))?;
+
+        Ok(state.plugins.rows())
+    }
+
+    /// One row of this session's catalogue, `None` when this build does not ship the plugin - the store
+    /// half of `record.plugins.metadata(name)` (`api.ts:3180`), whose `undefined` the route turns into
+    /// the IN-SESSION 404 rather than the global sentence.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::not_found`] `Unknown session "<id>".`
+    pub fn session_plugin_row(
+        &self,
+        session_id: &str,
+        plugin: &str,
+    ) -> Result<Option<crate::contract::PluginSummary>, ApiError> {
+        let inner = self.lock();
+        let state = inner
+            .session(session_id)
+            .ok_or_else(|| self.unknown_session(session_id))?;
+
+        Ok(state.plugins.row_of(plugin))
+    }
+
+    /// Validate and apply one plugin's settings patch FOR ONE SESSION ONLY (`sessions.ts
+    /// updateSessionPluginSettings`, minus the commit this crate's host write owns).
+    ///
+    /// WRITE-ANYTIME: there is no idle gate here, and that is the contract's deliberate split from a
+    /// session's TOOL switch (`assertIdleForToolMutation`). A settings write moves no registration and
+    /// removes no schema the model was promised, so a run in flight keeps what it was given and the next
+    /// read of every key by this session answers the new value (`api.ts:3189-3203`).
+    ///
+    /// ALL-OR-NOTHING and NO-OP ON REFUSAL, both inherited from [`crate::plugins::PluginSettingsStore::update`]:
+    /// every entry is validated before any of them is written, so a refused patch changes neither this
+    /// session's values nor its counter.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::not_found`] `Unknown session "<id>".` (session first), then the store's own
+    /// [`ApiError::not_found`] for a plugin this build does not ship and [`ApiError::bad_request`] for an
+    /// empty patch, an unknown key, or an out-of-bounds / mistyped value.
+    pub fn update_session_plugin_settings(
+        &self,
+        session_id: &str,
+        plugin: &str,
+        patch: &Map<String, Value>,
+    ) -> Result<(), ApiError> {
+        let mut inner = self.lock();
+        let state = inner
+            .session_mut(session_id)
+            .ok_or_else(|| self.unknown_session(session_id))?;
+
+        state.plugins.update(plugin, patch)
     }
 
     /// The store's own view of the registry, for a caller that holds no lock (`sessions.ts:1827`).
@@ -2043,6 +2163,17 @@ impl SessionState {
     pub fn durable_record(&self) -> HarnessSessionRecord {
         let mut record = self.record.clone();
         self.write_core_into(&mut record);
+
+        // THE SESSION'S OWN PLUGIN OVERRIDES, re-derived from the live store rather than trusted from
+        // the record (`sessions.ts:4136-4146`, which writes `session.plugins.snapshot()`): the store is
+        // what a running turn reads, so the document must say what the store says. The omit-when-empty
+        // rule is load-bearing twice over — it keeps a session nobody configured byte-identical to its
+        // pre-feature record, and it turns a `{}` or a malformed block that survived the tolerant read
+        // back into "this session changed nothing".
+        let overrides = self.plugins.snapshot();
+
+        record.plugin_settings = (!overrides.is_empty()).then(|| Value::Object(overrides));
+
         record
     }
 
@@ -3001,6 +3132,18 @@ impl Store {
             .clone()
             .unwrap_or_default();
         let session_agents = restore_session_agents(&record);
+        // R1 (the restore half of the copy-down): the session's OWN plugin overrides, never today's
+        // template (`sessions.ts:870-871`, `createPluginSettingsStore({ values: record.pluginSettings })`).
+        // The tolerant loader already dropped anything that is not a number / boolean / string, and the
+        // store's own `restore` drops what THIS build no longer declares or what a tightened bound now
+        // refuses - so a stale slot costs that one override, never the session.
+        //
+        // A session whose record carries no block therefore starts at the DECLARED defaults, which is the
+        // honest undo of a template edit made after this session was created: `[]` and absent both mean
+        // "this session has changed nothing", and the counter starts at 0 because a boot is not a write.
+        let plugins = crate::plugins::PluginSettingsStore::seeded(
+            record.plugin_settings.as_ref().and_then(Value::as_object),
+        );
         // `sessions.ts:1570 expiresAt`: the restored session is only ever idle from the moment its last
         // write happened, measured with THIS process' window.
         let expires = updated_at.saturating_add(self.config.idle_ms);
@@ -3040,6 +3183,11 @@ impl Store {
             session_agents,
             agent_instructions,
             tasks: restore_task_rows(&core),
+            // R1: the session's own plugin settings, rehydrated from the durable copy the paragraph
+            // above read. This is the SAME decoder a create uses (`Store::create_session` seeds the
+            // record and falls through here), so a session that boots from a document and one that boots
+            // empty cannot disagree about a plugin's value.
+            plugins,
             // The credential is never persisted, so a restart always loses it
             // (`sessions.ts:1618-1634`).
             provider_key: None,

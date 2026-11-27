@@ -32,6 +32,7 @@
 //! document through verbatim (`api-reads.ts` casts rather than restates).
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::error::ApiError;
@@ -85,77 +86,60 @@ pub const MAX_PENDING_ACTIONS: usize = 4;
 pub const MAX_STEER_RECORDS: usize = 64;
 /// Tools one session may create (`created_tools`).
 pub const MAX_CREATED_TOOLS: usize = 32;
-/// Model-facing tool-result text budget (`tool_result_bytes`).
+/// Model-facing tool-result text budget (`tool_result_bytes`) — **32,768**, at parity.
 ///
-/// A DIVERGENCE, NOT PARITY — stated as an explicit, numbered divergence because the prose
-/// this block used to carry claimed TypeScript agreement that no longer exists. It was wrong
-/// on the figures, on the unit, and on all three of its citation coordinates; restate it as
-/// figures + gap rather than agreement so nobody "reconciles" the number by accident:
+/// CLOSED 2026-11-27 (contract-parity stage C1, R4). This constant used to sit at 256 KiB
+/// against TS's 32 KiB, which let 8× more tool output reach the model than the replacement
+/// target does. The magnitude gap is now closed; ONE axis is still open and is stated below so
+/// nobody reads parity as byte-for-byte agreement of the *measurement*.
 ///
-/// 1. THE TYPESCRIPT FIGURE (verified 2026-11-25, F-CUTTER review): the reference budgets
-///    **32,768** bytes per result and **98,304** per turn. `MODEL_TOOL_RESULT_BUDGET_BYTES` is
-///    token-derived at
-///    `packages/underload/harness/src/engine/core/result-budget.ts:231`
-///    (`MODEL_TOOL_RESULT_BUDGET_TOKENS` 8,192 at `:193` × `MODEL_TOKEN_BYTES` 4 at `:163`),
-///    and the aggregate sibling at `:242` is 24,576 × 4 = 98,304 (`:194`). TS publishes the
-///    figure it enforces: `engine/shared/harness-api.ts:231`
-///    `tool_result_bytes: 32768`, and `src/harness-server.swagger.yaml:296`
-///    `tool_result_bytes: 32768`. Both numbers are SERIALIZED PAYLOAD bytes (what the provider
-///    bills), not raw text bytes.
-/// 2. THE COORDINATES THE OLD COMMENT CITED ARE GONE: `core/result-budget.ts:54` (no 256 KiB
-///    line any more), `harness-api.ts:216` (the published figure moved to `:231`, and the file
-///    lives at `engine/shared/harness-api.ts`), and `harness.swagger.yaml:243` (that filename
-///    does not exist; the document is `src/harness-server.swagger.yaml`, figure at `:296`).
-///    None of the three may be re-cited. `README.md` deviation 17 still repeats the stale
-///    coordinates — that row is the historical record of the 64 KiB → 256 KiB close, and its
-///    TS references need the same correction (README is outside this comment's edit).
-/// 3. THE RUST FIGURE (what THIS crate enforces AND publishes): **262,144** (256 KiB, below)
-///    per result, and **524,288** (512 KiB) per turn
-///    ([`MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES`]) — 8× the TS per-result cap, ~5.3× its
-///    per-turn cap, and a 2× per-result-to-per-turn ratio where TS's is 3×.
-///    [`PUBLISHED_TOOL_RESULT_BYTES`] is derived from the enforced constant, so the Rust boot
-///    document advertises 262144 as well: this crate enforces what it advertises, it just
-///    advertises a different window than TS.
-/// 4. WHY THE GAP IS DELIBERATE AND STILL OPEN: TS sizes the budget from the model window
-///    (token shares × 4) and measures ESCAPED payload bytes; this crate keeps the historical
-///    256 KiB figure and measures raw UTF-8 bytes
-///    ([`crate::tools::result::utf8_byte_length`]). Closing the gap means moving BOTH axes at
-///    once — magnitude and currency — which changes delivered bytes for every existing client
-///    and needs the matching TS-side currency work. The 2026-11-25 JSON-refusal mirror
-///    therefore mirrored the RULE at these numbers, not the numbers themselves: the refusal
-///    lives in [`crate::tools::result::bound_with_reason`] and
-///    `tools::result::tests::a_json_document_at_exactly_the_budget_is_delivered_whole`
-///    deliberately freezes 262,144 so an unowned constant change shows up as a test failure.
-///
-/// The reason the ENFORCED figure sits at 256 KiB rather than the 64 KiB this crate once used
-/// is still valid and is why 64 KiB must not come back: `read` budgets its own output at the
-/// same order of magnitude and the two numbers MUST agree — with both at 64 KiB, a `read` that
-/// exactly filled its content budget was ALWAYS over the wire cap (JSON escaping adds 2-15%),
-/// so the harness cut the result mid-string and replaced the whole object with its envelope,
-/// destroying the `nextLine`/`nextColumn` fields an agent needs to continue.
-pub const MODEL_TOOL_RESULT_BUDGET_BYTES: usize = 256 * 1024;
+/// 1. THE TYPESCRIPT FIGURE THIS MIRRORS (re-verified 2026-11-27): **32,768** bytes per result.
+///    `MODEL_TOOL_RESULT_BUDGET_BYTES` is token-derived at
+///    `packages/underload/harness/src/engine/core/result-budget.ts:239-240`
+///    (`MODEL_TOOL_RESULT_BUDGET_TOKENS` 8,192 at `:201` × `MODEL_TOKEN_BYTES` 4 at `:171`).
+///    TS publishes the figure it enforces:
+///    `packages/underload/harness/src/engine/shared/harness-api.ts:218-234`
+///    `HARNESS_SERVICE_LIMITS.tool_result_bytes: 32768`, mirrored in the generated
+///    `src/engine/shared/harness-api.ts` and in
+///    `packages/underload/harness/src/harness-server.swagger.yaml`
+///    (`tool_result_bytes: 32768`). The TS invariant that the published figure equals the
+///    enforced one is pinned there by `engine/shared/harness-api.test.ts:237`.
+/// 2. STILL OPEN — THE CURRENCY, NOT THE MAGNITUDE: TS gates on ESCAPED PAYLOAD bytes
+///    (`modelPayloadBytes`, the number the provider bills); this crate gates on raw UTF-8 bytes
+///    ([`crate::tools::result::utf8_byte_length`]). The same number therefore bites slightly
+///    EARLIER here than in TS on text heavy on quotes/newlines (JSON escaping adds 2-15%).
+///    Moving the magnitude without the currency was the requested change; moving the currency
+///    is a separate stage.
+/// 3. WHY THE HISTORICAL "must stay ≥ read's own content budget" argument no longer binds at
+///    this number: the old comment kept 256 KiB because `read` budgeted its own output at the
+///    same order and the two had to agree. This crate's `read` content budget is
+///    [`crate::tools::files::READ_CONTENT_BUDGET`] (64 KiB), which is now ABOVE this cap — so a
+///    `read` that exactly fills its own budget arrives JSON-refused (see
+///    [`crate::tools::result::bound_with_reason`]) rather than surviving whole. TS closed the
+///    same interaction by setting `FILE_READ_WIRE_BUDGET = MODEL_TOOL_RESULT_BUDGET_BYTES`
+///    (`engine/tools/files/read.tool.ts`); aligning `READ_CONTENT_BUDGET` is out of C1's file
+///    ownership and is reported rather than done here.
+pub const MODEL_TOOL_RESULT_BUDGET_BYTES: usize = 32 * 1024;
 
-/// The `tool_result_bytes` figure THIS crate's boot document publishes: 262144, derived from
-/// the ENFORCED budget so the advertised figure and the enforced one can never drift apart
-/// again — which is how the old deviation 17 got away. It is NOT TS's published figure: TS
-/// advertises 32768 (`engine/shared/harness-api.ts:231`,
-/// `src/harness-server.swagger.yaml:296`); see the numbered divergence on
-/// [`MODEL_TOOL_RESULT_BUDGET_BYTES`] above.
+/// The `tool_result_bytes` figure THIS crate's boot document publishes: **32768**, identical to
+/// the TS boot document (`harness-api.ts` `HARNESS_SERVICE_LIMITS`,
+/// `harness-server.swagger.yaml`). It stays DERIVED from the ENFORCED budget so the advertised
+/// figure and the enforced one can never drift apart again — which is how the old deviation 17
+/// got away. `tests/foundation.rs` pins published == enforced.
 pub const PUBLISHED_TOOL_RESULT_BYTES: u64 = MODEL_TOOL_RESULT_BUDGET_BYTES as u64;
 
 /// The aggregate sibling of the cap above: the most TOTAL tool-result text ONE turn may
 /// commit, summed over every call the model asked for in one assistant message
 /// (`MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES`, enforced by
-/// `createToolResultTurnBudget` / [`crate::tools::result::ToolResultTurnBudget`]).
+/// `createToolResultTurnBudget` / [`crate::tools::result::ToolResultTurnBudget`]) — **98,304**,
+/// at parity.
 ///
-/// Part of the same numbered divergence as [`MODEL_TOOL_RESULT_BUDGET_BYTES`] (item 3): TS's
-/// aggregate is **98,304** — `engine/core/result-budget.ts:242`, 24,576 tokens × 4 — i.e. 3×
-/// its own 32,768-byte cap, while THIS crate's is **524,288** (512 KiB) at 2× its 262,144-byte
-/// cap. The 2× ratio is the Rust design and is pinned as arithmetic by
-/// `tools::result::tests::the_per_turn_aggregate_is_published_next_to_the_per_result_cap`: one
-/// full-budget `read` (256 KiB) plus one more large result still fit UNCHANGED, while a turn
-/// that fires eight big reads and a build-log dump can no longer spend 2 MiB in one round.
-pub const MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES: usize = 512 * 1024;
+/// CLOSED with [`MODEL_TOOL_RESULT_BUDGET_BYTES`] under the same C1 item: TS derives it at
+/// `result-budget.ts:250-251` from `MODEL_TOOL_RESULTS_PER_TURN_BUDGET_TOKENS` 24,576 (`:202`) ×
+/// `MODEL_TOKEN_BYTES` 4 (`:171`). The 3× per-result-to-per-turn ratio ("three full results per
+/// turn") is TS's design and is now this crate's too; the historical Rust 2× ratio (512 KiB over
+/// 256 KiB) went with the numbers. `tools::result::tests` re-pins the ratio as arithmetic.
+pub const MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES: usize = 96 * 1024;
 
 /// The `service` identity the root document advertises. TS sends the literal
 /// `'noobscript-harness'` (`api.ts:1307`) and the published contract documents that value,
@@ -323,12 +307,344 @@ pub enum SessionInstructionSource {
     Session,
 }
 
-/// Role of one agent inside a definition or roster (`harness-api.ts:934`).
+/// The retired two-valued role, kept ONLY as a store-side member of the durable binding entry.
+///
+/// THE CONTRACT CARRIES NO `role` ANYWHERE ON THE AGENT FAMILY (R8 - the previous wording of this note
+/// claimed the session-agent binding was "the one place the contract still carries a two-valued role",
+/// and that was false): `SessionAgentBinding` requireds `rank` and forbids `role`
+/// (`harness-api.ts:1756-1847`, `additionalProperties: false`), `CreateSessionAgentRequest` names
+/// `rank` (`:1879`), and the generated TypeScript row is `rank: AgentRank`
+/// (`engine/shared/harness-api.ts:1770`). The ONLY `role` in the contract is
+/// [`crate::contract::HarnessPrefixTurn`]'s, which means `system | user | assistant` and has nothing to
+/// do with authority.
+///
+/// So this enum is NOT a wire type any more: it is the legacy column of
+/// [`crate::store::SessionAgentEntry`], the store-side binding record that this build (and a TypeScript
+/// document written before the rank migration) persists into `core.sessionAgentOverrides`. Removing the
+/// field would break a tolerant read of those documents for no benefit, so it stays - defaulted, never
+/// emitted, and read by nothing. A new document simply omits it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentRole {
     Primary,
     Subagent,
+}
+
+// ---------------------------------------------------------------------------
+// THE RANK LETTER (R1) - swagger `AgentRank` (`:4669-4685`)
+// ---------------------------------------------------------------------------
+
+/// One rank letter, upper-case: `A` the highest authority through `Z` the lowest
+/// (`AgentRank`, `types/index.ts:1583-1616`, aliased by the generated contract at
+/// `harness-api.ts:622-627`).
+///
+/// An enum rather than a `String` because the YAML declares a closed 26-member `enum`: serde then
+/// refuses a lower-case or multi-character value at the boundary, and the rank ARITHMETIC below is
+/// total (no `Option`, no parse) because every value of this type is a legal rank. A rank is
+/// AUTHORITY, not a singleton: several members of a roster may hold the same letter, including `A`,
+/// and delegation exists exactly when a rank map holds two or more DISTINCT letters.
+///
+/// The variant order IS the rank order (`AGENT_RANKS`, `types/index.ts:1616-1643`, "highest rank
+/// first"), so `rank_index_of` is the variant index and `derive(PartialOrd)` agrees with it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+pub enum AgentRank {
+    /// Highest authority (variant index 0).
+    #[default]
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    I,
+    J,
+    K,
+    L,
+    M,
+    N,
+    O,
+    P,
+    Q,
+    R,
+    S,
+    T,
+    U,
+    V,
+    W,
+    X,
+    Y,
+    Z,
+}
+
+/// `AGENT_RANKS` (`types/index.ts:1616-1643`): the rank scale AS DATA, highest first. Every
+/// consumer that has to enumerate ranks reads this table rather than re-listing letters, so the
+/// ordering is defined in exactly one place.
+pub const AGENT_RANKS: [AgentRank; 26] = [
+    AgentRank::A,
+    AgentRank::B,
+    AgentRank::C,
+    AgentRank::D,
+    AgentRank::E,
+    AgentRank::F,
+    AgentRank::G,
+    AgentRank::H,
+    AgentRank::I,
+    AgentRank::J,
+    AgentRank::K,
+    AgentRank::L,
+    AgentRank::M,
+    AgentRank::N,
+    AgentRank::O,
+    AgentRank::P,
+    AgentRank::Q,
+    AgentRank::R,
+    AgentRank::S,
+    AgentRank::T,
+    AgentRank::U,
+    AgentRank::V,
+    AgentRank::W,
+    AgentRank::X,
+    AgentRank::Y,
+    AgentRank::Z,
+];
+
+/// The highest letter a rank may hold (`AGENT_RANKS[0]`), which the contract's refusal sentence
+/// quotes.
+pub const HIGHEST_AGENT_RANK: AgentRank = AgentRank::A;
+/// The lowest letter a rank may hold (`AGENT_RANKS[25]`): what a member no rank map names gets,
+/// because "an agent has no authority the definition did not grant it".
+pub const LOWEST_AGENT_RANK: AgentRank = AgentRank::Z;
+
+impl AgentRank {
+    /// The wire spelling: the letter itself. The match mirrors `rank_index_of` because a `const fn`
+    /// cannot index a table it is itself part of.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::A => "A",
+            Self::B => "B",
+            Self::C => "C",
+            Self::D => "D",
+            Self::E => "E",
+            Self::F => "F",
+            Self::G => "G",
+            Self::H => "H",
+            Self::I => "I",
+            Self::J => "J",
+            Self::K => "K",
+            Self::L => "L",
+            Self::M => "M",
+            Self::N => "N",
+            Self::O => "O",
+            Self::P => "P",
+            Self::Q => "Q",
+            Self::R => "R",
+            Self::S => "S",
+            Self::T => "T",
+            Self::U => "U",
+            Self::V => "V",
+            Self::W => "W",
+            Self::X => "X",
+            Self::Y => "Y",
+            Self::Z => "Z",
+        }
+    }
+}
+
+/// `rankIndexOf` (`types/index.ts:1647`): 0 = `A` (highest), 25 = `Z` (lowest). A LARGER index is a
+/// LOWER rank, which is the direction every comparison in the kernel uses.
+#[must_use]
+pub const fn rank_index_of(rank: AgentRank) -> usize {
+    match rank {
+        AgentRank::A => 0,
+        AgentRank::B => 1,
+        AgentRank::C => 2,
+        AgentRank::D => 3,
+        AgentRank::E => 4,
+        AgentRank::F => 5,
+        AgentRank::G => 6,
+        AgentRank::H => 7,
+        AgentRank::I => 8,
+        AgentRank::J => 9,
+        AgentRank::K => 10,
+        AgentRank::L => 11,
+        AgentRank::M => 12,
+        AgentRank::N => 13,
+        AgentRank::O => 14,
+        AgentRank::P => 15,
+        AgentRank::Q => 16,
+        AgentRank::R => 17,
+        AgentRank::S => 18,
+        AgentRank::T => 19,
+        AgentRank::U => 20,
+        AgentRank::V => 21,
+        AgentRank::W => 22,
+        AgentRank::X => 23,
+        AgentRank::Y => 24,
+        AgentRank::Z => 25,
+    }
+}
+
+/// `isLowerRank` (`types/index.ts:1654-1655`): may `candidate` receive a delegation FROM `caller`?
+/// True only when `candidate` is STRICTLY lower-ranked, so a same-rank peer is not a subordinate.
+#[must_use]
+pub const fn is_lower_rank(candidate: AgentRank, caller: AgentRank) -> bool {
+    rank_index_of(candidate) > rank_index_of(caller)
+}
+
+/// `isAgentRank` (`types/index.ts:1662-1663`): the untrusted-input guard. One upper-case letter of
+/// the scale; `a`, `A1`, and `""` are all false, and the caller prints its own refusal naming the
+/// scale rather than upper-casing the client's intent.
+#[must_use]
+pub fn is_agent_rank(text: &str) -> bool {
+    let mut characters = text.chars();
+
+    let Some(first) = characters.next() else {
+        return false;
+    };
+
+    characters.next().is_none() && first.is_ascii_uppercase() && first.is_ascii_alphabetic()
+}
+
+/// The letter a rank one step BELOW `rank` is, clamped at `Z` (`toolbox.ts:280`
+/// `AGENT_RANKS[Math.min(lowest + 1, AGENT_RANKS.length - 1)]`).
+#[must_use]
+pub const fn rank_below(rank: AgentRank) -> AgentRank {
+    // `Z` is its own successor: the scale is closed, so the ladder clamps instead of wrapping, and
+    // an unresolved member of an all-`Z` team lands on `Z` like its peers. Written as an `if` because
+    // `Ord::min` is not const-stable.
+    let next = rank_index_of(rank) + 1;
+
+    AGENT_RANKS[if next >= AGENT_RANKS.len() {
+        AGENT_RANKS.len() - 1
+    } else {
+        next
+    }]
+}
+
+/// Parses one wire value into a rank letter. `None` is "not a rank", which the registry answers with
+/// the contract's refusal rather than serde's.
+#[must_use]
+pub fn agent_rank_of_text(text: &str) -> Option<AgentRank> {
+    if is_agent_rank(text) {
+        // Safe: `is_agent_rank` proved one upper-case ASCII letter, and the scale is exactly those
+        // 26 letters in order.
+        Some(AGENT_RANKS[usize::from(text.as_bytes()[0] - b'A')])
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// THE TWO RANK REFUSALS (R2) - `validateBindingRank` (`sessions.ts:1205-1222`)
+// ---------------------------------------------------------------------------
+
+/// The scale spelled exactly as BOTH rank refusals quote it: `AGENT_RANKS.join(', ')`
+/// (`sessions.ts:1220`, `api.ts:4055`). Built FROM [`AGENT_RANKS`] rather than typed out, so the
+/// sentence a client reads can never drift from the scale the validator accepts - the same reason
+/// TypeScript interpolates the table instead of naming the letters in the message.
+#[must_use]
+pub fn rank_scale_spelled() -> String {
+    AGENT_RANKS
+        .iter()
+        .map(|rank| rank.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// THE ONE BINDING REFUSAL, verbatim from `validateBindingRank` (`sessions.ts:1218-1221`): a
+/// `rank` that is present and is not one upper-case letter, on either write, answers this sentence.
+///
+/// It deliberately does NOT name the value the client sent: TS's validator never guesses a rank for a
+/// bad one ("the validator NEVER reinterprets it as a rank, which is the whole point of not keeping a
+/// compat shim"), and the letter list is the answer the caller needs.
+#[must_use]
+pub fn binding_rank_refusal() -> String {
+    format!(
+        "An agent binding takes a \"rank\": one letter of the authority scale, {}. The rank is what \
+         decides what the agent may reach; the roster alone does not.",
+        rank_scale_spelled()
+    )
+}
+
+/// THE SINGLE-LETTER REFUSAL, verbatim from `api.ts:4054-4057` and `sessions.ts:8246-8249`: the PATCH
+/// reaches this one when the caller STATED `rank` and the value resolved to no authority at all -
+/// i.e. `{"rank": null}`. POST never answers it, because a `null` rank there is the contract's
+/// "ask for no authority" arm (`harness-api.ts:1932-1937`), not a malformed letter.
+#[must_use]
+pub fn rank_letter_refusal() -> String {
+    format!(
+        "An agent rank must be one letter of the authority scale, {}.",
+        rank_scale_spelled()
+    )
+}
+
+// ---------------------------------------------------------------------------
+// THE PRESET-HISTORY TURN (U6) - swagger `HarnessPrefixTurn` (`:4784-4830`)
+// ---------------------------------------------------------------------------
+
+/// The role a seeded history turn carries (`HarnessPrefixTurn.role`, swagger `:4813-4822`): the
+/// three TEXT roles only. `tool` is refused - "a tool turn belongs to a conversation, not to a
+/// preset" - and so is any other value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrefixTurnRole {
+    /// Legal here: a preset band is a SEED, not a conversation, so a system turn sits BELOW the
+    /// member's instruction rather than competing with it.
+    System,
+    User,
+    Assistant,
+}
+
+/// One seeded history turn (`HarnessPrefixTurn`, `types/index.ts:727-731`, swagger `:4788-4830`): a
+/// message the definition places in a member's transcript BEFORE its first real turn.
+///
+/// THE CLOSED PAIR IS LOAD-BEARING: only `role` + `content` exist, which is what keeps one band
+/// meaning the same bytes in a template, a session override, and an engine band. `toolCalls`,
+/// `toolCallId`, `usage`, and attachments belong to the transcript record, and a request that carries
+/// one has it DROPPED rather than refused (swagger `:4794-4806`) - so this type models what is
+/// STORED, and the registry's `require_prefix_turns` is the place that drops or refuses.
+///
+/// `content` is VERBATIM: the route never trims, re-wraps, or normalises it, because the bytes a
+/// client saved are the bytes the model reads. An empty string is a real transcript entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessPrefixTurn {
+    pub role: PrefixTurnRole,
+    pub content: String,
+}
+
+/// Which layer wrote the preset-history band one session agent seeds
+/// (`SessionPrefixTurnsResponse.source`, swagger `:6667-6680`).
+///
+/// THREE answers only: `session` for a band this conversation stored that DIFFERS from what its
+/// definition seeds, `harness` for the frozen definition's own band, and `none` when no layer seeds
+/// one. There is no `catalogue`/`global` arm - a preset history has no catalogue layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionPrefixSource {
+    Harness,
+    Session,
+    /// No layer seeds this member; `prefix` is empty.
+    None,
+}
+
+/// The preset history one session agent actually seeds, plus its provenance
+/// (`SessionPrefixTurnsResponse`, swagger `:6644-6679`).
+///
+/// `prefix` is the LIVE band, in order, verbatim - EMPTY when nothing seeds this member, which is
+/// also what `source: none` states. A session write that restates the definition's own bytes answers
+/// `harness`, because no reader can observe a difference that is not there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionPrefixTurnsResponse {
+    pub session_id: String,
+    pub agent_id: String,
+    pub prefix: Vec<HarnessPrefixTurn>,
+    pub source: SessionPrefixSource,
 }
 
 /// Whether a roster binding came from the frozen definition or was created in the session.
@@ -1521,9 +1837,16 @@ pub struct ModelIndex {
 // Harness definitions
 // ---------------------------------------------------------------------------
 
-/// One named harness definition as a picker needs it (`harness-api.ts:422`). `agents` is
-/// derived as `[primary, ...subagents]`. A card omits per-agent instruction TEXT, the
-/// per-agent model map, and the resolved core-tool set; the identified read adds those.
+/// One named harness definition as a picker needs it (`HarnessCard`, swagger `:4702-4765`,
+/// `harness-api.ts:634-680`).
+///
+/// THREE INDEPENDENT FACTS, NOT ONE DERIVED SET: `agents` is the roster in DECLARATION ORDER,
+/// `entry` is ROUTING, and `ranks` is AUTHORITY. Swagger `:4707-4712` states the rule the earlier
+/// port violated - "`agents` is the roster in DECLARATION ORDER - it is not derived from anything,
+/// and neither `entry` nor `ranks` is derived from it" - so nothing here computes one from another:
+/// position in the roster states no authority, and the only place order matters is the DEFAULT for an
+/// omitted `entry`. A card omits per-agent instruction TEXT, the per-agent model map, and the
+/// resolved core-tool set; the identified read adds those.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct HarnessCard {
@@ -1531,11 +1854,15 @@ pub struct HarnessCard {
     pub title: String,
     pub description: String,
     pub requires_endpoint: bool,
-    pub primary: String,
-    /// ALWAYS serialized (`harness-api.ts:432`): an empty array is a FACT, not an absence -
-    /// it is what tells a picker that `delegate` is not registered for this harness.
-    #[serde(default)]
-    pub subagents: Vec<String>,
+    /// THE ENTRY AGENT (routing only): the member an unfocused submit opens a conversation for, and
+    /// the member a session refuses to delete. It carries whatever letter `ranks` gives it, and a
+    /// definition with several top-ranked members still has exactly one entry.
+    pub entry: String,
+    /// THE RANK MAP, and it ALWAYS serializes: it covers EVERY name in `agents` because the server
+    /// resolves a sparser request into it with the runtime's own fill rule (swagger `:4722-4733`).
+    /// A card states what the harness RUNS, never a subset an operator happened to write.
+    pub ranks: BTreeMap<String, AgentRank>,
+    /// THE ROSTER, in declaration order.
     pub agents: Vec<String>,
     pub tools: Vec<String>,
     pub builtin: bool,
@@ -1571,6 +1898,21 @@ pub struct HarnessDefinition {
     /// `instruction_summary`, and `preserve_order` makes the declared order the wire order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_colors: Option<BTreeMap<String, String>>,
+    /// The per-agent PRESET-HISTORY bands (swagger `:4859-4883`).
+    ///
+    /// THE ONE MAP WITHOUT THE NON-EMPTY RULE ON THE DEFINITION READ: the identified read ALWAYS
+    /// states it, `{}` when the definition seeds nothing, because a harness PATCH REPLACES the map
+    /// and a present `{}` is the explicit clear - so a client may only send the map it has READ, and
+    /// "absent" would otherwise be ambiguous between "no preset-history editor" and "nothing seeded".
+    /// `harness_definition_of` therefore always supplies `Some` (even an empty map), while the
+    /// SAVED SESSION's copy keeps the non-empty rule (`api-reads.ts` `sessionDefinitionOf`, and
+    /// `sessions.ts:1638-1650`, which deletes an empty map), so the field is `Option` here and the
+    /// two projections decide.
+    ///
+    /// A member keyed `[]` is echoed back: an explicit "no preset history" is a stated choice, which
+    /// is why an empty BAND keeps its key while an empty MAP is the clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_prefixes: Option<BTreeMap<String, Vec<HarnessPrefixTurn>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction_summary: Option<Vec<HarnessInstructionSummaryEntry>>,
 }
@@ -1624,9 +1966,22 @@ pub struct DeleteHarnessResult {
     pub restored_by_restart: bool,
 }
 
-/// Selection-only create body (`harness-api.ts:468`): a client picks trusted agent names
-/// and may record per-agent model ids and instruction overrides; it cannot supply a
-/// provider, a credential, a transport, or a tool list.
+/// Selection-only create body (`CreateHarnessRequest`, swagger `:4888-4981`): a client picks trusted
+/// agent names and may record per-agent model ids, instruction overrides, preset-history bands, and
+/// display colors; it cannot supply a provider, a credential, a transport, or a tool list.
+///
+/// THE ROSTER IS `agents`, in declaration order, and it is the ONLY roster field: `required`
+/// `[name, agents]`, with `entry`, `ranks`, and the four maps optional. `primary` and `subagents` are
+/// NOT accepted as aliases - they land in the `additionalProperties: false` refusal that names the
+/// accepted set (swagger `:3998`, `api.ts:2372-2386`).
+///
+/// WHY `agents`, `entry`, `ranks`, and `agent_prefixes` ARE RAW `Value`s
+/// ---------------------------------------------------------------------
+/// TypeScript's route forwards all four UNVALIDATED (`api.ts:2408-2425`: "this handler only moves
+/// bytes"), and the registry owns every refusal - the roster sentence, the membership sentence that
+/// lists the members, and the rank sentence that quotes the scale. A typed field would let serde
+/// answer first with serde's wording, so the shape stays JSON here and `crate::registry` validates
+/// it, which is the split the contract documents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CreateHarnessRequest {
@@ -1635,13 +1990,29 @@ pub struct CreateHarnessRequest {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub primary: String,
+    /// THE ROSTER: at least one agent, at most 16, in declaration order, no duplicates. A harness
+    /// with no agent has no entry and no rank, so it could never run a turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subagents: Option<Vec<String>>,
+    pub agents: Option<Value>,
+    /// THE ENTRY AGENT (routing). Omitted means the FIRST roster name - the only default the rank
+    /// model allows, because position states no authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<Value>,
+    /// THE RANK MAP. May name fewer members than the roster; every member it leaves out is filled one
+    /// rank BELOW the lowest rank it does state, and the read returns the RESOLVED map. Omitted
+    /// ENTIRELY is the ordinary team (entry at `A`, everyone else at `B`); an explicit `{}` is the
+    /// flat team (everyone at `B`, no delegation at all).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranks: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_models: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_instructions: Option<BTreeMap<String, String>>,
+    /// The fourth map of the same shape (`agent_prefixes`, swagger `:4953-4976`): agent name to that
+    /// member's complete ordered preset-history band. A key REPLACES that member's whole band, an
+    /// explicit `[]` states "starts with no preset history", and `{}` clears every band.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_prefixes: Option<Value>,
     /// The third map of the same shape (`harness-api.ts:484`): agent id -> CSS hex color. A client
     /// may record a swatch for each member it selects; the registry decides membership and the hex
     /// shape (`registry.ts:604-629`).
@@ -1649,9 +2020,13 @@ pub struct CreateHarnessRequest {
     pub agent_colors: Option<BTreeMap<String, String>>,
 }
 
-/// Patch body (`harness-api.ts:488`): an omitted field keeps its current value and the name
-/// is immutable. `agent_models` and `agent_instructions` REPLACE the map they name (`{}`
-/// clears it).
+/// Patch body (`UpdateHarnessRequest`, swagger `:4982-5054`): an omitted field keeps its current
+/// value and the name is immutable. `agents` REPLACES the roster, `entry` REPLACES routing, `ranks`
+/// REPLACES the authority map, and the four per-agent maps REPLACE the map they name (`{}` clears
+/// it). An override for a member this patch removes is dropped rather than rejected.
+///
+/// The same raw-`Value` reasoning as [`CreateHarnessRequest`] applies to `agents`, `entry`, `ranks`,
+/// and `agent_prefixes`: the route forwards them unvalidated and the registry owns the sentences.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct UpdateHarnessRequest {
@@ -1660,14 +2035,18 @@ pub struct UpdateHarnessRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub primary: Option<String>,
+    pub agents: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subagents: Option<Vec<String>>,
+    pub entry: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranks: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_models: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_instructions: Option<BTreeMap<String, String>>,
-    /// REPLACE semantics like the two maps above (`harness-api.ts:507`): `{}` clears every color,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_prefixes: Option<Value>,
+    /// REPLACE semantics like the maps beside it (`harness-api.ts:507`): `{}` clears every color,
     /// and a color for a member this patch removes is dropped rather than rejected
     /// (`registry.ts:1377-1389`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1904,8 +2283,22 @@ pub enum PluginSettingType {
     Boolean,
 }
 
+/// The visual section one setting row is drawn under (`PluginSetting.group`,
+/// `harness-server.swagger.yaml:5385-5407`). DISPLAY hint ONLY: the server validates, stores and
+/// returns the value without consulting it, so this struct is a projection and never an input.
+/// Both members are REQUIRED by the contract once the group is present (`required: [id, title]`),
+/// and the whole group is absent — never `null` — for a row the plugin never grouped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginSettingGroup {
+    /// Stable machine id of the section. Rows sharing an `id` render under one heading, in
+    /// first-appearance order.
+    pub id: String,
+    /// The human heading a renderer prints verbatim.
+    pub title: String,
+}
+
 /// One DECLARED setting of a plugin, copied verbatim from the plugin's own metadata
-/// (`harness-api.ts:664`). `default` is the value the plugin falls back to when nothing is
+/// (`harness-api.ts:1071`). `default` is the value the plugin falls back to when nothing is
 /// stored AND the target a `null` patch entry restores. `min`/`max` bound what the server
 /// accepts; `step` bounds only what a client offers and is deliberately NOT enforced
 /// (`server/plugins.ts` header, "VALIDATION AT THE WRITE EDGE").
@@ -1914,6 +2307,13 @@ pub enum PluginSettingType {
 /// INTEGER (`min: 1000`, never `1000.0`): serde_json prints an `f64` with its fraction, and the
 /// contract's rows are asserted byte-exact. `crate::plugins` owns the one conversion that keeps
 /// that promise.
+///
+/// C1/R2 added `group` and `parentKey`, the two DISPLAY hints the contract declares after
+/// `description` (YAML `PluginSetting`, `harness-api.ts:1096-1112`). They say WHERE a row is drawn,
+/// never what its value means, so validation, defaults and persistence ignore them and this crate
+/// treats them as pure projection. `parentKey` keeps the contract's camelCase — the display
+/// subtree is the one place on this contract that does not use snake_case, so the field is named
+/// `parent_key` in code and renamed on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct PluginSetting {
@@ -1931,9 +2331,16 @@ pub struct PluginSetting {
     pub step: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The section this row belongs to, when the plugin grouped it; absent renders the row in the
+    /// flat top-level run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<PluginSettingGroup>,
+    /// Key of the BOOLEAN setting that gates this row. camelCase on the wire.
+    #[serde(default, rename = "parentKey", skip_serializing_if = "Option::is_none")]
+    pub parent_key: Option<String>,
 }
 
-/// One built-in plugin as an operator sees it (`harness-api.ts:682`): identity, the lifecycle
+/// One built-in plugin as an operator sees it (`harness-api.ts:1118`): identity, the lifecycle
 /// hooks it declares, its settings descriptors, and the values in force RIGHT NOW.
 ///
 /// `builtin` is always `true` on this route - the catalogue is the set this build ships - and it
@@ -1953,6 +2360,13 @@ pub struct PluginSummary {
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// C1/R2: the system prompt this plugin sends to the model, shown READ-ONLY in the details
+    /// pane (`harness-api.ts:1128-1141`, YAML `PluginSummary.system_prompt`). Display metadata
+    /// only - it never shapes behaviour - and ABSENT-not-null for a plugin that never prompts,
+    /// which is what keeps every other row's shape byte-identical. snake_case like every other
+    /// multi-word key on this contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2127,15 +2541,27 @@ pub struct UpdateSessionRequest {
     pub title: Option<Option<String>>,
 }
 
-/// One entry of a session's live agent roster (`harness-api.ts:931`): a row states both what
+/// One entry of a session's live agent roster (`harness-api.ts:1756-1847`): a row states both what
 /// the session was BUILT with and what it RUNS now. Instruction TEXT lives on the
 /// instruction subresource.
+///
+/// THE AUTHORITY MEMBER IS `rank`, NOT `role` (R1). The contract's `required` list is
+/// `[agent_id, profile, rank, origin, model, inherited_model, instruction_source, instruction_chars,
+/// editable, deletable, restorable, revision]` under `additionalProperties: false`, and the generated
+/// row is `rank: AgentRank` (`engine/shared/harness-api.ts:1770`), so emitting a `role` member was a
+/// double break: a validating client saw a missing required `rank` AND an undeclared `role`. This
+/// struct therefore carries neither - the letter is projected by
+/// [`crate::store::read::session_agent_rank`], and the retired enum stays store-side
+/// ([`AgentRole`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionAgentBinding {
     pub agent_id: String,
     pub profile: String,
-    pub role: AgentRole,
+    /// The letter this session RUNS this member at: the session's own override when it set one, else
+    /// the frozen harness definition's rank map, else the LOWEST letter (`Z`) - never a rank this
+    /// build invented (`api-reads.ts:1564`, `rankOfMember`).
+    pub rank: AgentRank,
     pub origin: BindingOrigin,
     pub model: String,
     pub inherited_model: String,
@@ -2170,8 +2596,12 @@ pub struct SessionAgentResponse {
     pub agent: SessionAgentBinding,
 }
 
-/// Binds an existing trusted profile into this session (`harness-api.ts:974`): no
+/// Binds an existing trusted profile into this session (`harness-api.ts:1883-1942`): no
 /// implementation, tool list, or transport is accepted, so nothing here can inject code.
+///
+/// THE BODY IS THE CONTRACT'S SIX MEMBERS - `name, profile, model, instruction, prefix, rank` - and the
+/// retired `role` is NOT one of them (`api.ts:4188` validates exactly this list, and the generated
+/// request names `rank?: AgentRank` at `harness-api.ts:1938`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CreateSessionAgentRequest {
@@ -2181,19 +2611,66 @@ pub struct CreateSessionAgentRequest {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
+    /// THE RANK this session gives the member (`harness-api.ts:1938`). Absent or `null` asks for NO
+    /// authority, which this build resolves through the frozen definition's map and finally the LOWEST
+    /// letter; the route refuses any value that is not one upper-case `A-Z` letter
+    /// (`sessions.ts:1205 validateBindingRank`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<AgentRole>,
+    pub rank: Option<AgentRank>,
+    /// The member's PRESET HISTORY (`harness-api.ts:1931`), a `TurnBlock[]` so it travels as raw JSON
+    /// through the ONE band validator ([`crate::registry::require_prefix_turns`]). Unlike the PATCH, a
+    /// `null` here asks for NOTHING of its own rather than restoring a band (`harness-api.ts:1927-1931`),
+    /// so the store treats it as unstated.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_stated_value"
+    )]
+    pub prefix: Option<serde_json::Value>,
 }
 
 /// An omitted property is no change; a string REPLACES the whole field; an explicit `null`
 /// clears the session override and RESTORES the inherited binding (`harness-api.ts:988`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `prefix` is a `TurnBlock[]`, so it travels as raw JSON rather than a typed block list: the band is
+/// validated by [`crate::registry::require_prefix_turns`], the ONE validator this crate owns
+/// (`api.ts:4060`), and re-validated by the store write exactly as TS's `setSessionAgentPrefix`
+/// re-validates it (`sessions.ts:8166`). `Eq` cannot survive a `Value` field, so this DTO compares with
+/// `PartialEq` only.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct UpdateSessionAgentRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction: Option<Option<String>>,
+    /// THE AUTHORITY WRITE (`harness-api.ts:1956-1962`). This field has NO restore arm: `api.ts:4051-4058`
+    /// refuses a stated `null` with the single-letter sentence, so the only value that can reach the store
+    /// is a letter, and an absent key means no change (the plain `Option` serde gives exactly that).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<AgentRank>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_stated_value"
+    )]
+    pub prefix: Option<serde_json::Value>,
+}
+
+/// Reads a field that has THREE states: absent, stated `null`, and stated value.
+///
+/// WHY NOT `Option<Option<Value>>`: serde absorbs a JSON `null` into the OUTER `None`, which is the same
+/// trap this crate already documents for `model` and `instruction` (`api/session_agents.rs:405-410`,
+/// where the route rewrites a stated `null` into the blank string the store reads as a restore). A band
+/// has no spare string to borrow - `[]` is a real choice, "this conversation seeded no history", and it
+/// answers `source: session` where `null` answers `source: harness` - so the field deserializes through
+/// `Value` directly: present means present, and `Value::Null` IS the restore arm
+/// (`sessions.ts:8157-8163`).
+fn deserialize_stated_value<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <serde_json::Value as serde::Deserialize>::deserialize(deserializer).map(Some)
 }
 
 /// Receipt of a roster removal (`harness-api.ts:998`).
@@ -3119,6 +3596,17 @@ pub struct ContextBlock {
     pub result_chars: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_prompt: Option<bool>,
+    /// C1/R3: the LIVE, reader-facing verdict for this segment (`harness-api.ts:3766-3815`,
+    /// `harness-server.swagger.yaml` `ContextBlock.included`). The PROJECTOR never mints it —
+    /// `inPrompt` is the static per-kind figure and `included` is a fact about the CONVERSATION's
+    /// transcript — so the reads that can name the entry behind the segment stamp it at read time:
+    /// the block-detail route answers the ENTRY verdict (`api.ts:4597-4630`) and the display route
+    /// answers the SEGMENT verdict (`api.ts:2022` `contextSegmentIncludedOf`, applied by
+    /// `displaySectionsWithInclusionOf` at `:2100-2131`). ABSENT is never SYNTHESIZED: a segment
+    /// with no addressable entry carries no key at all, which is the reader's cue to show no
+    /// control. Only a literal `false` dims a segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub included: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_from: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3263,6 +3751,18 @@ pub const HARNESS_WS_UPDATE_KINDS: [&str; 16] = [
     "catalogue.updated",
     "config.updated",
 ];
+
+/// Whether `kind` is one of the [`HARNESS_WS_UPDATE_KINDS`].
+///
+/// The set exists once, in this constant, and this is the only reader of it: every publish path
+/// asserts against it (`events.rs::publish_with_ops`) so a new kind cannot be published without
+/// being added to the set the contract and the stream's `subscription_state.publishes` tables
+/// describe. `harness-stream.ts:62` states the same list as a `satisfies` clause, which is the
+/// compile-time version of the same gate.
+#[must_use]
+pub fn is_update_kind(kind: &str) -> bool {
+    HARNESS_WS_UPDATE_KINDS.contains(&kind)
+}
 
 /// Protocol error codes (`harness-stream.ts:65`).
 pub const HARNESS_WS_PROTOCOL_CODES: [&str; 9] = [

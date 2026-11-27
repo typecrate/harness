@@ -513,6 +513,9 @@ async fn the_standalone_executable_starts_the_default_inline_deployment() {
             contract::HARNESS_WS_STREAM_PATH
         )
     );
+    // Wave W2: there is no `docs:` line. The listener answers the mount, the stream, and (when the
+    // operator named one) a mirror root, which is exactly what the reference's own banner prints
+    // (`dev.ts:139-145`), so the next line is the data root.
     assert_eq!(
         banner_line(&mut lines).await,
         format!("  database root:  {}", root.path.display())

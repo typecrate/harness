@@ -295,6 +295,16 @@ impl EventHub {
         payload: serde_json::Value,
         ops: Vec<serde_json::Value>,
     ) -> HubEvent {
+        // THE UPDATE-KIND GATE. Every publish in the crate reports one of the 16 contract kinds
+        // (`contract::HARNESS_WS_UPDATE_KINDS`, `harness-stream.ts:62`), and a kind outside that set
+        // would reach a client as an `update` frame its `subscription_state.publishes` table never
+        // named. The TS union checks this at compile time; a debug build checks it here, and the
+        // integration suite runs in debug, so an invented kind fails rather than shipping.
+        debug_assert!(
+            crate::contract::is_update_kind(kind),
+            "publishing an update kind outside HARNESS_WS_UPDATE_KINDS: {kind}"
+        );
+
         let at = now_millis();
 
         // Normalized ONCE, so the event's `resources` and its `revisions` name exactly the
@@ -627,4 +637,55 @@ pub fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The update-kind gate lives in this file, so its proof lives here: an integration test cannot
+    //! make the debug assertion fire, because every publish the crate contains already names a
+    //! contract kind.
+
+    use super::*;
+
+    /// A kind outside the 16-kind union panics the hub in a debug build, which is what keeps an
+    /// invented kind from reaching a client as an `update` frame that no
+    /// `subscription_state.publishes` table ever promised (`harness-stream.ts:62`).
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "publishing an update kind outside HARNESS_WS_UPDATE_KINDS")]
+    fn an_invented_update_kind_panics_the_gate() {
+        let hub = EventHub::new();
+
+        let _ = hub.publish(
+            "agent.roster_changed",
+            &[ResourceRef::new("session", Some("s-1"))],
+            Some("s-1"),
+            None,
+            None,
+            serde_json::json!({ "agent_id": "general" }),
+        );
+    }
+
+    /// The gate accepts the contract's list, in full, and refuses a near-miss: a name that reads like
+    /// a kind but is not one.
+    #[test]
+    fn every_contract_kind_passes_the_gate() {
+        assert_eq!(
+            crate::contract::HARNESS_WS_UPDATE_KINDS.len(),
+            16,
+            "the union has sixteen members (`harness-stream.ts:62`)"
+        );
+
+        for kind in crate::contract::HARNESS_WS_UPDATE_KINDS {
+            assert!(
+                crate::contract::is_update_kind(kind),
+                "`{kind}` is a contract kind"
+            );
+        }
+
+        assert!(
+            !crate::contract::is_update_kind("session.changed"),
+            "a near-miss name is not a contract kind"
+        );
+    }
 }

@@ -23,7 +23,7 @@ use serde_json::Value;
 use crate::agents::AgentCatalogue;
 use crate::config::{HarnessRuntimeSettings, ServerConfig};
 use crate::contract::{
-    self, AgentResultStatus, AgentRole, BindingOrigin, CommandDescriptor, HarnessErrorInfo,
+    self, AgentRank, AgentResultStatus, BindingOrigin, CommandDescriptor, HarnessErrorInfo,
     HarnessEvent, HarnessMessage, HarnessUsage, InstructionSource, PendingAction, ProviderConfig,
     QueuedTask, ResourceBudget, SessionAgentBinding, SessionDefinitionResource,
     SessionInstructionSource, SessionStatePatch, SessionStatus, SessionSummary, SessionToolSummary,
@@ -34,8 +34,8 @@ use crate::contract::{
 use crate::events::{EventHub, now_millis};
 use crate::registry::HarnessRegistry;
 use crate::store::{
-    SessionState, TurnState, created_tool_value, parse_status, parse_turn_status, thread_key,
-    turn_key,
+    SessionAgentEntry, SessionState, TurnState, created_tool_value, parse_status,
+    parse_turn_status, thread_key, turn_key,
 };
 
 /// A queued task's row preview (`api-reads.ts:96` `QUEUE_PREVIEW_CHARS`). A queue panel of 100 x
@@ -270,11 +270,13 @@ impl SessionState {
         members
     }
 
-    /// The entry agent of this session (`definition.primary`, the one member that is never
-    /// detachable, `api-reads.ts:968-969`).
+    /// The entry agent of this session (`definition.entry`, the one member that is never detachable,
+    /// `api-reads.ts:968-969`). The name of this accessor is legacy: the wire's `role` column still
+    /// spells entry membership `primary`, which the session-agent binding migration would rename
+    /// together with `rank` (see this crate's `knowledge.md` dated section).
     #[must_use]
     pub fn primary_agent(&self) -> String {
-        self.definition().primary
+        self.definition().entry
     }
 
     /// The model one member actually runs with.
@@ -591,6 +593,16 @@ pub fn session_definition_of(
             // conversation paints. A member the map omits has NO configured color.
             agent_colors: (!definition.agent_colors.is_empty())
                 .then(|| definition.agent_colors.clone()),
+            // U6/F1: the frozen copy's per-agent PRESET-HISTORY bands (`api-reads.ts:1961-1990`).
+            // THE PRESENCE RULE DIFFERS FROM THE IDENTIFIED HARNESS READ ON PURPOSE: a session client
+            // negotiates the preset editor from the ROUTE (`GET …/agents/{id}/prefix`, which answers
+            // 404 on a pre-U6 backend), not from this property, so the map keeps the non-empty omission
+            // rule the two text maps use and a session frozen on a definition that seeds nothing keeps
+            // its exact pre-U6 wire row. A member keyed with `[]` still makes the map NON-empty and is
+            // echoed. This is the UNTOUCHED definition copy - the band this conversation rewrote lives
+            // in `record.preset.agent_prefixes`, which is what the prefix route reads.
+            agent_prefixes: (!definition.agent_prefixes.is_empty())
+                .then(|| definition.agent_prefixes.clone()),
             instruction_summary: summary,
         },
         session_id: state.record.id.clone(),
@@ -1534,11 +1546,7 @@ pub fn session_agent_rows_of(
                 profile: binding
                     .map(|binding| binding.profile.clone())
                     .unwrap_or_else(|| agent.clone()),
-                role: if agent == definition.primary {
-                    AgentRole::Primary
-                } else {
-                    AgentRole::Subagent
-                },
+                rank: session_agent_rank(&agent, binding, &definition),
                 origin: if binding.is_some() && !definition_member {
                     BindingOrigin::Session
                 } else {
@@ -1563,13 +1571,48 @@ pub fn session_agent_rows_of(
                 guidelines_count: Some(u64::try_from(guidelines.len()).unwrap_or(u64::MAX)),
                 editable: true,
                 // The entry agent cannot be detached: every session needs an entry point (`:968`).
-                deletable: agent != definition.primary,
+                deletable: agent != definition.entry,
                 restorable: source != SessionInstructionSource::Catalogue,
                 busy: is_agent_busy(state, &agent).then_some(true),
                 revision,
             }
         })
         .collect()
+}
+
+/// The LETTER one roster row reports for one member (`api-reads.ts:1564`):
+/// `record.harness.ranks?.[name] ?? rankOfMember(definition.ranks, name)`.
+///
+/// THE LADDER, strongest first, is TS's and has no fourth rung:
+/// 1. THE SESSION'S OWN OVERRIDE — the letter a `POST .../agents` with `rank` or a binding PATCH gave
+///    this member, which TS reads off the LIVE harness because that map is what decides delegation for the
+///    run in front of the reader. This build has no in-process brain, so the durable copy IS the live map:
+///    the override rides the session's binding entry (`store::agents::entry_rank`), and TS's read agrees
+///    with it for the same reason it reads the harness — "the rank the runtime holds is the one that decides
+///    delegation" (`api-reads.ts:1557-1562`).
+/// 2. THE FROZEN DEFINITION'S MAP (`rankOfMember`, `api-reads.ts:1487-1489`): what the harness was built
+///    with, which is also what a member this session merely inherited runs at. The definition copy is
+///    never rewritten by a session write, so an override can never look like the template's own choice.
+/// 3. THE LOWEST LETTER, `Z` — `LOWEST_RANK` in the same file. A member NO map names has no authority the
+///    definition granted it, which is the honest answer for an agent this conversation bound without asking
+///    for a rank, and the one the contract states for both shapes (`harness-api.ts:1766-1770`,
+///    `:1932-1937`).
+///
+/// WHAT IS DELIBERATELY NOT HERE: TS's POST default, where a caller that named no rank gets whatever
+/// `Harness.addAgent` decided (documented as one letter below the lowest EXPLICITLY configured rank,
+/// `toolbox.ts`, resolved back off the handle at `sessions.ts:7815-7822`). That figure is a property of a
+/// live brain this port does not run, and inventing it here would report an authority nothing enforces -
+/// so an unranked binding reports the definition's letter or `Z`, which is what every other read of the
+/// same record says.
+#[must_use]
+pub fn session_agent_rank(
+    agent: &str,
+    binding: Option<&SessionAgentEntry>,
+    definition: &crate::registry::HarnessDescriptor,
+) -> AgentRank {
+    crate::store::agents::entry_rank(binding)
+        .or_else(|| definition.ranks.get(agent).copied())
+        .unwrap_or(contract::LOWEST_AGENT_RANK)
 }
 
 /// `isAgentBusy` (`api-reads.ts:977-990`): whether one member currently has a run in flight (a lane

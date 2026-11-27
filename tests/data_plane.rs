@@ -1650,49 +1650,114 @@ fn journal_reader_matches_the_typescript_reader_case_by_case() {
     );
 }
 
-/// 6. The registry: five shipped presets with the symmetric teams, aliases, create/patch/delete,
-///    the tombstone and the restart rule, and the agent validation refusals.
+/// 6. The registry: the eight shipped cards with their explicit `entry` + `ranks`, aliases,
+///    create/patch/delete, the tombstone and the restart rule, and the agent validation refusals.
 #[test]
-fn registry_ships_edits_and_tombstones_the_five_presets() {
+fn registry_ships_edits_and_tombstones_the_eight_presets() {
     let agents = AgentCatalogue::builtin();
     let registry = HarnessRegistry::shipped(&settings(), Vec::new());
 
+    // CARD ORDER IS THE CONTRACT (`presets.ts:529-538`): `general` first, `chat` last.
     assert_eq!(
         registry.names(),
-        vec!["instruct", "research", "workspace", "reviewer", "planner"]
+        vec![
+            "general",
+            "instruct",
+            "research",
+            "workspace",
+            "reviewer",
+            "planner",
+            "debugger",
+            "chat"
+        ]
     );
 
-    // The titles, exactly as `presets.test.ts:141-147` pins them.
+    // The VISIBLE TITLES, including the two renames whose ids stayed (`presets.ts` `title`):
+    // research -> "Explore", workspace -> "Analyst", planner -> "Manager".
     assert_eq!(
         registry
             .cards()
             .iter()
             .map(|card| card.title.clone())
             .collect::<Vec<String>>(),
-        vec!["Instruct", "Researcher", "Coder", "Reviewer", "Planner"]
+        vec![
+            "General", "Instruct", "Explore", "Analyst", "Reviewer", "Manager", "Debugger", "Chat"
+        ]
     );
 
-    // One symmetric team per primary (`presets.test.ts:180-186`).
-    let expected: [(&str, Vec<String>); 5] = [
+    // ONE ROSTER AND ONE RANK MAP PER CARD (`presets.ts:180-478`). The roster is the declaration
+    // order - the subject FIRST, then the other specialists in catalogue order WITHOUT the Manager
+    // (only the Manager card may delegate to the Manager), then `summarizer`. `ranks` is the subject
+    // at A and every delegate at B, so `delegate` is registered; the two single-member cards state
+    // ONE rank at B, which is what keeps `delegate` off their tool lists.
+    let expected: [(&str, Vec<String>); 8] = [
+        ("general", names(&["general"])),
         (
             "instruct",
-            names(&["research", "workspace", "reviewer", "planner", "summarizer"]),
+            names(&[
+                "instruct",
+                "general",
+                "research",
+                "workspace",
+                "reviewer",
+                "debugger",
+                "summarizer",
+            ]),
         ),
         (
             "research",
-            names(&["instruct", "workspace", "reviewer", "planner", "summarizer"]),
+            names(&[
+                "research",
+                "general",
+                "instruct",
+                "workspace",
+                "reviewer",
+                "debugger",
+                "summarizer",
+            ]),
         ),
         (
             "workspace",
-            names(&["instruct", "research", "reviewer", "planner", "summarizer"]),
+            names(&[
+                "workspace",
+                "general",
+                "instruct",
+                "research",
+                "reviewer",
+                "debugger",
+                "summarizer",
+            ]),
         ),
         (
             "reviewer",
-            names(&["instruct", "research", "workspace", "planner", "summarizer"]),
+            names(&[
+                "reviewer",
+                "general",
+                "instruct",
+                "research",
+                "workspace",
+                "debugger",
+                "summarizer",
+            ]),
         ),
         (
             "planner",
             names(&[
+                "planner",
+                "general",
+                "instruct",
+                "research",
+                "workspace",
+                "reviewer",
+                "debugger",
+                "summarizer",
+            ]),
+        ),
+        (
+            "debugger",
+            names(&[
+                "debugger",
+                "general",
                 "instruct",
                 "research",
                 "workspace",
@@ -1700,30 +1765,94 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                 "summarizer",
             ]),
         ),
+        ("chat", names(&["general"])),
     ];
 
-    for (name, team) in expected {
+    for (name, roster) in expected {
         let definition = registry.get(name).expect("the preset is shipped");
+        let delegating = roster.len() > 1;
 
-        assert_eq!(definition.subagents, team, "team of {name}");
+        // `chat` is the one card whose entry is NOT its own id: it runs the `general` profile.
+        let entry = if name == "chat" { "general" } else { name };
+
+        assert_eq!(definition.entry, entry, "entry of {name}");
+        assert_eq!(definition.agents, roster, "roster of {name}");
         assert_eq!(
-            definition.agents,
-            std::iter::once(name.to_string())
-                .chain(team.clone())
-                .collect::<Vec<String>>()
+            definition.ranks,
+            presets::team_ranks(
+                entry,
+                &roster.iter().map(String::as_str).collect::<Vec<&str>>()
+            ),
+            "ranks of {name}"
         );
-        assert_eq!(definition.primary, name);
+        if delegating {
+            assert_eq!(
+                definition.ranks[entry],
+                crate::contract::AgentRank::A,
+                "the entry of a delegating card outranks its team"
+            );
+            assert!(
+                definition
+                    .ranks
+                    .values()
+                    .any(|rank| *rank == crate::contract::AgentRank::B),
+                "a delegating card states a lower rank"
+            );
+        } else {
+            // A single-member card states ONLY the entry rank (`presets.ts`, the note above the
+            // legacy table): one letter means one DISTINCT letter, which is what keeps `delegate`
+            // unregistered (`toolbox.ts ranksDeclareDelegation`).
+            assert_eq!(
+                definition.ranks[entry],
+                presets::ENTRY_RANK,
+                "a one-member card states only `ENTRY_RANK`"
+            );
+            assert_eq!(
+                definition.ranks.len(),
+                1,
+                "and that map has exactly one entry"
+            );
+        }
         assert!(definition.builtin);
         assert!(definition.editable);
         assert!(definition.requires_endpoint);
-        assert_eq!(definition.environment_tools, names(&["search", "fetch"]));
+        assert_eq!(
+            definition.environment_tools,
+            if name == "chat" {
+                Vec::new()
+            } else {
+                names(&["search", "fetch"])
+            },
+            "`chat` declares no environment tool (`presets.ts:455-478`)"
+        );
         assert_eq!(
             definition.tools,
-            names(&presets::SHARED_TOOL_NAMES),
-            "every live card carries the shared toolbox"
+            if name == "chat" {
+                Vec::new()
+            } else {
+                names(&presets::SHARED_TOOL_NAMES)
+            },
+            "every live card except `chat` carries the shared toolbox"
         );
-        assert_eq!(presets::team_of(name), team, "team_of({name})");
     }
+
+    // `delegate` follows the rank map, not the roster size (`toolbox.ts ranksDeclareDelegation`).
+    assert!(
+        registry
+            .get("instruct")
+            .expect("shipped")
+            .core_tools()
+            .contains(&"delegate".to_string()),
+        "two distinct ranks register `delegate`"
+    );
+    assert!(
+        !registry
+            .get("general")
+            .expect("shipped")
+            .core_tools()
+            .contains(&"delegate".to_string()),
+        "a one-rank map never registers `delegate`"
+    );
 
     // `delegate` is projected for a card WITH a team, and `search`/`fetch` are environment core.
     assert_eq!(
@@ -1767,8 +1896,10 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                 name: "my-team".to_string(),
                 title: None,
                 description: None,
-                primary: "research".to_string(),
-                subagents: Some(vec!["reviewer".to_string()]),
+                agents: Some(json!(["research".to_string(), "reviewer".to_string()])),
+                entry: Some(json!("research")),
+                ranks: None,
+                agent_prefixes: None,
                 agent_models: Some(std::collections::BTreeMap::from([(
                     "reviewer".to_string(),
                     "merge/ds4-flash".to_string(),
@@ -1799,8 +1930,10 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                     name: "INSTRUCT".to_string(),
                     title: None,
                     description: None,
-                    primary: "instruct".to_string(),
-                    subagents: None,
+                    agents: Some(json!(["instruct".to_string()])),
+                    entry: Some(json!("instruct")),
+                    ranks: None,
+                    agent_prefixes: None,
                     agent_models: None,
                     agent_instructions: None,
                     agent_colors: None,
@@ -1820,8 +1953,10 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                     name: "writer".to_string(),
                     title: None,
                     description: None,
-                    primary: "instruct".to_string(),
-                    subagents: None,
+                    agents: Some(json!(["instruct".to_string()])),
+                    entry: Some(json!("instruct")),
+                    ranks: None,
+                    agent_prefixes: None,
                     agent_models: None,
                     agent_instructions: None,
                     agent_colors: None,
@@ -1840,8 +1975,10 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                 name: "ghost-team".to_string(),
                 title: None,
                 description: None,
-                primary: "nobody".to_string(),
-                subagents: None,
+                agents: Some(json!(["nobody".to_string()])),
+                entry: Some(json!("nobody")),
+                ranks: None,
+                agent_prefixes: None,
                 agent_models: None,
                 agent_instructions: None,
                 agent_colors: None,
@@ -1853,7 +1990,9 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
     assert_eq!(unknown.status, 400);
     assert_eq!(
         unknown.message,
-        "`primary` names unknown agent \"nobody\". Known agents: instruct, research, workspace, reviewer, planner, summarizer."
+        // The roster is the field that carries agent ids now, so `requireAgent` reports it by
+        // name (`registry.ts:329-353`), and the known set is this build's agent catalogue.
+        "`agents` names unknown agent \"nobody\". Known agents: general, instruct, research, workspace, reviewer, planner, debugger, summarizer."
     );
 
     // A bad name is refused with the pattern sentence.
@@ -1864,8 +2003,10 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                     name: "9lives".to_string(),
                     title: None,
                     description: None,
-                    primary: "instruct".to_string(),
-                    subagents: None,
+                    agents: Some(json!(["instruct".to_string()])),
+                    entry: Some(json!("instruct")),
+                    ranks: None,
+                    agent_prefixes: None,
                     agent_models: None,
                     agent_instructions: None,
                     agent_colors: None,
@@ -1885,8 +2026,10 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                     name: "bad-map".to_string(),
                     title: None,
                     description: None,
-                    primary: "instruct".to_string(),
-                    subagents: None,
+                    agents: Some(json!(["instruct".to_string()])),
+                    entry: Some(json!("instruct")),
+                    ranks: None,
+                    agent_prefixes: None,
                     agent_models: Some(std::collections::BTreeMap::from([(
                         "planner".to_string(),
                         "m".to_string()
@@ -1928,8 +2071,10 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
             contract::UpdateHarnessRequest {
                 title: Some("Instruct (edited)".to_string()),
                 description: None,
-                primary: None,
-                subagents: None,
+                agents: None,
+                entry: None,
+                ranks: None,
+                agent_prefixes: None,
                 agent_models: None,
                 agent_instructions: Some(std::collections::BTreeMap::new()),
                 agent_colors: None,
@@ -1956,8 +2101,10 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                 contract::UpdateHarnessRequest {
                     title: None,
                     description: None,
-                    primary: None,
-                    subagents: None,
+                    agents: None,
+                    entry: None,
+                    ranks: None,
+                    agent_prefixes: None,
                     agent_models: None,
                     agent_instructions: Some(std::collections::BTreeMap::from([(
                         "planner".to_string(),
@@ -1980,8 +2127,10 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                 contract::UpdateHarnessRequest {
                     title: None,
                     description: None,
-                    primary: None,
-                    subagents: None,
+                    agents: None,
+                    entry: None,
+                    ranks: None,
+                    agent_prefixes: None,
                     agent_models: None,
                     agent_instructions: Some(std::collections::BTreeMap::from([(
                         "research".to_string(),
@@ -2004,8 +2153,10 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                     name: "bad-team".to_string(),
                     title: None,
                     description: None,
-                    primary: "research".to_string(),
-                    subagents: Some(vec!["research".to_string()]),
+                    agents: Some(json!(["research".to_string(), "research".to_string()])),
+                    entry: Some(json!("research")),
+                    ranks: None,
+                    agent_prefixes: None,
                     agent_models: None,
                     agent_instructions: None,
                     agent_colors: None,
@@ -2014,7 +2165,10 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
             )
             .unwrap_err()
             .message,
-        "Subagent \"research\" is the primary agent; a harness has exactly one primary."
+        // The retired "a subagent may not be the primary" rule is GONE: a roster that names the
+        // same agent twice is ambiguous, and the registry refuses to guess which occurrence and
+        // which rank entry was meant (`registry.ts:517-552`).
+        "Agent \"research\" is listed in `agents` more than once."
     );
     assert_eq!(
         registry
@@ -2023,8 +2177,14 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
                     name: "bad-team".to_string(),
                     title: None,
                     description: None,
-                    primary: "research".to_string(),
-                    subagents: Some(vec!["reviewer".to_string(), "reviewer".to_string()]),
+                    agents: Some(json!([
+                        "research".to_string(),
+                        "reviewer".to_string(),
+                        "reviewer".to_string()
+                    ])),
+                    entry: Some(json!("research")),
+                    ranks: None,
+                    agent_prefixes: None,
                     agent_models: None,
                     agent_instructions: None,
                     agent_colors: None,
@@ -2033,7 +2193,7 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
             )
             .unwrap_err()
             .message,
-        "Subagent \"reviewer\" is listed more than once."
+        "Agent \"reviewer\" is listed in `agents` more than once."
     );
 
     // DELETE tombstones a built-in and reports it honestly.
@@ -2071,15 +2231,24 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
     )
     .expect("a saved registry replays");
 
+    // Every shipped card EXCEPT the tombstoned one comes back, in catalogue order.
     assert_eq!(
         restarted.names(),
-        vec!["research", "workspace", "reviewer", "planner"]
+        vec![
+            "general",
+            "research",
+            "workspace",
+            "reviewer",
+            "planner",
+            "debugger",
+            "chat",
+        ]
     );
     assert_eq!(restarted.deleted_names(), vec!["instruct".to_string()]);
 
     let clean_restart = HarnessRegistry::from_records(&settings(), Vec::new(), Vec::new(), &agents)
         .expect("a fresh registry seeds itself");
-    assert_eq!(clean_restart.names().len(), 5);
+    assert_eq!(clean_restart.names().len(), 8);
     assert_eq!(
         clean_restart.get("instruct").expect("re-shipped").title,
         "Instruct"
@@ -2093,8 +2262,10 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
             contract::UpdateHarnessRequest {
                 title: Some("Skeptical Lead".to_string()),
                 description: None,
-                primary: None,
-                subagents: None,
+                agents: None,
+                entry: None,
+                ranks: None,
+                agent_prefixes: None,
                 agent_models: None,
                 agent_instructions: None,
                 agent_colors: None,
@@ -2114,8 +2285,17 @@ fn registry_ships_edits_and_tombstones_the_five_presets() {
 
     // `referenced_by_agent` is what makes the HTTP layer's 409 possible.
     assert_eq!(
+        // `summarizer` is the tail of every delegating roster (`presets.ts`), so all six team
+        // cards select it; `general` and `chat` are one-member rosters and never do.
         clean_restart.referenced_by_agent("summarizer"),
-        vec!["instruct", "research", "workspace", "reviewer", "planner"]
+        vec![
+            "instruct",
+            "research",
+            "workspace",
+            "reviewer",
+            "planner",
+            "debugger"
+        ]
     );
 }
 
@@ -2143,8 +2323,10 @@ fn the_agent_color_map_follows_the_same_rules_as_the_other_two() {
                 name: "painted".to_string(),
                 title: None,
                 description: None,
-                primary: "research".to_string(),
-                subagents: Some(vec!["reviewer".to_string()]),
+                agents: Some(json!(["research".to_string(), "reviewer".to_string()])),
+                entry: Some(json!("research")),
+                ranks: None,
+                agent_prefixes: None,
                 agent_models: None,
                 agent_instructions: None,
                 // A padded value is stored trimmed (`registry.ts:577`), and every accepted shape
@@ -2189,8 +2371,10 @@ fn the_agent_color_map_follows_the_same_rules_as_the_other_two() {
                     name: "miscolored".to_string(),
                     title: None,
                     description: None,
-                    primary: "research".to_string(),
-                    subagents: None,
+                    agents: Some(json!(["research".to_string()])),
+                    entry: Some(json!("research")),
+                    ranks: None,
+                    agent_prefixes: None,
                     agent_models: None,
                     agent_instructions: None,
                     agent_colors: Some(colors(&[("planner", "#fff")])),
@@ -2226,8 +2410,10 @@ fn the_agent_color_map_follows_the_same_rules_as_the_other_two() {
                     name: "miscolored".to_string(),
                     title: None,
                     description: None,
-                    primary: "research".to_string(),
-                    subagents: None,
+                    agents: Some(json!(["research".to_string()])),
+                    entry: Some(json!("research")),
+                    ranks: None,
+                    agent_prefixes: None,
                     agent_models: None,
                     agent_instructions: None,
                     agent_colors: Some(colors(&[("research", value)])),
@@ -2292,7 +2478,9 @@ fn the_agent_color_map_follows_the_same_rules_as_the_other_two() {
         .update(
             "painted",
             contract::UpdateHarnessRequest {
-                subagents: Some(Vec::new()),
+                // The roster is the only way to remove a member now: an explicit one-member roster
+                // drops `reviewer`, and its swatch must go with it (`registry.ts:1380-1384`).
+                agents: Some(json!(["research".to_string()])),
                 ..contract::UpdateHarnessRequest::default()
             },
             &agents,
@@ -2362,8 +2550,13 @@ fn the_agent_color_map_follows_the_same_rules_as_the_other_two() {
         title: legacy.title.clone(),
         description: legacy.description.clone(),
         requires_endpoint: legacy.requires_endpoint,
-        primary: legacy.primary.clone(),
-        subagents: legacy.subagents.clone(),
+        // The CURRENT spelling is what a refreshed row is compared on; the retired pair stays absent
+        // so the only difference under test is the colour map (`persistence.ts` `presetToRecord`).
+        primary: None,
+        subagents: None,
+        entry: Some(legacy.entry.clone()),
+        ranks: Some(legacy.ranks.clone()),
+        agent_prefixes: None,
         agents: legacy.agents.clone(),
         tools: legacy.tools.clone(),
         environment_tools: Some(legacy.environment_tools.clone()),
@@ -2404,8 +2597,10 @@ fn the_harness_text_bounds_are_measured_in_utf16_units() {
                 name: name.to_string(),
                 title: None,
                 description: None,
-                primary: "research".to_string(),
-                subagents: None,
+                agents: Some(json!(["research".to_string()])),
+                entry: Some(json!("research")),
+                ranks: None,
+                agent_prefixes: None,
                 agent_models: None,
                 agent_instructions: Some(std::collections::BTreeMap::from([(
                     "research".to_string(),
@@ -2491,23 +2686,26 @@ fn registry_shipped_description(name: &str) -> String {
         .clone()
 }
 
-/// 7. The agent catalogue: six profiles with the shipped titles, the composed prompt, and the
+/// 7. The agent catalogue: eight profiles with the shipped titles, the composed prompt, and the
 ///    override/restore rules.
 #[test]
-fn catalogue_ships_six_profiles_and_replays_operator_edits() {
+fn catalogue_ships_eight_profiles_and_replays_operator_edits() {
     let hub = EventHub::new();
     let mut catalogue = AgentCatalogue::builtin();
 
     assert_eq!(
         catalogue.names(),
         vec![
+            "general",
             "instruct",
             "research",
             "workspace",
             "reviewer",
             "planner",
+            "debugger",
             "summarizer"
-        ]
+        ],
+        "the full TypeScript roster, in `AGENT_PROFILE_NAMES` order, DEFAULT FIRST (`agents/index.ts:57-66`)"
     );
 
     // The titles, exactly as `agents/*.ts` states them.
@@ -2519,13 +2717,56 @@ fn catalogue_ships_six_profiles_and_replays_operator_edits() {
     assert_eq!(
         titles,
         vec![
+            "General",
             "Instruct",
             "Researcher",
             "Coder",
             "Reviewer",
             "Planner",
+            "Debugger",
             "Summarizer"
         ]
+    );
+
+    // R2: the two profiles this port used to lack are verbatim, not paraphrased. Every shipped preset
+    // card names `general` and `debugger` on a roster, so an instruction row for either member is now
+    // resolvable text rather than an empty placeholder.
+    assert_eq!(
+        catalogue.effective("general").expect("known").instruction,
+        "You are the General agent, the default. Do every step of the task yourself, in this conversation, and never hand work to another agent."
+    );
+    assert_eq!(
+        catalogue.effective("debugger").expect("known").instruction,
+        "You are the Debugger agent. Exercise the whole system until something breaks, then prove how it breaks."
+    );
+    assert_eq!(
+        catalogue
+            .effective("general")
+            .expect("known")
+            .guidelines
+            .last()
+            .expect("a guideline"),
+        "Be concise: no preamble, no restating the question."
+    );
+    assert_eq!(
+        catalogue
+            .effective("debugger")
+            .expect("known")
+            .guidelines
+            .last()
+            .expect("a guideline"),
+        "Report what you exercised, what held, what broke, and what you did not get to. Never invent a failure and never bury one."
+    );
+    assert_eq!(
+        catalogue
+            .effective("general")
+            .expect("known")
+            .guidelines
+            .iter()
+            .filter(|line| line.contains("threadFork"))
+            .count(),
+        1,
+        "the lone-agent rule names the two ways a solo agent could still hand work away"
     );
 
     // The identity sentence is verbatim, and so is the composition rule.
@@ -2723,7 +2964,7 @@ fn catalogue_ships_six_profiles_and_replays_operator_edits() {
     assert!(catalogue.effective("summarizer").is_none());
     assert_eq!(
         catalogue.selectable().len(),
-        5,
+        7,
         "the selectable list drops the retired profile only"
     );
     // A retired profile is still a KNOWN identity, so the durable record survives a restart.
@@ -2765,8 +3006,10 @@ fn catalogue_ships_six_profiles_and_replays_operator_edits() {
                 name: "needs-summarizer".to_string(),
                 title: None,
                 description: None,
-                primary: "instruct".to_string(),
-                subagents: Some(vec!["summarizer".to_string()]),
+                agents: Some(json!(["instruct".to_string(), "summarizer".to_string()])),
+                entry: Some(json!("instruct")),
+                ranks: None,
+                agent_prefixes: None,
                 agent_models: None,
                 agent_instructions: None,
                 agent_colors: None,
@@ -2787,8 +3030,10 @@ fn catalogue_ships_six_profiles_and_replays_operator_edits() {
             contract::UpdateHarnessRequest {
                 title: Some("Still editable".to_string()),
                 description: None,
-                primary: None,
-                subagents: None,
+                agents: None,
+                entry: None,
+                ranks: None,
+                agent_prefixes: None,
                 agent_models: None,
                 agent_instructions: None,
                 agent_colors: None,
@@ -2797,6 +3042,229 @@ fn catalogue_ships_six_profiles_and_replays_operator_edits() {
         )
         .expect("an existing team with a retired member stays patchable");
     assert_eq!(patched.title, "Still editable");
+
+    // R2: the bypass covers the RETIRED half only. A roster that restates a retired member the card
+    // already selects plus the two roles this port used to lack still resolves, because `general` and
+    // `debugger` are shipped profiles now — under the old, wider bypass this same body passed for the
+    // wrong reason (an unknown name was excused by being already selected).
+    let restated = registry
+        .update(
+            "instruct",
+            contract::UpdateHarnessRequest {
+                title: None,
+                description: None,
+                agents: Some(json!([
+                    "instruct".to_string(),
+                    "general".to_string(),
+                    "debugger".to_string(),
+                    "summarizer".to_string()
+                ])),
+                entry: None,
+                ranks: None,
+                agent_prefixes: None,
+                agent_models: None,
+                agent_instructions: None,
+                agent_colors: None,
+            },
+            &replayed,
+        )
+        .expect("a restated roster of known ids survives a retired member");
+
+    assert_eq!(
+        restated.agents,
+        vec![
+            "instruct".to_string(),
+            "general".to_string(),
+            "debugger".to_string(),
+            "summarizer".to_string()
+        ]
+    );
+
+    // And a NEW selection of the same retired profile is still the 409 above, one call later: the
+    // bypass follows the entry's own roster, never the catalogue.
+    assert_eq!(
+        registry
+            .create(
+                contract::CreateHarnessRequest {
+                    name: "needs-summarizer-again".to_string(),
+                    title: None,
+                    description: None,
+                    agents: Some(json!(["instruct".to_string(), "summarizer".to_string()])),
+                    entry: Some(json!("instruct")),
+                    ranks: None,
+                    agent_prefixes: None,
+                    agent_models: None,
+                    agent_instructions: None,
+                    agent_colors: None,
+                },
+                &replayed,
+            )
+            .unwrap_err()
+            .message,
+        "Agent \"summarizer\" is retired and can no longer be selected. Existing harnesses and sessions that already select it are unaffected."
+    );
+
+    // `general` and `debugger` are SELECTABLE now, which is what the eight shipped cards assume: a
+    // created card may name either, and an unknown id next to it is still the 400 that lists the eight.
+    let created = registry
+        .create(
+            contract::CreateHarnessRequest {
+                name: "general-led".to_string(),
+                title: None,
+                description: None,
+                agents: Some(json!(["general".to_string(), "debugger".to_string()])),
+                entry: Some(json!("general")),
+                ranks: None,
+                agent_prefixes: None,
+                agent_models: None,
+                agent_instructions: None,
+                agent_colors: None,
+            },
+            &replayed,
+        )
+        .expect("the two ported roles are selectable by a created card");
+    assert_eq!(
+        created.agents,
+        vec!["general".to_string(), "debugger".to_string()]
+    );
+
+    let half_known = registry
+        .create(
+            contract::CreateHarnessRequest {
+                name: "half-known".to_string(),
+                title: None,
+                description: None,
+                agents: Some(json!(["general".to_string(), "ghost".to_string()])),
+                entry: Some(json!("general")),
+                ranks: None,
+                agent_prefixes: None,
+                agent_models: None,
+                agent_instructions: None,
+                agent_colors: None,
+            },
+            &replayed,
+        )
+        .unwrap_err();
+
+    assert_eq!(half_known.status, 400);
+    assert_eq!(
+        half_known.message,
+        "`agents` names unknown agent \"ghost\". Known agents: general, instruct, research, workspace, reviewer, planner, debugger, summarizer."
+    );
+}
+
+/// R2: every roster member of every shipped card is a profile this build actually carries.
+///
+/// The eight cards hardcode their rosters (`presets.rs`), and before the `general`/`debugger` profiles
+/// were ported three of them named ids outside the agent catalogue — an instruction row for such a
+/// member reported an empty prompt, and a PATCH of that card was only saved by the workaround this
+/// change removed. This is the pin that keeps that from silently coming back.
+#[test]
+fn every_shipped_card_resolves_every_roster_member() {
+    let catalogue = AgentCatalogue::builtin();
+    let registry = HarnessRegistry::shipped(&settings(), Vec::new());
+
+    // `cards()` is the hub-free projection (`registry/mod.rs:332`); only `name`/`agents` matter here,
+    // so the `definition_revision: 0` stamp it carries is irrelevant.
+    let cards: Vec<(String, Vec<String>)> = registry
+        .cards()
+        .iter()
+        .map(|card| (card.name.clone(), card.agents.clone()))
+        .collect();
+
+    assert_eq!(
+        cards,
+        vec![
+            ("general".to_string(), vec!["general".to_string()]),
+            (
+                "instruct".to_string(),
+                vec![
+                    "instruct".to_string(),
+                    "general".to_string(),
+                    "research".to_string(),
+                    "workspace".to_string(),
+                    "reviewer".to_string(),
+                    "debugger".to_string(),
+                    "summarizer".to_string(),
+                ]
+            ),
+            (
+                "research".to_string(),
+                vec![
+                    "research".to_string(),
+                    "general".to_string(),
+                    "instruct".to_string(),
+                    "workspace".to_string(),
+                    "reviewer".to_string(),
+                    "debugger".to_string(),
+                    "summarizer".to_string(),
+                ]
+            ),
+            (
+                "workspace".to_string(),
+                vec![
+                    "workspace".to_string(),
+                    "general".to_string(),
+                    "instruct".to_string(),
+                    "research".to_string(),
+                    "reviewer".to_string(),
+                    "debugger".to_string(),
+                    "summarizer".to_string(),
+                ]
+            ),
+            (
+                "reviewer".to_string(),
+                vec![
+                    "reviewer".to_string(),
+                    "general".to_string(),
+                    "instruct".to_string(),
+                    "research".to_string(),
+                    "workspace".to_string(),
+                    "debugger".to_string(),
+                    "summarizer".to_string(),
+                ]
+            ),
+            (
+                "planner".to_string(),
+                vec![
+                    "planner".to_string(),
+                    "general".to_string(),
+                    "instruct".to_string(),
+                    "research".to_string(),
+                    "workspace".to_string(),
+                    "reviewer".to_string(),
+                    "debugger".to_string(),
+                    "summarizer".to_string(),
+                ]
+            ),
+            (
+                "debugger".to_string(),
+                vec![
+                    "debugger".to_string(),
+                    "general".to_string(),
+                    "instruct".to_string(),
+                    "research".to_string(),
+                    "workspace".to_string(),
+                    "reviewer".to_string(),
+                    "summarizer".to_string(),
+                ]
+            ),
+            // The tool-less card is NOT named after a profile: its entry and only roster member are the
+            // trusted `general` profile (`presets.rs:347-355`), which is exactly why this card used to
+            // break the roster check before `general` was ported.
+            ("chat".to_string(), vec!["general".to_string()]),
+        ],
+        "the eight cards, in listing order, with the roster each one declares"
+    );
+
+    for (card, roster) in cards {
+        for member in roster {
+            assert!(
+                catalogue.shipped(&member).is_some(),
+                "`{card}` selects \"{member}\", which is not a shipped profile"
+            );
+        }
+    }
 }
 
 /// 8. The instruction ladder: harness override beats the global layer, which beats the catalogue.
@@ -2827,13 +3295,44 @@ fn instruction_resolution_follows_harness_global_then_catalogue() {
     let index = registry
         .instruction_index("instruct", &catalogue)
         .expect("the index reads");
-    assert_eq!(index.len(), 6, "one row per member");
-    assert_eq!(index[0].agent, "instruct");
-    assert_eq!(index[0].source, contract::InstructionSource::Catalogue);
-    assert!(!index[0].overridden);
+    // One row per ROSTER member, and the entry agent's row is the one that must reflect the entry's
+    // own instruction: `instruct` is the card that carries the other six roles plus `summarizer`
+    // (`presets.ts` roster `instruct, general, research, workspace, reviewer, debugger,
+    // summarizer`), so seven rows carry the entry's model plus six delegates.
+    assert_eq!(index.len(), 7, "one row per member");
+    // The reference indexes by agent id, so a read is stable across restarts; the row for the entry
+    // agent is found by name, not by position.
+    let entry_row = index
+        .iter()
+        .find(|row| row.agent == "instruct")
+        .expect("the entry agent has a row");
+    assert_eq!(entry_row.source, contract::InstructionSource::Catalogue);
+    assert!(!entry_row.overridden);
     assert_eq!(
-        index[0].chars,
+        entry_row.chars,
         u64::try_from(shipped.chars().count()).expect("fits")
+    );
+    assert_eq!(
+        index
+            .iter()
+            .map(|row| row.source)
+            .collect::<Vec<contract::InstructionSource>>(),
+        vec![contract::InstructionSource::Catalogue; 7],
+        "nothing overrides anything at layer 3"
+    );
+    let mut indexed: Vec<String> = index.iter().map(|row| row.agent.clone()).collect();
+    indexed.sort();
+    assert_eq!(
+        indexed,
+        vec![
+            "debugger",
+            "general",
+            "instruct",
+            "research",
+            "reviewer",
+            "summarizer",
+            "workspace"
+        ]
     );
 
     // LAYER 2 (global): `PATCH /agents/{id}` is a real layer.
@@ -2875,8 +3374,10 @@ fn instruction_resolution_follows_harness_global_then_catalogue() {
             contract::UpdateHarnessRequest {
                 title: None,
                 description: None,
-                primary: None,
-                subagents: None,
+                agents: None,
+                entry: None,
+                ranks: None,
+                agent_prefixes: None,
                 agent_models: None,
                 agent_instructions: Some(std::collections::BTreeMap::from([(
                     "instruct".to_string(),
@@ -2925,8 +3426,10 @@ fn instruction_resolution_follows_harness_global_then_catalogue() {
             contract::UpdateHarnessRequest {
                 title: None,
                 description: None,
-                primary: None,
-                subagents: None,
+                agents: None,
+                entry: None,
+                ranks: None,
+                agent_prefixes: None,
                 agent_models: None,
                 agent_instructions: Some(std::collections::BTreeMap::new()),
                 agent_colors: None,
@@ -3289,15 +3792,15 @@ fn tool_detail_execution_gate_and_card_membership_serialize_exactly() {
         "the optional member is absent when the row has no gate"
     );
 
-    // A card ALWAYS serializes `subagents` (`harness-api.ts:428`): the empty array is what tells
-    // a picker that `delegate` is not registered for this harness.
+    // A card ALWAYS serializes `entry` AND `ranks` (`harness-api.ts:628-780`, and the swagger card
+    // requires both): the one-key rank map is what tells a picker `delegate` is not registered.
     let solo = contract::HarnessCard {
         name: "solo".to_string(),
         title: "Solo".to_string(),
         description: "One agent.".to_string(),
         requires_endpoint: true,
-        primary: "solo".to_string(),
-        subagents: vec![],
+        entry: "solo".to_string(),
+        ranks: std::collections::BTreeMap::from([("solo".to_string(), contract::AgentRank::B)]),
         agents: vec!["solo".to_string()],
         tools: vec!["read".to_string()],
         builtin: true,
@@ -3305,32 +3808,70 @@ fn tool_detail_execution_gate_and_card_membership_serialize_exactly() {
     };
     let card = serde_json::to_value(&solo).expect("serializable");
     assert_eq!(
-        card["subagents"],
-        json!([]),
-        "the key is present when empty"
+        card,
+        json!({
+            "name": "solo",
+            "title": "Solo",
+            "description": "One agent.",
+            "requires_endpoint": true,
+            "entry": "solo",
+            "ranks": { "solo": "B" },
+            "agents": ["solo"],
+            "tools": ["read"],
+            "builtin": true,
+            "definition_revision": 3
+        }),
+        "the card is exactly the contract's ten keys, and the two retired keys are absent"
     );
-    assert!(
-        card.get("subagents").is_some(),
-        "an empty team is a statement, not an omission"
+    // The KEY SET is the wire contract (`harness-api.ts`'s card type): `entry` and `ranks` are
+    // always present, and the retired `primary`/`subagents` keys are gone. `serde_json` emits the
+    // fields in DECLARATION order, which is the order the generated TypeScript type lists them.
+    assert_eq!(
+        card.as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<&str>>(),
+        vec![
+            "name",
+            "title",
+            "description",
+            "requires_endpoint",
+            "entry",
+            "ranks",
+            "agents",
+            "tools",
+            "builtin",
+            "definition_revision"
+        ],
+        "ten keys, and neither retired key is among them"
     );
 
-    // Deserialization still TOLERATES the key's absence (an old reader or a hand-written row),
-    // so removing `skip_serializing_if` did not make the type strict on input.
-    let mut sparse = card.as_object().expect("object").clone();
-    sparse.remove("subagents");
-    let parsed: contract::HarnessCard =
-        serde_json::from_value(Value::Object(sparse)).expect("absence still deserializes");
-    assert_eq!(parsed, solo);
-
-    // The registry's own cards carry the team they declare, and a solo preset still prints the
-    // empty array (`presets.ts`: only the teamed presets register `delegate`).
+    // Every shipped card states an entry INSIDE its roster and a rank for EVERY roster member, and
+    // nothing else (`registry.ts` keeps `ranks` and `agents` in lockstep).
     for preset in presets::shipped_presets() {
         let card = read::harness_card_of_revision(&preset, 0);
         let body = serde_json::to_value(&card).expect("serializable");
+
+        assert!(
+            card.agents.contains(&card.entry),
+            "{} routes to a member of its own roster",
+            preset.name
+        );
+        // `ranks` is a BTreeMap (lettered agent ids in ascending order) while `agents` is the
+        // DECLARATION-ORDER roster, so the membership comparison is sorted and the order pin lives
+        // in `agents` alone.
+        let mut ranked: Vec<&String> = body["ranks"]
+            .as_object()
+            .expect("a rank map")
+            .keys()
+            .collect();
+        ranked.sort_unstable();
+        let mut roster: Vec<&String> = card.agents.iter().collect();
+        roster.sort_unstable();
         assert_eq!(
-            body["subagents"],
-            json!(card.subagents),
-            "{} always states its team",
+            ranked, roster,
+            "`{}` ranks exactly its roster, no more and no less",
             preset.name
         );
     }

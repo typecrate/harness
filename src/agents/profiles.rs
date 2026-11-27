@@ -14,15 +14,17 @@
 //!
 //! NOT SHIPPED HERE: `demo` and `flaky`
 //! ------------------------------------
-//! The TS catalogue has eight entries (`index.ts:40-49`, `:57-66`); this port ships SIX. `demo` is
-//! a scripted offline transport and `flaky` registers a tool that throws on two calls in three -
-//! both are test fixtures, and the Rust port has no scripted transport and no `testFlaky` tool, so
-//! shipping them would advertise a card that cannot run. Consequences, both recorded in
-//! `knowledge.md`:
-//!   * the "Known agents: ..." refusal lists six names instead of eight;
-//!   * a saved `state.json` from a TS build that selected `demo`/`flaky` still RESTORES (the
-//!     session replays from its own frozen preset record, and `persistence.rs` keeps the record
-//!     verbatim) - it simply cannot be re-SELECTED by a new harness definition.
+//! The TS roster is EIGHT entries (`agents/index.ts:57-66`) and this port ships all eight. The two
+//! entries it used to be missing were `general` and `debugger`, and both are now ported: every
+//! shipped preset card names them (`src/registry/presets.rs`), and a card whose roster member is
+//! outside the agent catalogue cannot be PATCHED, which is why the two profiles are a contract
+//! requirement rather than a nicety.
+//!
+//! The catalogue used to end with two FIXTURES — `demo` (the scripted offline transport) and
+//! `flaky` (the `testFlaky` retry example). Upstream DELETED both (`agents/index.ts:16-22`): a
+//! registry entry is a role a user can pick and a harness can select, and neither of those was a
+//! usable configuration. They are absent here for the same reason, not because the port dropped
+//! them, so the "Known agents: ..." refusal lists the same eight names the reference prints.
 
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +69,37 @@ pub const PERMISSIONS_GUIDELINE: &str = "File and command tools run unsandboxed 
 /// The self-extending escape hatch, one line rather than a tool manual
 /// (`agents/guidelines.ts:133-134` `TOOL_CREATE_GUIDELINE`).
 pub const TOOL_CREATE_GUIDELINE: &str = "toolCreate is searchable, not declared: enable it with toolRequest before using it to add a small missing capability to this session.";
+
+/// The DEFAULT general-purpose agent — the one card a fresh deployment runs (`agents/general.ts:47-68`).
+///
+/// Its guidelines are a HARD RULE rather than a preference: the `general` preset configures no agent
+/// ranked below it, so `delegate` is never registered for it and `threadFork`/`threadSend` are the two
+/// ways a lone agent could still hand work away — both named in the second guideline. `TOOL_CREATE_
+/// GUIDELINE` is deliberately absent upstream (authoring a tool is the debugger's job), and the
+/// DELEGATION line is absent because there is nobody to delegate to.
+#[must_use]
+pub fn general_profile() -> AgentProfileDef {
+    AgentProfileDef {
+        name: "general".to_string(),
+        title: "General".to_string(),
+        description: "The default general-purpose agent. It does the whole task itself, start to finish: this harness configures no agent ranked below it, so delegate is not even registered and it never splits work out.".to_string(),
+        instruction: "You are the General agent, the default. Do every step of the task yourself, in this conversation, and never hand work to another agent.".to_string(),
+        guidelines: vec![
+            // The brief is the specification — the rule every other role assumes.
+            "Treat the brief as the specification: do exactly what it asks, keep the scope it states, and say plainly when it is ambiguous or when a claim cannot be checked.".to_string(),
+            // The one rule unique to this profile: alone by contract, including the two ways a lone
+            // agent could still hand work away — a forked branch, or posting the step into another
+            // conversation the host happens to have open.
+            "You work alone: no agent is ranked below you here, so a step you cannot do is a step to unlock with toolRequest, never a step to pass on. Do not spawn a branch with threadFork, and do not hand the step to another conversation with threadSend.".to_string(),
+            DISCOVERY_GUIDELINE.to_string(),
+            WEB_SEARCH_GUIDELINE.to_string(),
+            // Tool results beat recall, and naming the tool is what makes the answer checkable.
+            "Prefer a tool result over memory when a declared tool can answer more accurately, and name the tool you used.".to_string(),
+            PERMISSIONS_GUIDELINE.to_string(),
+            "Be concise: no preamble, no restating the question.".to_string(),
+        ],
+    }
+}
 
 /// The general-purpose default agent (`agents/instruct.ts:25-45`).
 #[must_use]
@@ -186,6 +219,42 @@ pub fn planner_profile() -> AgentProfileDef {
     }
 }
 
+/// The stress-test agent — the only role whose job is to make the system fail
+/// (`agents/debugger.ts:36-61`).
+///
+/// "ACCESS TO EVERYTHING" IS A SCOPE STATEMENT, NOT A TOOL LIST: every live harness registers the
+/// identical toolbox, so this profile claims no extra tool — it says nothing is out of bounds, and the
+/// `debugger` preset backs that with the widest delegate allowlist any preset ships. Unlike `research`
+/// and `reviewer` it is NOT read-only: a stress run needs scratch files and `toolCreate` needs a probe,
+/// while the discipline kept instead is "do not edit the thing under test unless asked".
+#[must_use]
+pub fn debugger_profile() -> AgentProfileDef {
+    AgentProfileDef {
+        name: "debugger".to_string(),
+        title: "Debugger".to_string(),
+        description: "Stress-test agent. Everything is in scope: it unlocks any searchable tool, runs any command, delegates to any role, and drives the system into a failure, then reproduces and reports it with the exact input and error.".to_string(),
+        instruction: "You are the Debugger agent. Exercise the whole system until something breaks, then prove how it breaks.".to_string(),
+        guidelines: vec![
+            // Scope, not inventory: the point is that no capability is off-limits.
+            "Nothing is off-limits here: unlock any searchable tool you need, read any path, run any command, and delegate to any configured role.".to_string(),
+            // Stress, not sampling — the boundary cases are the assignment.
+            "Test the edges, not the happy path: empty input, oversized input, a missing path, a wrong type, a repeated call, a cancelled call, a target that refuses.".to_string(),
+            // A finding without a reproduction is an anecdote.
+            "Reduce every failure to the smallest call sequence that triggers it again, and quote the exact tool, input, and error text.".to_string(),
+            // Scratch is fine; editing the subject is not, unless asked.
+            "Write scratch files when a probe needs them, but never change the code under test unless the brief asks for a fix.".to_string(),
+            // The web trio is part of what gets stressed, and an absent `search` on a keyless host is
+            // a correct finding, not a missing capability to invent a source for.
+            WEB_SEARCH_GUIDELINE.to_string(),
+            DELEGATION_GUIDELINE.to_string(),
+            DISCOVERY_GUIDELINE.to_string(),
+            TOOL_CREATE_GUIDELINE.to_string(),
+            PERMISSIONS_GUIDELINE.to_string(),
+            "Report what you exercised, what held, what broke, and what you did not get to. Never invent a failure and never bury one.".to_string(),
+        ],
+    }
+}
+
 /// The delegated summarizer (`agents/summarizer.ts:12-18`).
 ///
 /// This id is ALSO what the `textSummarize` tool looks for in the agent registry
@@ -205,18 +274,21 @@ pub fn summarizer_profile() -> AgentProfileDef {
 }
 
 /// Every shipped profile, in `AGENT_PROFILE_NAMES` display/selection order
-/// (`agents/index.ts:57-66`, minus the two fixtures).
+/// (`agents/index.ts:57-66`): the seven real roles, DEFAULT FIRST, then the delegated condenser.
 ///
-/// Order is contractual: the agent list page and the error messages enumerate this order, and the
-/// harness presets pick their teams from the first five names.
+/// Order is contractual: the agent list page and the "Known agents: ..." refusal enumerate this order,
+/// the frontend palette assigns tones by it, and the harness presets pick their teams from the names in
+/// it.
 #[must_use]
 pub fn shipped_profiles() -> Vec<AgentProfileDef> {
     vec![
+        general_profile(),
         instruct_profile(),
         research_profile(),
         workspace_profile(),
         reviewer_profile(),
         planner_profile(),
+        debugger_profile(),
         summarizer_profile(),
     ]
 }

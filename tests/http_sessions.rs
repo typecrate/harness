@@ -766,14 +766,16 @@ async fn the_session_lifecycle_answers_the_contract_end_to_end() {
     .await;
 
     assert_eq!(merged.status, StatusCode::OK);
-    // The contract MERGES a model patch: every other member keeps what it had. The create set all six
-    // members to the session's `settings.model`, so the honest shape after one patch is five unchanged
-    // rows and the one that moved (`api.ts:2067-2073`, "an agent absent from the body keeps its model").
+    // The contract MERGES a model patch: every other member keeps what it had. The create set every
+    // member of the frozen roster to the session's `settings.model` - the shipped `instruct` card
+    // carries six delegates (`presets.ts`) - so the honest shape after one patch is six unchanged rows
+    // and the one that moved (`api.ts:2067-2073`, "an agent absent from the body keeps its model").
     assert_eq!(
         merged.body["session"]["agent_models"],
         json!({
+            "debugger": "mock/one",
+            "general": "mock/one",
             "instruct": "mock/two",
-            "planner": "mock/one",
             "research": "mock/one",
             "reviewer": "mock/one",
             "summarizer": "mock/one",
@@ -1483,6 +1485,205 @@ async fn a_submitted_task_runs_and_every_turn_read_describes_it() {
     assert_eq!(
         attachment.message(),
         format!("Unknown attachment \"ghost\" in session \"{id}\".")
+    );
+
+    server.stop().await;
+}
+
+/// R3: the display read stamps `ContextBlock.included` on every context-bar row it can join to a
+/// transcript entry — the LIVE SEGMENT verdict (`contextSegmentIncludedOf`, `api.ts:2022-2089`, applied
+/// per section at `api.ts:2118`), which is NOT the fold's own `inPrompt`: `inPrompt` is what the
+/// projector believed while the turn ran, `included` is what the transcript says the prompt carries
+/// now. The expected values below are derived from the transcript read (the same rows the predicate
+/// joins), not from the display read, so a fold that stamped the wrong flag would disagree here.
+#[tokio::test]
+async fn the_display_read_stamps_the_context_bar_with_the_inclusion_verdict() {
+    let root = Root::new("display-inclusion");
+    let server = TestServer::start(&root).await;
+
+    let (base, _script) = provider(vec![
+        tool_turn(
+            "call-time",
+            "timeNow",
+            r#"{"timezone":"UTC"}"#,
+            usage(11, 4),
+        ),
+        answered("the clock reads noon", usage(7, 3)),
+    ])
+    .await;
+
+    let (id, _) = create_session(&server, &base, Some("clock")).await;
+    let receipt = submit(&server, &id, "what time is it", None).await;
+    let turn_id = receipt.string_at("/turn_id");
+    let thread = receipt.string_at("/thread_id");
+
+    wait_for_turn(&server, &id, &turn_id, "done").await;
+
+    // THE AUTHORITY FOR THE VERDICT: the transcript rows, read on their own. The contract's rule is
+    // `included !== false` — an absent flag means included — so a row that never carried the member
+    // answers `true`, and the only way to answer `false` is to store it.
+    let messages = get(
+        &server,
+        &format!("/v1/harness/sessions/{id}/threads/{thread}/transcript/messages"),
+    )
+    .await;
+
+    assert_eq!(messages.status, StatusCode::OK);
+
+    let rows = messages.body["items"]
+        .as_array()
+        .expect("the transcript read answers with rows");
+
+    let stored_verdict = |role: &str, content: &str| -> Option<bool> {
+        rows.iter()
+            .find(|row| row["role"] == json!(role) && row["content"] == json!(content))
+            .map(|row| row.get("included") != Some(&json!(false)))
+    };
+
+    let expected_answer = stored_verdict("assistant", "the clock reads noon")
+        .expect("the run recorded the answer as an assistant entry");
+
+    assert!(
+        expected_answer,
+        "nothing has compacted this conversation, so the transcript flags the answer in"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row.get("included") != Some(&json!(false))),
+        "no entry of this transcript is withheld, which is why every segment that HAS a verdict \
+         answers true: {rows:?}"
+    );
+
+    // THE DISPLAY READ. Three rows: the prompt segment, the tool call's segment, and the streamed
+    // answer window.
+    let bar = get(
+        &server,
+        &format!("/v1/harness/sessions/{id}/turns/{turn_id}/display"),
+    )
+    .await;
+
+    assert_eq!(bar.status, StatusCode::OK);
+
+    let segments = bar.body["display"]["sections"][0]["context"]
+        .as_array()
+        .expect("the section carries its context bar");
+
+    assert_eq!(
+        segments
+            .iter()
+            .map(|segment| segment["kind"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["user", "tool", "assistant"],
+        "the bar is the same three rows the fold publishes; the verdict is additive, never a reshuffle"
+    );
+
+    // THE PROMPT ROW CARRIES NO MEMBER AT ALL. A `user` segment mints no call id and names no
+    // thinking bytes, so neither join runs: `blockEntryOf` refuses without `blockCallIdOf`
+    // (`api.ts:1856-1858`) and the verdict is `undefined`, which `JSON.stringify` drops. Inventing a
+    // `true` here would be the defect the reference names: "a fabricated `true` would be as wrong as
+    // a `false`" (`api.ts:2063-2065`).
+    assert!(
+        segments[0].get("included").is_none(),
+        "an unaddressable segment states no verdict: {}",
+        segments[0]
+    );
+
+    // THE TWO ROWS THAT DO HAVE A VERDICT, each its last key — the position the
+    // `{ ...block, included }` spread puts it (`api.ts:2122-2126`).
+    assert_eq!(
+        segments[1].get("included"),
+        Some(&json!(true)),
+        "the tool row's verdict comes from the paired call/result entries, which this transcript \
+         carries in full: {}",
+        segments[1]
+    );
+    assert_eq!(
+        segments[2].get("included"),
+        Some(&json!(expected_answer)),
+        "answer row: {}",
+        segments[2]
+    );
+
+    for segment in &segments[1..] {
+        let keys: Vec<&str> = segment
+            .as_object()
+            .expect("a context block is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        assert_eq!(
+            keys.last().copied(),
+            Some("included"),
+            "the verdict is appended last, the position the spread puts it, so a byte-level diff of \
+             the fold still lines up: {keys:?}"
+        );
+    }
+
+    // THE TWO FLAGS ARE NOT THE SAME FACT. `inPrompt` comes from the projector
+    // (`turn-projector.ts:1463`), and an ANSWER window is in the prompt because an assistant answer
+    // counts; the verdict is read from the transcript. They agree on this row for this reason, and a
+    // stamp that simply copied `inPrompt` would pass this line while failing the compaction case the
+    // member exists for.
+    assert_eq!(segments[2]["inPrompt"], json!(true));
+
+    // THE CASE THE MEMBER EXISTS FOR: withhold the answer entry and re-read. The transcript document
+    // is rebuilt from the rows this test just read, with ONE member changed on one row, so the only
+    // thing that can move on the bar is the verdict.
+    let withheld: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let mut row = row.clone();
+
+            if row["role"] == json!("assistant")
+                && row["content"] == json!("the clock reads noon")
+                && let Some(map) = row.as_object_mut()
+            {
+                map.insert("included".to_owned(), json!(false));
+            }
+
+            row
+        })
+        .collect();
+
+    let written = put_json(
+        &server,
+        &format!("/v1/harness/sessions/{id}/threads/{thread}/transcript"),
+        json!({ "messages": withheld }),
+    )
+    .await;
+
+    assert_eq!(written.status, StatusCode::OK, "{}", written.body);
+
+    let after = get(
+        &server,
+        &format!("/v1/harness/sessions/{id}/turns/{turn_id}/display"),
+    )
+    .await;
+
+    let stamped = after.body["display"]["sections"][0]["context"]
+        .as_array()
+        .expect("the section carries its context bar");
+
+    assert_eq!(
+        stamped[2]["included"],
+        json!(false),
+        "the entry behind the answer window is withheld, so the segment is off the prompt"
+    );
+    assert_eq!(
+        stamped[2]["inPrompt"],
+        json!(true),
+        "and the projector's own flag does NOT move: two axes, each stating its own fact \
+         (`api.ts:2032-2041`)"
+    );
+    assert_eq!(
+        stamped[1]["included"],
+        json!(true),
+        "the tool segment keeps its verdict — its owning entry was never touched"
+    );
+    assert!(
+        stamped[0].get("included").is_none(),
+        "the prompt segment still states no verdict"
     );
 
     server.stop().await;
@@ -2374,7 +2575,19 @@ async fn the_roster_binds_patches_and_walks_the_instruction_ladder() {
         .expect("a member id")
         .to_owned();
 
-    assert_eq!(primary["role"], json!("primary"));
+    assert_eq!(
+        primary["rank"],
+        json!("A"),
+        "the entry agent reports the harness descriptor's own letter for it (`team_ranks`, \
+         `src/registry/presets.rs:174-188`: the entry agent holds `ENTRY_RANK`), and the row states \
+         a RANK rather than the retired two-valued role (R1)"
+    );
+    assert_eq!(
+        primary.get("role"),
+        None,
+        "`additionalProperties: false` (`harness-api.ts:1755`): a member the contract does not declare is \
+         a contract violation, so the retired `role` is GONE rather than kept alongside `rank`"
+    );
     assert_eq!(primary["origin"], json!("definition"));
     assert_eq!(
         primary["deletable"],
@@ -2625,7 +2838,9 @@ async fn the_roster_binds_patches_and_walks_the_instruction_ladder() {
     assert_eq!(bad_agent_field.status, StatusCode::BAD_REQUEST);
     assert_eq!(
         bad_agent_field.message(),
-        "Unknown field \"mode\". Allowed fields: model, instruction."
+        "Unknown field \"mode\". Allowed fields: model, instruction, rank, prefix.",
+        "the PATCH gate names all FOUR fields the contract's `UpdateSessionAgentRequest` carries \
+         (`api.ts:4040`), `rank` included - this is the pin the comment on `PATCH_FIELDS` cites"
     );
 
     // UNBIND, then BIND the same trusted profile back. Every shipped catalogue profile is already a
@@ -2664,7 +2879,7 @@ async fn the_roster_binds_patches_and_walks_the_instruction_ladder() {
     let bound = post_json(
         &server,
         &format!("/v1/harness/sessions/{id}/agents"),
-        Some(json!({"name": "summarizer", "profile": "summarizer", "model": "mock/sum", "role": "subagent"})),
+        Some(json!({"name": "summarizer", "profile": "summarizer", "model": "mock/sum"})),
     )
     .await;
 
@@ -2680,7 +2895,18 @@ async fn the_roster_binds_patches_and_walks_the_instruction_ladder() {
         "definition",
         "a trusted profile re-binds as a definition member, not as a session-invented one"
     );
-    assert_eq!(bound.string_at("/agent/role"), "subagent");
+    assert_eq!(
+        bound.string_at("/agent/rank"),
+        "B",
+        "a bind that asked for NO rank reports the harness descriptor's letter for that member \
+         (`team_ranks`: every non-entry member of the `instruct` card holds `TEAM_RANK` = `B`), which is \
+         the first half of the ladder `api-reads.ts:1564` states"
+    );
+    assert_eq!(
+        bound.body["agent"].get("role"),
+        None,
+        "the receipt is the same row shape as the roster's, `role`-free included"
+    );
     assert_eq!(bound.string_at("/agent/model"), "mock/sum");
     assert_eq!(bound.body["agent"]["deletable"], json!(true));
     assert_eq!(
@@ -2745,7 +2971,7 @@ async fn the_roster_binds_patches_and_walks_the_instruction_ladder() {
     let already = post_json(
         &server,
         &format!("/v1/harness/sessions/{id}/agents"),
-        Some(json!({"name": "instruct", "profile": "instruct", "role": "primary"})),
+        Some(json!({"name": "instruct", "profile": "instruct"})),
     )
     .await;
 
@@ -2771,8 +2997,11 @@ async fn the_roster_binds_patches_and_walks_the_instruction_ladder() {
             "A session agent binding must use its profile's own name: \"name\" is \"ghost\" but \"profile\" is \"instruct\". The roster key is the trusted profile id, which is what a restart rebuilds this session's team from.",
         ),
         (
+            // R2: the retired two-valued `role` is NOT an alias for `rank` and is not ignored. The contract
+            // body is closed (`harness-api.ts:1883-1942`) and `api.ts:4184-4186` states the rule, so a
+            // legacy client lands here rather than on a silently reinterpreted authority.
             json!({"name": "summarizer", "role": "leader"}),
-            "\"role\" must be \"primary\" or \"subagent\".",
+            "Unknown field \"role\". Allowed fields: name, profile, model, instruction, rank, prefix.",
         ),
         (
             json!({"name": 5}),
@@ -2780,7 +3009,7 @@ async fn the_roster_binds_patches_and_walks_the_instruction_ladder() {
         ),
         (
             json!({"name": "summarizer", "code": "x"}),
-            "Unknown field \"code\". Allowed fields: name, profile, model, instruction, role.",
+            "Unknown field \"code\". Allowed fields: name, profile, model, instruction, rank, prefix.",
         ),
         (
             json!({"profile": "summarizer"}),
@@ -2834,6 +3063,1038 @@ async fn the_roster_binds_patches_and_walks_the_instruction_ladder() {
     assert_eq!(
         ghost_patch.message(),
         format!("Unknown agent \"ghost\" in session \"{id}\".")
+    );
+
+    server.stop().await;
+}
+
+/// The contract's `SessionAgentBinding` REQUIRED members, verbatim from `harness-api.ts:1756-1847` in the
+/// order the interface declares them. `rank` sits third and `role` appears nowhere: the row is a closed
+/// object (`additionalProperties: false`, `:1755`), so a Rust row that swaps one for the other breaks a
+/// validating client twice over - one missing required member and one undeclared member.
+const SESSION_BINDING_REQUIRED: [&str; 12] = [
+    "agent_id",
+    "profile",
+    "rank",
+    "origin",
+    "model",
+    "inherited_model",
+    "instruction_source",
+    "instruction_chars",
+    "editable",
+    "deletable",
+    "restorable",
+    "revision",
+];
+
+/// The three members the same interface marks OPTIONAL (`has_instruction_override?`, `guidelines_count?`,
+/// `busy?`). Together with [`SESSION_BINDING_REQUIRED`] this is the CLOSED member set: a key outside it is
+/// the second half of the contract break R1 describes.
+const SESSION_BINDING_OPTIONAL: [&str; 3] =
+    ["has_instruction_override", "guidelines_count", "busy"];
+
+/// ONE ROW, ONE RULE: every session-agent row - the list, the identified read, and a create/patch receipt -
+/// satisfies the contract's member list element for element.
+///
+/// Three assertions, none of them a smoke test:
+/// 1. the required members appear, in the contract's declared order, with none missing and none repeated;
+/// 2. NOTHING else appears, which is `additionalProperties: false`;
+/// 3. `role` specifically is absent, because it is the retired member this build used to emit and the one a
+///    reader would otherwise shrug at.
+///
+/// `at` names the surface being checked, so a failure says which read drifted rather than just which row.
+fn assert_contract_binding_row(row: &Value, at: &str) {
+    let Some(object) = row.as_object() else {
+        panic!("`{at}` must be a JSON object, got {row}");
+    };
+
+    let keys: Vec<&str> = object.keys().map(String::as_str).collect();
+
+    let required_in_order: Vec<&str> = keys
+        .iter()
+        .copied()
+        .filter(|key| SESSION_BINDING_REQUIRED.contains(key))
+        .collect();
+
+    assert_eq!(
+        required_in_order,
+        SESSION_BINDING_REQUIRED.to_vec(),
+        "`{at}` states every required member exactly once, in the contract's order"
+    );
+
+    for key in &keys {
+        assert!(
+            SESSION_BINDING_REQUIRED.contains(key) || SESSION_BINDING_OPTIONAL.contains(key),
+            "`{at}` carries `{key}`, a member the contract does not declare \
+             (`additionalProperties: false`)"
+        );
+    }
+
+    assert!(
+        !keys.contains(&"role"),
+        "`{at}` still emits the retired `role` member"
+    );
+}
+
+/// THE SESSION-AGENT RANK VOCABULARY (R1 + R2): the wire row's `rank`, the bind body's six members, the
+/// PATCH's fourth one, and the two refusal sentences TypeScript answers.
+///
+/// Every expectation here is read off the CONTRACT, not off this build's output:
+/// - `SessionAgentBinding.rank` (`harness-api.ts:1766-1770`), letter-spelled `AgentRank` (`:622-627`).
+/// - `CreateSessionAgentRequest` = `name, profile, model, instruction, prefix, rank` (`:1883-1942`), and
+///   `api.ts:4188` validates exactly that list.
+/// - `UpdateSessionAgentRequest` = `model, instruction, rank, prefix` (`:1954-1990`), and `api.ts:4040`
+///   validates exactly that list.
+/// - `validateBindingRank` (`sessions.ts:1205-1222`) and the PATCH's stated-but-no-authority check
+///   (`api.ts:4051-4058`) supply the two sentences, quoted verbatim below.
+/// - the precedence `api-reads.ts:1564` states - `record.harness.ranks?.[name] ?? rankOfMember(
+///   definition.ranks, name)`, and `rankOfMember` (`:1487-1489`) falls to the LOWEST letter - which is the
+///   "descriptor letter, then session override, then `Z`" ladder the sections below pin in both directions.
+#[tokio::test]
+async fn the_session_agent_rank_vocabulary_is_the_contracts() {
+    let root = Root::new("agent-rank");
+    let server = TestServer::start(&root).await;
+    let (base, _script) = provider(vec![answered("unused", usage(1, 1))]).await;
+
+    let (id, _) = create_session(&server, &base, Some("agent-rank")).await;
+    let agents_path = format!("/v1/harness/sessions/{id}/agents");
+
+    // -------------------------------------------------------------------
+    // 1. THE INHERITED RUNG, and the row shape on every read.
+    //
+    // The `instruct` card's rank map is `team_ranks(entry, roster)` (`src/registry/presets.rs:174-188`):
+    // the entry agent at `ENTRY_RANK` = `A`, every other member at `TEAM_RANK` = `B`. Nothing in this
+    // section writes a rank, so every row reports its descriptor letter and the entry agent's `A` is a
+    // descriptor fact rather than "the first member is `A`" - the mistake the retired `role` encoded.
+    // -------------------------------------------------------------------
+    let roster = get(&server, &agents_path).await;
+
+    assert_eq!(roster.status, StatusCode::OK);
+
+    let rows = roster.body["agents"].as_array().expect("a roster").clone();
+
+    assert!(
+        rows.len() > 1,
+        "a delegating card's roster has delegates to rank"
+    );
+
+    for row in &rows {
+        assert_contract_binding_row(row, "GET .../agents row");
+    }
+
+    let letter_of = |row: &Value| row["rank"].as_str().expect("a rank letter").to_owned();
+
+    assert_eq!(
+        letter_of(&rows[0]),
+        "A",
+        "the entry agent reports the descriptor's letter for it"
+    );
+    assert_eq!(
+        letter_of(&rows[1]),
+        "B",
+        "a delegate reports the descriptor's letter for it, NOT `A`, and two members of one roster \
+         may share a letter - the point of a rank rather than a two-valued role"
+    );
+
+    let summarizer_id = rows
+        .iter()
+        .map(|row| row["agent_id"].as_str().unwrap_or_default().to_owned())
+        .find(|agent| agent == "summarizer")
+        .expect("the `instruct` roster carries the summarizer delegate");
+
+    let one = get(&server, &format!("{agents_path}/{summarizer_id}")).await;
+
+    assert_eq!(one.status, StatusCode::OK);
+    assert_contract_binding_row(&one.body["agent"], "GET .../agents/{agentId} row");
+    assert_eq!(letter_of(&one.body["agent"]), "B");
+
+    // -------------------------------------------------------------------
+    // 2. A BODY BUILT FROM THE CONTRACT'S OWN SIX MEMBERS IS ACCEPTED.
+    //
+    // Every member of `CreateSessionAgentRequest` is present, `prefix` and `rank` included, and the route
+    // answers 201 rather than a 400 about `prefix` - the failure mode R2 describes. The member is detached
+    // first because every shipped catalogue profile is already on this roster, so 201 is reached by the
+    // same re-bind the roster test above uses.
+    // -------------------------------------------------------------------
+    let unbound = del(&server, &format!("{agents_path}/{summarizer_id}")).await;
+
+    assert_eq!(unbound.status, StatusCode::OK, "{}", unbound.body);
+
+    let bound = post_json(
+        &server,
+        &agents_path,
+        Some(json!({
+            "name": summarizer_id,
+            "profile": summarizer_id,
+            "model": "mock/sum",
+            "instruction": "Compress to one line.",
+            "prefix": [{"role": "user", "content": "the ask"}],
+            "rank": "C",
+        })),
+    )
+    .await;
+
+    assert_eq!(
+        bound.status,
+        StatusCode::CREATED,
+        "the contract's own body is accepted: {}",
+        bound.body
+    );
+    assert_contract_binding_row(&bound.body["agent"], "POST .../agents receipt");
+    assert_eq!(
+        letter_of(&bound.body["agent"]),
+        "C",
+        "the receipt states the rank the body asked for, in the contract's letter spelling"
+    );
+    assert_eq!(bound.string_at("/agent/model"), "mock/sum");
+
+    // THE BIND'S `prefix` IS A WRITE, not decoration: `harness-api.ts:1922-1931` promises the band is
+    // "stored verbatim and durable in this session's record", and `api.ts:4231-4249` validates it at the
+    // edge. `source: session` is the rung a stored band the definition does not carry answers
+    // (`api.ts:4466-4503`), so this read is the observable proof the member was not accepted and dropped.
+    let band = get(&server, &format!("{agents_path}/{summarizer_id}/prefix")).await;
+
+    assert_eq!(
+        band.body,
+        json!({
+            "session_id": id,
+            "agent_id": summarizer_id,
+            "prefix": [{"role": "user", "content": "the ask"}],
+            "source": "session",
+        }),
+        "the band a bind states is the band the member seeds"
+    );
+
+    // -------------------------------------------------------------------
+    // 3. THE OVERRIDE RUNG.
+    //
+    // A rank written for THIS session outranks the descriptor for every read of that session, which is the
+    // first rung of `api-reads.ts:1564`; the descriptor keeps its letter for every member nobody wrote.
+    // -------------------------------------------------------------------
+    let patched = patch_json(
+        &server,
+        &format!("{agents_path}/{summarizer_id}"),
+        json!({"rank": "D"}),
+    )
+    .await;
+
+    assert_eq!(
+        patched.status,
+        StatusCode::OK,
+        "the PATCH takes `rank`: {}",
+        patched.body
+    );
+    assert_contract_binding_row(&patched.body["agent"], "PATCH .../agents/{agentId} receipt");
+    assert_eq!(letter_of(&patched.body["agent"]), "D");
+
+    let roster_after = get(&server, &agents_path).await;
+
+    for row in roster_after.body["agents"].as_array().expect("a roster") {
+        assert_contract_binding_row(row, "the roster read after a rank write");
+
+        // THE SCOPE OF AN OVERRIDE: the member this session wrote reports its letter, and every OTHER member
+        // still reports the letter the harness descriptor states for it - the entry agent `A`, each delegate
+        // `B` (`team_ranks`, `src/registry/presets.rs:174-188`). A session rank is one key in a map, not a
+        // promotion of whoever asked.
+        let expected = match row["agent_id"].as_str() {
+            Some(agent) if agent == summarizer_id.as_str() => "D",
+            Some("instruct") => "A",
+            _ => "B",
+        };
+
+        assert_eq!(
+            letter_of(row),
+            expected,
+            "`{}` reports the letter its own rung states",
+            row["agent_id"]
+        );
+    }
+
+    let read_back = get(&server, &format!("{agents_path}/{summarizer_id}")).await;
+
+    assert_eq!(letter_of(&read_back.body["agent"]), "D");
+
+    // -------------------------------------------------------------------
+    // 4. THE REFUSALS, each one TypeScript's own sentence.
+    // -------------------------------------------------------------------
+    let binding_refusal = "An agent binding takes a \"rank\": one letter of the authority scale, \
+                           A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z. \
+                           The rank is what decides what the agent may reach; the roster alone does not.";
+    let letter_refusal = "An agent rank must be one letter of the authority scale, \
+                          A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z.";
+
+    for (body, expected, surface) in [
+        // THE RETIRED `role`, on both verbs. `api.ts:4184-4186`: "the OLD field `role` is not accepted at
+        // all - it lands in the unknown-field refusal below", so a legacy client gets a clear refusal
+        // instead of a body this build quietly reinterprets.
+        (
+            json!({"name": "instruct", "profile": "instruct", "role": "subagent"}),
+            "Unknown field \"role\". Allowed fields: name, profile, model, instruction, rank, prefix.",
+            "POST",
+        ),
+        (
+            json!({"role": "primary"}),
+            "Unknown field \"role\". Allowed fields: model, instruction, rank, prefix.",
+            "PATCH",
+        ),
+        // A LETTER THAT IS NOT ONE, on either verb: one validator, one message (`sessions.ts:1218-1221`).
+        // Lower-case is not upper-case - `isAgentRank` is the guard, and it never reinterprets.
+        (
+            json!({"name": "ghost", "rank": "leader"}),
+            binding_refusal,
+            "POST",
+        ),
+        (json!({"rank": "d"}), binding_refusal, "PATCH"),
+        (json!({"rank": 5}), binding_refusal, "PATCH"),
+        // THE PATCH'S OTHER SENTENCE, and it belongs to the PATCH alone: a stated `null` resolves to no
+        // authority, which `api.ts:4054-4057` refuses out loud because a rank has no restore arm. On POST
+        // the same value is the contract's "ask for no authority" arm (`harness-api.ts:1932-1937`), so a
+        // `null` rank binds - the last case in this table pins that difference.
+        (json!({"rank": null}), letter_refusal, "PATCH"),
+    ] {
+        let described = format!("{surface} {}", body);
+        let reply = if surface == "POST" {
+            post_json(&server, &agents_path, Some(body)).await
+        } else {
+            patch_json(&server, &format!("{agents_path}/{summarizer_id}"), body).await
+        };
+
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "`{described}` is refused"
+        );
+        assert_eq!(reply.message(), expected, "`{described}`");
+    }
+
+    // THE ONE POST ARM THAT IS NOT AN ERROR: `null` asks for no authority, and the row that answers
+    // resolves it through the ladder rather than refusing the body. The member is re-bound from the
+    // definition, so no session override exists and the descriptor's letter is the answer.
+    let unranked = del(&server, &format!("{agents_path}/{summarizer_id}")).await;
+
+    assert_eq!(unranked.status, StatusCode::OK, "{}", unranked.body);
+
+    let defaulted = post_json(
+        &server,
+        &agents_path,
+        Some(json!({"name": summarizer_id, "profile": summarizer_id, "rank": null})),
+    )
+    .await;
+
+    assert_eq!(
+        defaulted.status,
+        StatusCode::CREATED,
+        "a `null` rank binds: {}",
+        defaulted.body
+    );
+    assert_eq!(
+        letter_of(&defaulted.body["agent"]),
+        "B",
+        "no rank asked for, no rank invented: the row falls through to the descriptor's letter for the \
+         member (`rankOfMember`), which is the rung `harness-api.ts:1766-1770` describes"
+    );
+
+    server.stop().await;
+}
+
+/// THE RANK PATCH IS A BEFORE-THE-FIRST-THREAD WRITE (`harness-api.ts:1956-1962`,
+/// `sessions.ts:8253-8262`): a saved conversation keeps the ranks its harness template defines, because its
+/// delegation graph was built from that map.
+///
+/// The refusal is scoped to the rank arm alone, and the second half of this test is what proves the scope:
+/// a MODEL patch on the same started session still answers 200. Without that half, a gate that accidentally
+/// covered the whole PATCH would pass this test while breaking the override writes.
+#[tokio::test]
+async fn a_started_conversation_keeps_its_ranks() {
+    let root = Root::new("agent-rank-started");
+    let server = TestServer::start(&root).await;
+    let (base, _script) = provider(vec![answered("the run", usage(3, 2))]).await;
+
+    let (id, _) = create_session(&server, &base, Some("agent-rank-started")).await;
+    let summarizer_path = format!("/v1/harness/sessions/{id}/agents/summarizer");
+
+    let before = patch_json(&server, &summarizer_path, json!({"rank": "C"})).await;
+
+    assert_eq!(
+        before.status,
+        StatusCode::OK,
+        "a session nobody has used takes a rank: {}",
+        before.body
+    );
+    assert_eq!(before.string_at("/agent/rank"), "C");
+
+    let started = submit(&server, &id, "start the conversation", None).await;
+
+    assert_eq!(
+        started.status,
+        StatusCode::ACCEPTED,
+        "the submit is accepted: {}",
+        started.body
+    );
+
+    let turn_id = started.string_at("/turn_id");
+
+    wait_for_turn(&server, &id, &turn_id, "done").await;
+
+    let refused = patch_json(&server, &summarizer_path, json!({"rank": "E"})).await;
+
+    assert_eq!(
+        refused.status,
+        StatusCode::CONFLICT,
+        "a used session refuses a rank: {}",
+        refused.body
+    );
+    assert_eq!(
+        refused.message(),
+        "A saved conversation keeps the ranks its harness template defines; start a new session to change \
+         them."
+    );
+
+    // THE SCOPE OF THE GATE: an override moves no authority, so it stays writable after the first turn
+    // (`api.ts:4096-4146` runs the model half with no such check).
+    let modelled = patch_json(&server, &summarizer_path, json!({"model": "mock/other"})).await;
+
+    assert_eq!(
+        modelled.status,
+        StatusCode::OK,
+        "the model half is not gated by the started rule: {}",
+        modelled.body
+    );
+
+    // AND THE REFUSAL CHANGED NOTHING: the rank the session was given while it was fresh is still the one
+    // every read reports.
+    let roster = get(&server, &format!("/v1/harness/sessions/{id}/agents")).await;
+
+    for row in roster.body["agents"].as_array().expect("a roster") {
+        assert_contract_binding_row(row, "the roster read after a refused rank");
+    }
+
+    let summarizer_row = roster.body["agents"]
+        .as_array()
+        .expect("a roster")
+        .iter()
+        .find(|row| row["agent_id"].as_str() == Some("summarizer"))
+        .expect("the summarizer row")
+        .clone();
+
+    assert_eq!(
+        summarizer_row["rank"],
+        json!("C"),
+        "a refused rank write leaves the accepted one in place"
+    );
+    assert_eq!(
+        summarizer_row["model"],
+        json!("mock/other"),
+        "and the override that WAS accepted after the first turn is still there too"
+    );
+
+    server.stop().await;
+}
+
+/// THE PRESET-HISTORY BAND (`GET .../agents/{agent_id}/prefix` `api.ts:4449-4510` + the binding PATCH's
+/// `prefix` field `api.ts:4052-4077`, `sessions.ts:8136-8210`).
+///
+/// Three things are pinned here and none of them is the happy path:
+///
+/// 1. THE PROVENANCE LADDER. A band has three authors - the frozen definition (`harness`), this
+///    conversation (`session`), and nobody (`none`) - and the write has THREE arms that land in
+///    different rungs: a band, `[]` ("this conversation chose no history", which is a CHOICE and answers
+///    `session`), and `null` ("give me back what my definition seeds", which restates the definition's
+///    band rather than deleting it). Collapsing `[]` and `null` is the obvious implementation and it is
+///    wrong: a client that reads `session` knows its own empty band is what the model will see, and a
+///    client that reads `none` knows nothing does.
+/// 2. THE DOCUMENT'S KEY ORDER, pinned on the re-serialized body. `serde_json` runs with
+///    `preserve_order` in this crate (`Cargo.toml:82`), so the parsed body keeps the wire order and this
+///    line fails the moment the response type's field order drifts from `harness-api.ts:2067-2083`.
+/// 3. THE ONE VALIDATOR'S SENTENCES. Every malformed band answers with the registry's wording, naming the
+///    turn index, because the SAME validator backs the harness-definition write
+///    ([`typecrate_harness::registry::require_prefix_turns`]) - a client that PATCHes a band into a
+///    definition and into a session must read one shape of 400.
+#[tokio::test]
+async fn the_preset_history_band_reports_its_author_and_the_binding_patch_writes_it() {
+    let root = Root::new("preset-history");
+    let server = TestServer::start(&root).await;
+    let (base, _script) = provider(vec![answered("unused", usage(1, 1))]).await;
+
+    let (id, _) = create_session(&server, &base, Some("preset-history")).await;
+
+    let roster = get(&server, &format!("/v1/harness/sessions/{id}/agents")).await;
+    let primary_id = roster.body["agents"][0]["agent_id"]
+        .as_str()
+        .expect("the roster names its primary agent")
+        .to_owned();
+    let agent_path = format!("/v1/harness/sessions/{id}/agents/{primary_id}");
+    let prefix_path = format!("{agent_path}/prefix");
+
+    // 1. NOTHING SEEDS THIS MEMBER: the `instruct` card declares no preset history at all
+    // (`src/registry/presets.rs:252`, `agent_prefixes: BTreeMap::new()`), so the frozen definition has
+    // no band and the session's own preset copy has none either. `none` is the rung, and `prefix: []`
+    // is its honest payload (`api.ts:4482`, "which is also the honest value for source: none").
+    let band = get(&server, &prefix_path).await;
+
+    assert_eq!(band.status, StatusCode::OK, "the read: {}", band.body);
+    assert_eq!(
+        band.body,
+        json!({
+            "session_id": id,
+            "agent_id": primary_id,
+            "prefix": [],
+            "source": "none",
+        })
+    );
+    assert_eq!(
+        serde_json::to_string(&band.body).expect("a body re-serializes"),
+        format!(
+            "{{\"session_id\":\"{id}\",\"agent_id\":\"{primary_id}\",\"prefix\":[],\"source\":\"none\"}}"
+        ),
+        "the document's key order is `harness-api.ts:2067-2083`'s declaration order"
+    );
+    assert_eq!(
+        band.header(&REVISION_HEADER),
+        None,
+        "a band projection stamps no revision: the route has no write (`api.ts:4510`)"
+    );
+
+    // 2. THE WRITE, and the ladder moves to `session` because the stored band is not the definition's.
+    let written = patch_json(
+        &server,
+        &agent_path,
+        json!({"prefix": [
+            {"role": "user", "content": "the ask"},
+            {"role": "assistant", "content": "the answer"}
+        ]}),
+    )
+    .await;
+
+    assert_eq!(
+        written.status,
+        StatusCode::OK,
+        "the write: {}",
+        written.body
+    );
+    assert_eq!(
+        written.string_at("/agent/agent_id"),
+        primary_id,
+        "the receipt is the binding row, exactly like the model half of this route"
+    );
+
+    let authored = get(&server, &prefix_path).await;
+
+    assert_eq!(
+        authored.body,
+        json!({
+            "session_id": id,
+            "agent_id": primary_id,
+            "prefix": [
+                {"role": "user", "content": "the ask"},
+                {"role": "assistant", "content": "the answer"},
+            ],
+            "source": "session",
+        }),
+        "the band reads back verbatim, in order, with the text UNTRIMMED"
+    );
+
+    // 3. `[]` ON A MEMBER NOTHING SEEDS. The write landed (the shard says so below), yet the rung is
+    // still `none`: an empty stored band and no band at all produce the SAME prompt, and TS's ladder
+    // refuses to report an authorship no reader can observe (`api.ts:4466-4476`, "a session write that
+    // restates the definition's own bytes answers `harness`, because no reader - not the model, not a
+    // restart - can observe a difference that is not there", with `none` the same rule when the
+    // definition's band is empty too). `[]` and `null` are DIFFERENT WRITES - the first restates what
+    // this conversation chose, the second what its definition seeds - and the split is observable only
+    // where the definition seeds something, which is the next test.
+    let emptied = patch_json(&server, &agent_path, json!({"prefix": []})).await;
+
+    assert_eq!(emptied.status, StatusCode::OK, "`[]`: {}", emptied.body);
+
+    let chosen = get(&server, &prefix_path).await;
+
+    assert_eq!(
+        chosen.body,
+        json!({"session_id": id, "agent_id": primary_id, "prefix": [], "source": "none"})
+    );
+
+    // 4. `null` IS THE UNDO, and it is not the same statement as `[]`: the store restates the frozen
+    // definition's own band (`sessions.ts:8157-8163`), which here is nothing at all - so the rung returns
+    // to `none`, which is precisely what `[]` refused to say.
+    let undone = patch_json(&server, &agent_path, json!({"prefix": null})).await;
+
+    assert_eq!(undone.status, StatusCode::OK, "`null`: {}", undone.body);
+
+    let restored = get(&server, &prefix_path).await;
+
+    assert_eq!(
+        restored.body,
+        json!({"session_id": id, "agent_id": primary_id, "prefix": [], "source": "none"})
+    );
+
+    // 5. ONE PATCH, TWO FIELDS, ONE BUMP. TS runs the instruction and prefix halves as two store calls
+    // and bumps `session_agents` once at the route (`api.ts:4158-4166`); this build folds the halves into
+    // one commit, and the figure that has to agree is the counter the header quotes.
+    let both = patch_json(
+        &server,
+        &agent_path,
+        json!({"model": "mock/framed-one", "prefix": [{"role": "system", "content": "framed"}]}),
+    )
+    .await;
+
+    assert_eq!(both.status, StatusCode::OK, "both halves: {}", both.body);
+    assert_eq!(both.string_at("/agent/model"), "mock/framed-one");
+
+    let next = patch_json(&server, &agent_path, json!({"model": "mock/framed-two"})).await;
+
+    assert_eq!(
+        next.revision(),
+        both.revision() + 1,
+        "the two-field write moved the roster counter exactly once"
+    );
+
+    let framed = get(&server, &prefix_path).await;
+
+    assert_eq!(
+        framed.body["prefix"],
+        json!([{"role": "system", "content": "framed"}]),
+        "the model half did not disturb the band the same patch wrote"
+    );
+
+    // 6. THE DROP, not a refusal: a turn carrying `toolCalls`, `id` or `attachments` is accepted and the
+    // projection keeps only the role and its text (swagger `:4794-4806` states a drop, and
+    // `requirePrefixTurns` is where it happens - a preset that seeded a tool result would promise the
+    // model an exchange whose execution never happened).
+    let padded = patch_json(
+        &server,
+        &agent_path,
+        json!({"prefix": [{
+            "role": "user",
+            "content": "kept",
+            "id": "turn-7",
+            "toolCalls": [{"id": "call-1", "name": "timeNow", "arguments": "{}"}],
+            "attachments": [{"kind": "file"}],
+            "notAContractKey": true
+        }]}),
+    )
+    .await;
+
+    assert_eq!(padded.status, StatusCode::OK, "the drop: {}", padded.body);
+
+    let stripped = get(&server, &prefix_path).await;
+
+    assert_eq!(
+        stripped.body["prefix"],
+        json!([{"role": "user", "content": "kept"}]),
+        "exactly `{{ role, content }}` survives, in the contract's key order"
+    );
+    assert_eq!(
+        serde_json::to_string(&stripped.body["prefix"]).expect("a band re-serializes"),
+        "[{\"role\":\"user\",\"content\":\"kept\"}]"
+    );
+
+    // 7. EVERY MALFORMED BAND, in the registry's own words, naming the turn index. Each refusal is
+    // followed by a read, because a rejected patch must leave the band EXACTLY as it was.
+    //
+    // THE BACKTICKS CLOSE BEFORE THE INDEX (`` `prefix.instruct`[0] ``, not `` `prefix.instruct[0]` ``):
+    // `require_prefix_turns` builds `label` once with the quotes and then formats `format!("{label}[{i}]")`
+    // (`src/registry/mod.rs:1347`), and TS does the same (`registry.ts:886-890`). The label is the FIELD,
+    // the index is a position inside it - so this pin looks odd and is the contract.
+    let mut index = 0usize;
+
+    for (submitted, expected) in [
+        (
+            json!({"prefix": "not a band"}),
+            format!(
+                "`prefix.{primary_id}` must be an ARRAY of preset-history turns ({{ role, content }})."
+            ),
+        ),
+        (
+            json!({"prefix": {"instruct": []}}),
+            format!(
+                "`prefix.{primary_id}` must be an ARRAY of preset-history turns ({{ role, content }})."
+            ),
+        ),
+        (
+            json!({"prefix": [[]] }),
+            format!(
+                "`prefix.{primary_id}`[0] must be an object with a \"role\" and a \"content\" string."
+            ),
+        ),
+        (
+            json!({"prefix": [{"role": "tool", "content": "a result"}] }),
+            format!(
+                "`prefix.{primary_id}`[0] has role \"tool\". A preset history turn is \"system\", \"user\", or \"assistant\" \u{2014} a tool turn belongs to a conversation, not to a preset."
+            ),
+        ),
+        (
+            json!({"prefix": [{"role": "user"}] }),
+            format!("`prefix.{primary_id}`[0] needs a string \"content\". Received undefined."),
+        ),
+        (
+            json!({"prefix": [{"role": "user", "content": [{"kind": "text"}]}] }),
+            format!(
+                "`prefix.{primary_id}`[0] needs a string \"content\". Received [{{\"kind\":\"text\"}}]."
+            ),
+        ),
+        (
+            // `MAX_PREFIX_TURNS` (`src/registry/presets.rs:151`) is 64, so 65 is the first refusal.
+            json!({"prefix": array_turns(65)}),
+            format!("`prefix.{primary_id}` cannot hold more than 64 turns. Received 65."),
+        ),
+        (
+            json!({"prefix": [{"role": "user", "content": "x".repeat(32_001)}] }),
+            format!("`prefix.{primary_id}`[0] content cannot exceed 32000 characters."),
+        ),
+    ] {
+        index += 1;
+
+        let refused = patch_json(&server, &agent_path, submitted).await;
+
+        assert_eq!(
+            refused.status,
+            StatusCode::BAD_REQUEST,
+            "refusal #{index} is a 400: {}",
+            refused.body
+        );
+        assert_eq!(refused.message(), expected, "refusal #{index}");
+
+        let unchanged = get(&server, &prefix_path).await;
+
+        assert_eq!(
+            unchanged.body["prefix"],
+            json!([{"role": "user", "content": "kept"}]),
+            "refusal #{index} changed the band"
+        );
+    }
+
+    // 8. THE BOUNDARY THE OTHER WAY: 64 turns and a 32000-character turn are both legal, which is what
+    // makes the two refusals above about the BOUND rather than about the shape.
+    let boundary = patch_json(&server, &agent_path, json!({"prefix": array_turns(64)})).await;
+
+    assert_eq!(
+        boundary.status,
+        StatusCode::OK,
+        "64 turns: {}",
+        boundary.body
+    );
+    assert_eq!(
+        get(&server, &prefix_path).await.body["prefix"]
+            .as_array()
+            .map(Vec::len),
+        Some(64)
+    );
+
+    // 9. THE ORDER: a body that is wrong about BOTH the band and the instruction answers about the band,
+    // because TS validates the band first (`api.ts:4052-4077` precedes `:4095`) so a malformed band can
+    // never arrive after a half of the patch has already moved.
+    let precedence = patch_json(
+        &server,
+        &agent_path,
+        json!({"instruction": 7, "prefix": "not a band"}),
+    )
+    .await;
+
+    assert_eq!(precedence.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        precedence.message(),
+        format!(
+            "`prefix.{primary_id}` must be an ARRAY of preset-history turns ({{ role, content }})."
+        )
+    );
+
+    // 10. THE FOUR-LETTER REFUSALS. The session is asked first (a request naming a session that never
+    // existed never learns which agents it lacks), then the DEFINITION roster - a band is a seed, so an
+    // agent this conversation merely bound at runtime has no seed to report (`api.ts:4455-4458`).
+    let ghost_session = get(&server, "/v1/harness/sessions/ghost/agents/instruct/prefix").await;
+
+    assert_eq!(ghost_session.status, StatusCode::NOT_FOUND);
+    assert_eq!(ghost_session.message(), "Unknown session \"ghost\".");
+
+    let ghost_both = get(&server, "/v1/harness/sessions/ghost/agents/ghost/prefix").await;
+
+    assert_eq!(ghost_both.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        ghost_both.message(),
+        "Unknown session \"ghost\".",
+        "the session is named even when the agent is unknown too"
+    );
+
+    let ghost_agent = get(
+        &server,
+        &format!("/v1/harness/sessions/{id}/agents/ghost/prefix"),
+    )
+    .await;
+
+    assert_eq!(ghost_agent.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        ghost_agent.message(),
+        format!("Agent \"ghost\" is not a member of session \"{id}\".")
+    );
+
+    // 11. THE 405, from the generated route table rather than from a handler: this path declares GET
+    // only, so the unbind verb says which verb to use.
+    let no_delete = del(&server, &prefix_path).await;
+
+    assert_eq!(no_delete.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(no_delete.message(), format!("Use GET for {prefix_path}."));
+
+    server.stop().await;
+}
+
+/// A band of `count` legal turns, used for the turn-count boundary and its refusal.
+fn array_turns(count: usize) -> Value {
+    Value::Array(
+        (0..count)
+            .map(|index| {
+                json!({"role": if index % 2 == 0 { "user" } else { "assistant" }, "content": format!("turn {index}")})
+            })
+            .collect(),
+    )
+}
+
+/// THE OTHER TWO RUNGS, on a definition that actually seeds a band: `harness` for the untouched copy,
+/// and the `[]`-versus-`null` split that a member with no band cannot show.
+///
+/// This is the test that pins the durable half of the undo. TS writes the SESSION's own preset copy
+/// rather than deleting the key (`sessions.ts:8196-8202`: "the map therefore always says what the live
+/// brain seeds - which is also what makes the prefix read's `source` ladder decidable from the record
+/// alone"), so an undo leaves the definition's band ON the session record and the read answers
+/// `harness` about bytes the session wrote. A port that deleted the key on `null` would answer the same
+/// thing here and break on the next template edit; a port that stored `[]` would answer `session` and
+/// tell the client its conversation chose an empty history when it did not.
+#[tokio::test]
+async fn a_definition_that_seeds_a_band_reports_harness_until_the_session_overrides_it() {
+    let root = Root::new("preset-history-seeded");
+    let server = TestServer::start(&root).await;
+    let (base, _script) = provider(vec![answered("unused", usage(1, 1))]).await;
+
+    let seeded_band = json!([
+        {"role": "user", "content": "the seeded ask"},
+        {"role": "assistant", "content": "the seeded answer"},
+    ]);
+
+    let created = post_json(
+        &server,
+        "/v1/harness/harnesses",
+        Some(json!({
+            "name": "seeded-team",
+            "title": "Seeded Team",
+            "description": "A harness whose one member seeds a preset history.",
+            "agents": ["instruct"],
+            "agent_prefixes": { "instruct": seeded_band },
+        })),
+    )
+    .await;
+
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "the definition: {}",
+        created.body
+    );
+
+    let session = post_json(
+        &server,
+        "/v1/harness/sessions",
+        Some(json!({
+            "harness": "seeded-team",
+            "settings": {"base_url": base, "api_key": MOCK_KEY, "model": "mock/one"}
+        })),
+    )
+    .await;
+
+    assert_eq!(
+        session.status,
+        StatusCode::CREATED,
+        "the session: {}",
+        session.body
+    );
+
+    let id = session.string_at("/session/id");
+    let agent_path = format!("/v1/harness/sessions/{id}/agents/instruct");
+    let prefix_path = format!("{agent_path}/prefix");
+
+    // RUNG `harness`: nothing has been written, and the live band IS the frozen definition's.
+    let initial = get(&server, &prefix_path).await;
+
+    assert_eq!(initial.status, StatusCode::OK, "the read: {}", initial.body);
+    assert_eq!(
+        initial.body,
+        json!({
+            "session_id": id,
+            "agent_id": "instruct",
+            "prefix": seeded_band,
+            "source": "harness",
+        })
+    );
+
+    // THE CHOICE: `[]` on a member that DOES have a seeded band is a statement, so the rung moves to
+    // `session` and the band is empty - "this conversation chose no preset history over the band its
+    // definition would have seeded" (`api.ts:4466-4476`). This is the only place `[]` and `null` are
+    // observable apart, which is why the previous test could not pin it.
+    let chose_empty = patch_json(&server, &agent_path, json!({"prefix": []})).await;
+
+    assert_eq!(
+        chose_empty.status,
+        StatusCode::OK,
+        "`[]`: {}",
+        chose_empty.body
+    );
+
+    let chosen = get(&server, &prefix_path).await;
+
+    assert_eq!(
+        chosen.body,
+        json!({"session_id": id, "agent_id": "instruct", "prefix": [], "source": "session"})
+    );
+
+    // A band of its own, then the UNDO.
+    let wrote = patch_json(
+        &server,
+        &agent_path,
+        json!({"prefix": [{"role": "user", "content": "session-only"}]}),
+    )
+    .await;
+
+    assert_eq!(wrote.status, StatusCode::OK, "the band: {}", wrote.body);
+
+    let authored = get(&server, &prefix_path).await;
+
+    assert_eq!(
+        authored.body,
+        json!({
+            "session_id": id,
+            "agent_id": "instruct",
+            "prefix": [{"role": "user", "content": "session-only"}],
+            "source": "session",
+        })
+    );
+
+    let undone = patch_json(&server, &agent_path, json!({"prefix": null})).await;
+
+    assert_eq!(undone.status, StatusCode::OK, "`null`: {}", undone.body);
+
+    let restored = get(&server, &prefix_path).await;
+
+    assert_eq!(
+        restored.body,
+        json!({
+            "session_id": id,
+            "agent_id": "instruct",
+            "prefix": seeded_band,
+            "source": "harness",
+        }),
+        "the undo restates the definition's own band on the SESSION's preset copy, so the rung returns \
+         to `harness` with the seeded bytes - not an empty band, and not `none`"
+    );
+
+    // The definition itself is untouched by any of this: a session band is a copy, never an edit of the
+    // harness its author wrote (`api.ts:4479`, the comparison is against the FROZEN definition copy).
+    let definition = get(&server, "/v1/harness/harnesses/seeded-team").await;
+
+    assert_eq!(
+        definition.body["harness"]["agent_prefixes"]["instruct"], seeded_band,
+        "the frozen definition still says what its author wrote"
+    );
+
+    server.stop().await;
+}
+
+/// THE IDLE GATE ON THE BAND WRITE, and the half of the same route that does NOT wait.
+///
+/// A band is what the brain SEEDS the next turn with, so TS refuses to swap it underneath a run
+/// (`sessions.ts:8141`, `assertBindingIdle(session, "change an agent prefix in a session")` - the same
+/// guard a roster change takes, for the same reason: the run in flight resolves its team and its seeds
+/// from the live harness, and a band that moved underneath it would silently rewrite what the model
+/// saw). The model half of this PATCH has no such gate anywhere in TS (`setAgentModels` reads the
+/// session and writes), and that split is what this test pins: one route, two verbs of write, two
+/// different answers on the same live session.
+#[tokio::test]
+async fn a_live_run_waits_for_the_band_write_and_still_takes_a_model_override() {
+    let root = Root::new("preset-history-busy");
+    let server = TestServer::start(&root).await;
+
+    // One answer, HELD OPEN: the run is live for the whole window the writes land in, which is the
+    // state TS's guard reads.
+    let (base, _script) = provider(vec![Answer::Delayed(
+        900,
+        answered_body("held open", usage(7, 3)),
+    )])
+    .await;
+
+    let (id, _) = create_session(&server, &base, Some("preset-history-busy")).await;
+    let thread = open_thread(&server, &id, "instruct").await;
+    let agent_path = format!("/v1/harness/sessions/{id}/agents/instruct");
+    let prefix_path = format!("{agent_path}/prefix");
+
+    let running = submit(&server, &id, "the first ask", Some(&thread)).await;
+    let turn_id = running.string_at("/turn_id");
+
+    wait_for_turn(&server, &id, &turn_id, "running").await;
+
+    let gated = patch_json(
+        &server,
+        &agent_path,
+        json!({"prefix": [{"role": "user", "content": "mid-run"}]}),
+    )
+    .await;
+
+    assert_eq!(
+        gated.status,
+        StatusCode::CONFLICT,
+        "the gate: {}",
+        gated.body
+    );
+    assert_eq!(
+        gated.message(),
+        format!(
+            "Cannot change an agent prefix in a session while session \"{id}\" has a live run or queued work; wait for it to settle or cancel it first."
+        )
+    );
+
+    // THE REFUSAL CHANGES NOTHING - not the band, and not the roster counter this route stamps.
+    let unchanged = get(&server, &prefix_path).await;
+
+    assert_eq!(
+        unchanged.body,
+        json!({"session_id": id, "agent_id": "instruct", "prefix": [], "source": "none"}),
+        "a gated write leaves the band the run seeded"
+    );
+
+    let modelled = patch_json(&server, &agent_path, json!({"model": "mock/mid-run"})).await;
+
+    assert_eq!(
+        modelled.status,
+        StatusCode::OK,
+        "the model half is not gated: {}",
+        modelled.body
+    );
+    assert_eq!(modelled.string_at("/agent/model"), "mock/mid-run");
+
+    wait_for_turn(&server, &id, &turn_id, "done").await;
+
+    // THE SAME WRITE, ONE SETTLE LATER. This is what separates the gate from a blanket refusal: the
+    // session is writable again, and nothing about the run that just finished poisoned it.
+    let settled = patch_json(
+        &server,
+        &agent_path,
+        json!({"prefix": [{"role": "user", "content": "after the run"}]}),
+    )
+    .await;
+
+    assert_eq!(
+        settled.status,
+        StatusCode::OK,
+        "after the settle: {}",
+        settled.body
+    );
+
+    let authored = get(&server, &prefix_path).await;
+
+    assert_eq!(
+        authored.body,
+        json!({
+            "session_id": id,
+            "agent_id": "instruct",
+            "prefix": [{"role": "user", "content": "after the run"}],
+            "source": "session",
+        })
     );
 
     server.stop().await;
@@ -3547,6 +4808,108 @@ async fn a_tool_registration_replaces_by_name_and_refuses_the_replace_flag() {
     server.stop().await;
 }
 
+/// C1/R7: the created-tool budget refusal is the TypeScript sentence, verbatim, at the
+/// TypeScript status.
+///
+/// TS throws this from the kernel path the route calls (`harness.ts:3098-3102`) and the route
+/// maps it by CONTENT (`api.ts:4869-4878`): `/budget|limit/i` answers 409, everything else
+/// answers 400. The shipped sentence names neither word, so the arm it lands in is 400 — which
+/// is what the contract states twice over:
+///   * `harness-server.swagger.yaml` (`/v1/harness/sessions/{session_id}/tools`, post):
+///     "Creation stops at the created-tool budget (32 by default, shown as `budget` in the
+///     receipt) and that refusal is a 400 carrying the runtime's own advice to reuse an existing
+///     tool, not a 409; a replacement of a name this session already holds does not consume the
+///     budget.";
+///   * `harness-api.ts:433-437` quotes the same sentence for `created_tools`.
+#[tokio::test]
+async fn the_created_tool_budget_refusal_is_the_typescript_sentence_at_400() {
+    let root = Root::new("toolbox-budget");
+    let server = TestServer::start(&root).await;
+    let (base, _script) = provider(vec![answered("unused", usage(1, 1))]).await;
+
+    let (id, _) = create_session(&server, &base, Some("toolbox budget")).await;
+    let path = format!("/v1/harness/sessions/{id}/tools");
+
+    // Fill the lifetime budget: 32 DISTINCT names (`contract::MAX_CREATED_TOOLS`, and TS's
+    // `core/creation.ts:73` `DEFAULT_CREATED_TOOLS_LIMIT` is the same 32).
+    for slot in 0..32_u64 {
+        let registered = post_json(
+            &server,
+            &path,
+            Some(json!({
+                "name": format!("toolBudget{slot}"),
+                "description": "Budget filler.",
+                "tags": ["budget"],
+                "source": "return 1;",
+            })),
+        )
+        .await;
+
+        assert_eq!(
+            registered.status,
+            StatusCode::CREATED,
+            "slot {slot} registers: {}",
+            registered.body
+        );
+        assert_eq!(
+            registered.number_at("/registration/budget/used"),
+            slot + 1,
+            "the receipt books the spend it just made"
+        );
+    }
+
+    // One name over the budget: refused with TS's exact words, and the budget figure the receipt
+    // carries is unchanged because a refusal spends nothing.
+    let over = post_json(
+        &server,
+        &path,
+        Some(json!({
+            "name": "toolBudget32",
+            "description": "One over the line.",
+            "tags": ["budget"],
+            "source": "return 1;",
+        })),
+    )
+    .await;
+
+    assert_eq!(
+        over.status,
+        StatusCode::BAD_REQUEST,
+        "the budget refusal is a 400, never a 409 (`api.ts:4869-4878`): {}",
+        over.body
+    );
+    assert_eq!(
+        over.message(),
+        "This harness already created 32 tools; reuse an existing tool instead of creating more."
+    );
+
+    // A replacement under a name this session already holds never spends a slot, so it still
+    // answers 201 with the budget pinned at 32 (`harness.ts:3093`: only a NEW name counts).
+    let replace = post_json(
+        &server,
+        &path,
+        Some(json!({
+            "name": "toolBudget0",
+            "description": "Replaces the first filler.",
+            "tags": ["budget"],
+            "source": "return 2;",
+        })),
+    )
+    .await;
+
+    assert_eq!(
+        replace.status,
+        StatusCode::CREATED,
+        "a replacement is not a creation: {}",
+        replace.body
+    );
+    assert_eq!(replace.body["registration"]["created"], json!(false));
+    assert_eq!(replace.body["registration"]["replaced"], json!(true));
+    assert_eq!(replace.number_at("/registration/budget/used"), 32);
+
+    server.stop().await;
+}
+
 /// T7b: the per-agent display colors ride the FROZEN definition, so the swatches a saved
 /// conversation paints come from the copy it captured, not from a later global edit
 /// (`harness-api.ts:884-900`, `api-reads.ts:1318-1329`).
@@ -3561,8 +4924,8 @@ async fn a_session_definition_carries_the_harness_color_map() {
         "/v1/harness/harnesses",
         Some(json!({
             "name": "t7b-palette",
-            "primary": "planner",
-            "subagents": ["research"],
+            "agents": ["planner", "research"],
+            "entry": "planner",
             "agent_colors": { "planner": "#123456", "research": "#abc" },
         })),
     )
@@ -4725,8 +6088,8 @@ async fn a_host_write_is_visible_to_the_next_session_without_a_restart() {
             "name": "t7a-live",
             "title": "T7a Live",
             "description": "Created after the store booted.",
-            "primary": "planner",
-            "subagents": ["research"],
+            "agents": ["planner", "research"],
+            "entry": "planner",
             "agent_models": { "research": "provider/model-y" },
         })),
     )
@@ -5314,6 +6677,372 @@ async fn a_running_conversation_refuses_both_transcript_writes_with_one_sentence
         StatusCode::OK,
         "the cancel settles the thread so the run cannot outlive the assertions: {}",
         cancelled.body
+    );
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// The session body validators quote the reference, not the serialiser (wave W8)
+// ---------------------------------------------------------------------------
+
+/// The words a client sees when its body is wrong.
+///
+/// The reference has a SENTENCE for every refusal — it even picks a STATUS by matching its own
+/// sentences with a regex (`server/sessions.ts:2036-2051` `attachmentErrorStatus`,
+/// `:10326-10338` `threadError`) — so a 400 that quotes the serialiser (`invalid type: integer \`7\`,
+/// expected a string`, `` missing field `id` ``) is a wire difference even when the status code
+/// matches. `POST {root}/sessions` therefore reads its body field by field instead of decoding it, and
+/// these are the exact strings the reference's `postSession` + `settingsInputOf` emit
+/// (`api.ts:3316-3323`, `:599-629`).
+#[tokio::test]
+async fn a_session_create_body_refusal_quotes_the_reference_and_never_the_serialiser() {
+    let root = Root::new("session-create-body-refusals");
+    let server = TestServer::start(&root).await;
+
+    for (body, message) in [
+        (json!([]), "The request body must be a JSON object."),
+        (json!("general"), "The request body must be a JSON object."),
+        (json!(null), "The request body must be a JSON object."),
+        (
+            json!({"nope": 1}),
+            "Unknown field \"nope\". Allowed fields: harness, title, settings.",
+        ),
+        (
+            json!({"harness": 123}),
+            "A session requires a harness name.",
+        ),
+        (json!({"harness": ""}), "A session requires a harness name."),
+        (
+            json!({"harness": "instruct", "settings": 7}),
+            "\"body.settings\" must be an object.",
+        ),
+        (
+            json!({"harness": "instruct", "settings": [1]}),
+            "\"body.settings\" must be an object.",
+        ),
+        (
+            // `settingsInputOf` returns early ONLY for `undefined` (`api.ts:605`); its next guard is
+            // `settings === null` (`:607-608`), so a JSON `null` block is the same refusal, not absence.
+            json!({"harness": "instruct", "settings": null}),
+            "\"body.settings\" must be an object.",
+        ),
+        (
+            json!({"harness": "instruct", "settings": {"base_url": 7}}),
+            "\"body.settings.base_url\" must be a string.",
+        ),
+        (
+            json!({"harness": "instruct", "settings": {"api_key": true}}),
+            "\"body.settings.api_key\" must be a string.",
+        ),
+        (
+            json!({"harness": "instruct", "settings": {"model": [1]}}),
+            "\"body.settings.model\" must be a string.",
+        ),
+        (
+            json!({"harness": "instruct", "settings": {"zzz": 1}}),
+            "Unknown field \"zzz\". Allowed fields: base_url, api_key, model.",
+        ),
+    ] {
+        let reply = post_json(&server, "/v1/harness/sessions", Some(body.clone())).await;
+
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "`{body}` is refused");
+        assert_eq!(
+            reply.message(),
+            message,
+            "`{body}` answers the reference's sentence verbatim"
+        );
+
+        // The actual defect this wave closes: serde's own wording on a client-visible body.
+        for internal in [
+            "invalid type",
+            "missing field",
+            "unknown variant",
+            "invalid value",
+            "expected a string",
+        ] {
+            assert!(
+                !reply.message().contains(internal),
+                "`{body}` never quotes the serialiser, got `{}`",
+                reply.message()
+            );
+        }
+    }
+
+    server.stop().await;
+}
+
+/// `title` on `POST {root}/sessions` is OPTIONAL and TOLERANT: the reference tests it with
+/// `typeof body.title === 'string'` (`api.ts:3421`) and creates an UNTITLED session when the value is
+/// a number, a boolean or `null`. A serde decode made that a 400 quoting the parser, so the tolerance
+/// is pinned here together with the trim rule the store owns (`normalize_title`, the reference's
+/// `body.title.trim()`).
+#[tokio::test]
+async fn a_session_create_ignores_a_title_that_is_not_a_string() {
+    let root = Root::new("session-create-title-tolerance");
+    let server = TestServer::start(&root).await;
+    let (base, _script) = provider(vec![answered("unused", usage(1, 1))]).await;
+
+    for shape in [
+        json!(7),
+        json!(true),
+        json!(null),
+        json!({"a": 1}),
+        json!([]),
+    ] {
+        let reply = post_json(
+            &server,
+            "/v1/harness/sessions",
+            Some(json!({
+                "harness": "instruct",
+                "title": shape,
+                "settings": {"base_url": base, "api_key": MOCK_KEY, "model": "mock/one"}
+            })),
+        )
+        .await;
+
+        assert_eq!(
+            reply.status,
+            StatusCode::CREATED,
+            "a `{shape}` title is ignored, not refused: {}",
+            reply.body
+        );
+        assert_eq!(
+            reply.body["session"].get("title"),
+            None,
+            "the session carries no title at all: {}",
+            reply.body["session"]
+        );
+    }
+
+    // A real title keeps the reference's trim, and a blank one is absence rather than an empty string.
+    let named = post_json(
+        &server,
+        "/v1/harness/sessions",
+        Some(json!({
+            "harness": "instruct",
+            "title": "  spaced  ",
+            "settings": {"base_url": base, "api_key": MOCK_KEY, "model": "mock/one"}
+        })),
+    )
+    .await;
+
+    assert_eq!(named.status, StatusCode::CREATED, "{}", named.body);
+    assert_eq!(named.body["session"]["title"], json!("spaced"));
+
+    let blank = post_json(
+        &server,
+        "/v1/harness/sessions",
+        Some(json!({
+            "harness": "instruct",
+            "title": "   ",
+            "settings": {"base_url": base, "api_key": MOCK_KEY, "model": "mock/one"}
+        })),
+    )
+    .await;
+
+    assert_eq!(blank.status, StatusCode::CREATED, "{}", blank.body);
+    assert_eq!(
+        blank.body["session"].get("title"),
+        None,
+        "a blank title never reaches the resource"
+    );
+
+    server.stop().await;
+}
+
+/// `PATCH {root}/sessions/{id}` already refused every malformed body with the reference's sentence
+/// before this wave; these are the strings the route is now pinned to, so a future move to a typed
+/// decode cannot quietly replace them with parser text (`api.ts:3449-3483`).
+#[tokio::test]
+async fn a_session_patch_body_refusal_quotes_the_reference_and_never_the_serialiser() {
+    let root = Root::new("session-patch-body-refusals");
+    let server = TestServer::start(&root).await;
+    let (base, _script) = provider(vec![answered("unused", usage(1, 1))]).await;
+    let (id, _created) = create_session(&server, &base, Some("patch refusals")).await;
+    let path = format!("/v1/harness/sessions/{id}");
+
+    for (body, message) in [
+        (json!([]), "The request body must be a JSON object."),
+        (json!(7), "The request body must be a JSON object."),
+        (
+            json!({"nope": 1}),
+            "Unknown field \"nope\". Allowed fields: agent_models, title.",
+        ),
+        (json!({}), "A patch must change at least one field."),
+        (json!({"title": 7}), "\"title\" must be a string or null."),
+        (
+            json!({"title": true}),
+            "\"title\" must be a string or null.",
+        ),
+        (
+            json!({"agent_models": "x"}),
+            "`agentModels` must be an object mapping agent ids to model ids.",
+        ),
+        (
+            json!({"agent_models": []}),
+            "`agentModels` must be an object mapping agent ids to model ids.",
+        ),
+        // The value-level refusals are the shared registry validator's, verbatim
+        // (`harnesses/registry.ts:631-644` `requireModelId`, re-exported for the session store).
+        (
+            json!({"agent_models": {"instruct": 7}}),
+            "`agentModels.instruct` must be a model id string.",
+        ),
+        (
+            json!({"agent_models": {"instruct": true}}),
+            "`agentModels.instruct` must be a model id string.",
+        ),
+    ] {
+        let reply = patch_json(&server, &path, body.clone()).await;
+
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "`{body}` is refused");
+        assert_eq!(
+            reply.message(),
+            message,
+            "`{body}` answers the reference's sentence verbatim"
+        );
+
+        for internal in [
+            "invalid type",
+            "missing field",
+            "unknown variant",
+            "invalid value",
+        ] {
+            assert!(
+                !reply.message().contains(internal),
+                "`{body}` never quotes the serialiser, got `{}`",
+                reply.message()
+            );
+        }
+    }
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// The conversation cap, from the unfocused submit's side (wave W4)
+// ---------------------------------------------------------------------------
+
+/// The cap is 256 in the reference (`engine/core/thread.ts:52` `MAX_THREAD_RECORDS = 256`), and the
+/// TWO routes that hit it answer with TWO codes. The unfocused submit wraps the runtime's sentence and
+/// maps it to **429** (`engine/harness.ts:8052-8056`, `server/sessions.ts:10318-10338`); the create
+/// route wraps NOTHING (`api.ts:5277-5281`), so the throw reaches the listener's uncaught handler and
+/// answers **500** with the same sentence unwrapped (`handler.ts:319-320`).
+#[tokio::test]
+async fn an_unfocused_submit_at_the_conversation_cap_answers_429_with_the_remedy() {
+    let root = Root::new("thread-cap-429");
+    let server = TestServer::start(&root).await;
+    let (base, _script) = provider(vec![answered("unused", usage(1, 1))]).await;
+    let (id, _) = create_session(&server, &base, Some("cap")).await;
+
+    let roster = get(&server, &format!("/v1/harness/sessions/{id}/threads")).await;
+    let opened_before_loop = roster.body["items"].as_array().map(Vec::len).unwrap_or(0);
+
+    // Fill the roster one conversation at a time. The create route keeps the reference's own 500 (the
+    // kernel's throw, unclassified); the number this loop counts is the figure the gate quotes, so it
+    // is asserted rather than assumed.
+    let mut created = 0;
+    let mut refusal = None;
+
+    while created < 300 {
+        let next = post_json(
+            &server,
+            &format!("/v1/harness/sessions/{id}/threads"),
+            Some(json!({"agent": "instruct", "label": format!("#CAP{created}")})),
+        )
+        .await;
+
+        if next.status == StatusCode::INTERNAL_SERVER_ERROR {
+            refusal = Some(next);
+            break;
+        }
+
+        assert_eq!(
+            next.status,
+            StatusCode::CREATED,
+            "create #{created} fills the roster: {}",
+            next.body
+        );
+
+        created += 1;
+    }
+
+    let refused = refusal.expect("the roster fills and the create route refuses");
+
+    assert_eq!(
+        opened_before_loop + created,
+        256,
+        "the roster holds the cap's worth of conversations before it refuses"
+    );
+    assert_eq!(
+        refused.body["error"]["message"],
+        json!(
+            "This session already has 256 independent threads; delete a terminal one before creating \
+             another (maximum 256)."
+        ),
+        "the create route answers the runtime's sentence, unwrapped: {}",
+        refused.body
+    );
+    assert_eq!(
+        refused.body.as_object().expect("an object body").len(),
+        1,
+        "the 500 body is the envelope and nothing else: {}",
+        refused.body
+    );
+    // The reference's uncaught-error path is `sendJson(response, 500, {error:{message}})` with NO
+    // header map (`handler.ts:320`, and `start.ts:176-189` is the same shape), so the epoch header a
+    // success carries is absent here — the crate's envelope answers the same way.
+    assert_eq!(
+        refused
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+        "application/json; charset=utf-8",
+        "the refusal is JSON, never a text/plain 500"
+    );
+    assert!(
+        refused.headers.get("x-harness-epoch").is_none(),
+        "the uncaught path mints no header map, so no epoch header rides the 500: {:?}",
+        refused.headers
+    );
+
+    // THE SUBMIT. An unfocused `POST /tasks` opens a host conversation, and at the cap that is the
+    // runtime's thread-creation refusal: **429**, with the sentence that tells the operator what to
+    // delete. A 409 here would send a client into a retry loop that can never succeed.
+    let late = submit(&server, &id, "one more conversation", None).await;
+
+    assert_eq!(
+        late.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the submit names the cap as a rate limit: {}",
+        late.body
+    );
+    assert_eq!(
+        late.body["error"]["message"],
+        json!(
+            "Could not open a new thread: This session already has 256 independent threads; \
+             delete a terminal one before creating another (maximum 256)."
+        ),
+        "the remedy sentence is the runtime's, quoted in full"
+    );
+
+    // A FOCUSED submit on a conversation that exists is unaffected by the cap: the roster is full, but
+    // the turn has somewhere to land. The roster is read AGAIN here - a fresh session opens no
+    // conversation of its own, so the pre-fill read above is legitimately empty.
+    let full = get(&server, &format!("/v1/harness/sessions/{id}/threads")).await;
+    let thread = full.body["items"][0]["id"]
+        .as_str()
+        .expect("a full roster names a conversation")
+        .to_owned();
+    let focused = submit(&server, &id, "into an existing conversation", Some(&thread)).await;
+
+    assert_eq!(
+        focused.status,
+        StatusCode::ACCEPTED,
+        "the cap never blocks a turn that already has a thread: {}",
+        focused.body
     );
 
     server.stop().await;

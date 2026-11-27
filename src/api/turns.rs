@@ -125,7 +125,9 @@ pub async fn get_session_turn(ctx: &mut Ctx) -> ApiResult {
 /// `GET {root}/sessions/{session_id}/turns/{turn_id}/display` (`api.ts:3800-3827`).
 ///
 /// The tree is the projector's document with the turn's identity stamped in (see the module header);
-/// the route adds `revision`, which is the owning turn's figure by definition (`:3820-3822`).
+/// the route adds `revision`, which is the owning turn's figure by definition (`:3820-3822`), and the
+/// live `included` verdict on every context segment that has one (`:3812-3818`'s
+/// `displaySectionsWithInclusionOf`).
 pub async fn get_session_turn_display(ctx: &mut Ctx) -> ApiResult {
     ctx.ignore_body().await;
 
@@ -137,12 +139,29 @@ pub async fn get_session_turn_display(ctx: &mut Ctx) -> ApiResult {
 
     let store = ctx.runtime.store.as_ref();
     let mut inner = store.lock();
-    let mut display = inner
+    let state = inner
         .session_mut(&session_id)
-        .ok_or_else(|| store.unknown_session(&session_id))?
+        .ok_or_else(|| store.unknown_session(&session_id))?;
+    let turn = state
         .turn_mut(&turn_id)
-        .ok_or_else(|| missing_in("turn", &turn_id, &session_id))?
-        .display();
+        .ok_or_else(|| missing_in("turn", &turn_id, &session_id))?;
+
+    let mut display = turn.display();
+    let events = turn.record.events.clone();
+    let times = turn.record.event_times.clone().unwrap_or_default();
+    let turn_thread_id = turn.record.thread_id.clone();
+
+    // C1/R3: `included` is a fact about the CONVERSATION's committed transcript, never a fold of this
+    // turn's events, so it is joined HERE — the same reason the block-detail route joins it. A plugin
+    // that called `setIncluded`, or another tab's toggle, is visible on the next paint instead of
+    // hiding behind the compiled bar's static `inPrompt`.
+    stamp_display_inclusion(
+        state,
+        turn_thread_id.as_deref(),
+        &events,
+        &times,
+        &mut display,
+    );
 
     drop(inner);
 
@@ -952,6 +971,237 @@ fn thought_included_of(messages: &[HarnessMessage], entry: usize) -> bool {
             ..
         }) if *reasoning_included != Some(false)
     )
+}
+
+/// The ONE live assistant entry whose `content` is exactly this recorded ANSWER text, or nothing
+/// when the transcript names none OR names more than one (`transcriptEntryOfAnswer`,
+/// `api.ts:1004-1023`).
+///
+/// C1/R3 added this third join because an answer window has no call id — `block_call_id_of` is the
+/// tool kind's, and the projector mints an answer from `text` deltas — so the unit join could never
+/// name it and every verdict about an answer segment stayed ABSENT. The recorded BYTES are its
+/// identity, exactly as the thinking join works, with the same ambiguity refusal: two entries that
+/// streamed the same answer text is a server that cannot say which one this segment came from, and
+/// a `find` that preferred one would be picking a flag rather than reading one.
+fn transcript_entry_of_answer(messages: &[HarnessMessage], text: &str) -> Option<usize> {
+    if text.is_empty() {
+        return None;
+    }
+
+    let mut found: Option<usize> = None;
+
+    for (index, message) in messages.iter().enumerate() {
+        let content = match message {
+            HarnessMessage::Assistant { content, .. } => Some(content.as_str()),
+            _ => None,
+        };
+
+        if content != Some(text) {
+            continue;
+        }
+
+        if found.is_some() {
+            return None;
+        }
+
+        found = Some(index);
+    }
+
+    found
+}
+
+/// The conversation and the ONE assistant entry an `assistant` segment's ANSWER was streamed by
+/// (`blockAnswerOf`, `api.ts:1934-1957`).
+fn block_answer_of(
+    state: &store::SessionState,
+    turn_thread_id: Option<&str>,
+    text: Option<&str>,
+) -> Option<ThoughtTarget> {
+    let text = text.filter(|text| !text.is_empty())?;
+
+    for thread_id in thread_candidates_of(state, turn_thread_id) {
+        if state.transcript_is_unreadable(&thread_id) {
+            continue;
+        }
+
+        let messages = state.transcript_messages(&thread_id).unwrap_or_default();
+
+        if let Some(entry) = transcript_entry_of_answer(&messages, text) {
+            return Some(ThoughtTarget {
+                thread_id,
+                messages,
+                entry,
+            });
+        }
+    }
+
+    None
+}
+
+/// One entry's own inclusion, spelled the way the plugin API spells
+/// `HarnessContextEntry.included`: the ABSENCE of the flag means the entry rides the requests that
+/// follow, and only a literal `false` withholds it (`entryIncludedOf`, `api.ts:1960`).
+fn entry_included_of(messages: &[HarnessMessage], entry: usize) -> bool {
+    matches!(
+        messages.get(entry),
+        Some(HarnessMessage::System { included, .. })
+            | Some(HarnessMessage::User { included, .. })
+            | Some(HarnessMessage::Assistant { included, .. })
+            | Some(HarnessMessage::Tool { included, .. })
+            if *included != Some(false)
+    )
+}
+
+/// The LIVE SEGMENT verdict the display read stamps on one context-bar entry
+/// (`contextSegmentIncludedOf`, `api.ts:2022-2089`), applied per section by
+/// `displaySectionsWithInclusionOf` (`api.ts:2100-2131`).
+///
+/// WHY THE DISPLAY READ HAS ITS OWN PREDICATE AND NOT THE BLOCK DETAIL's: one field name, two honest
+/// granularities (`harness-api.ts:3801-3813`). The detail read answers the ENTRY the segment resolves
+/// to — the verdict the dialog's chip switches and `PATCH` writes — while the lane paints a SEGMENT,
+/// and a tool's request and its answer are ONE segment under ONE boolean. The two figures differ in
+/// exactly one case: a truncated request whose result still travels reads `true` on the lane and
+/// `false` on the detail read, and both are honest about what they describe.
+///
+/// THREE JOINS, one per kind, in TS's dispatch order:
+///   * `reasoning` → the recorded thinking bytes → the thought join → the THINKING axis, and nothing
+///     else (an entry leaving the request takes its ANSWER window off, never this window);
+///   * `assistant` → the recorded answer bytes → the answer join → that entry's flag;
+///   * anything else → the recorded call → the unit join → the owning entry's flag.
+///
+/// ABSENT (`None`) whenever no join resolves an entry: the client's "unaddressable" state, where a
+/// fabricated `true` would be as wrong as a `false`.
+fn context_segment_included(
+    state: &store::SessionState,
+    turn_thread_id: Option<&str>,
+    events: &[crate::persistence::SessionTurnEvent],
+    times: &[u64],
+    block: &Value,
+) -> Option<bool> {
+    let kind = block
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let from = block_range(block, "eventFrom");
+    let to = block_range(block, "eventTo");
+
+    if kind == "reasoning" {
+        // The bytes are read through the SAME reader the block detail answers its `text` pane with,
+        // so the bar and the dialog cannot resolve two different entries for one segment.
+        let text = recorded_stream_text(events, times, "reasoning", from, to)?;
+        let thought = block_thought_of(state, turn_thread_id, Some(&text))?;
+
+        return Some(thought_included_of(&thought.messages, thought.entry));
+    }
+
+    // ONE join per kind. `block_unit_of` answers nothing for a kind that mints no call id, which is
+    // why an unresolved segment of ANY kind still answers `None` rather than a boolean.
+    if kind == "assistant" {
+        let text = recorded_stream_text(events, times, "assistant", from, to)?;
+        let answer = block_answer_of(state, turn_thread_id, Some(&text))?;
+
+        return Some(entry_included_of(&answer.messages, answer.entry));
+    }
+
+    let unit = block_unit_of(state, turn_thread_id, events, block)?;
+    // `transcript_unit_of_call` puts the OWNING entry first (or the orphan result, for a call whose
+    // owner a host edit removed), which is exactly the entry `transcriptEntryOfCall` names.
+    let entry = *unit.unit.first()?;
+
+    if entry_included_of(&unit.messages, entry) {
+        return Some(true);
+    }
+
+    // THE OTHER HALF OF A TOOL SEGMENT: reaching here means the request is withheld, and the recorded
+    // result is a SEPARATE entry that keeps travelling, which keeps bytes of THIS segment in the
+    // prompt. Mirror case: an orphan result switched off while its owner's request still rides. Only
+    // the tool kind can reach this branch — an answer window is one entry with no sibling.
+    if kind == "tool" {
+        let sibling = unit.messages.iter().enumerate().find(|(index, message)| {
+            *index != entry
+                && matches!(
+                    message,
+                    HarnessMessage::Tool { tool_call_id, .. }
+                        if tool_call_id == &unit.call_id
+                )
+        });
+
+        // One let-chain (edition 2024): a sibling exists AND that sibling still rides the prompt.
+        if let Some((index, _)) = sibling
+            && entry_included_of(&unit.messages, index)
+        {
+            return Some(true);
+        }
+    }
+
+    Some(false)
+}
+
+/// `displaySectionsWithInclusionOf` (`api.ts:2100-2131`): the compiled bar with the live verdict on
+/// every segment that HAS one, stamped IN PLACE on the read.
+///
+/// NOT A REWRITE of the fold: `inPrompt`, every count, stamp and identity field is the projector's
+/// own figure, byte-identical, and only the ONE field this join owns is added. A segment whose
+/// verdict is ABSENT is left untouched, so the tree carries no `included` key at all for a
+/// policy/unknown segment — the shape the client copies only when the wire stated it.
+///
+/// The SECTION's stamped conversation is the owner hint (T21), passed so a segment of a delegated
+/// section is looked for in the conversation that recorded it FIRST; a section that names none falls
+/// back to the turn's own conversation, which is what every route that cannot name one does.
+fn stamp_display_inclusion(
+    state: &store::SessionState,
+    turn_thread_id: Option<&str>,
+    events: &[crate::persistence::SessionTurnEvent],
+    times: &[u64],
+    display: &mut Value,
+) {
+    let Some(sections) = display.get_mut("sections").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for section in sections.iter_mut() {
+        let hint = section
+            .get("threadId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .or(turn_thread_id)
+            .map(|id| id.to_owned());
+
+        // The blocks are cloned out and written back as a whole array: the borrow of `section` cannot
+        // outlive the join, which reads the store through `state`.
+        let Some(blocks) = section.get("context").and_then(Value::as_array).cloned() else {
+            continue;
+        };
+
+        if blocks.is_empty() {
+            continue;
+        }
+
+        let stamped: Vec<Value> = blocks
+            .iter()
+            .map(|block| {
+                let Some(verdict) =
+                    context_segment_included(state, hint.as_deref(), events, times, block)
+                else {
+                    return block.clone();
+                };
+
+                let mut stamped = block.clone();
+
+                if let Some(map) = stamped.as_object_mut() {
+                    // The verdict is appended LAST, the position the `{ ...block, included }` spread
+                    // produces (`api.ts:2122-2126`).
+                    map.insert("included".to_owned(), json!(verdict));
+                }
+
+                stamped
+            })
+            .collect();
+
+        if let Some(map) = section.as_object_mut() {
+            map.insert("context".to_owned(), Value::Array(stamped));
+        }
+    }
 }
 
 /// The conversations this segment's recorded events could belong to, in the order the join is allowed to

@@ -15,6 +15,14 @@
 //! | `config`      | `src/server/config.ts` (+ the `PATCH /config` rules in `src/server/api.ts`) |
 //! | `environment` | `src/server/environment.ts`                                   |
 //! | `package_root`| `src/server/package-root.ts` (+ the dump root in `packages/underload/service/server.ts`) |
+//! | `static_files`| `src/server/static.ts` (the media-type table, the `assets`-is-immutable cache |
+//! |               | rule, the SPA fallback, the traversal guard, GET/HEAD only)                 |
+//! | `listen`      | the defaults + single bind of `src/server/start.ts:160-161,421-440` and the  |
+//! |               | port refusal of `src/server/dev.ts:96-105` / `bin/index.ts:370-380`; the    |
+//! |               | reference resolves one host and one port, so `auto` and `publicBaseUrl` are  |
+//! |               | (one config, `auto`, `publicBaseUrl`) is this crate's, not the reference's   |
+//! | `manifest`    | rendered from `src/api/mod.rs`'s route table for the parity probes; the      |
+//! |               | reference has no machine-readable surface endpoint                           |
 //! | `origin`      | `src/shared/origin.ts`, `src/server/service.ts`, `src/server/stream/mount.ts` |
 //! | `ids`         | `src/core/thread.ts` (`THREAD_HOST_PREFIX`), `src/shared/agent-results.ts` (label codes) |
 //! | `persistence` | `src/server/persistence.ts` (the on-disk schema, the atomic commit, the interrupted-run repair) |
@@ -90,6 +98,12 @@ pub mod events;
 pub mod ids;
 pub mod journal;
 pub mod labels;
+/// The listen configuration: bind host/port, the advertised public origin, and the static-mirror
+/// root. Its defaults and its port refusal are the reference's (`start.ts:160-161`,
+/// `dev.ts:101-105`); the `listen` SHAPE (one object, `auto`, `publicBaseUrl`) is this crate's.
+pub mod listen;
+/// The machine-readable surface manifest `parity-manifest` writes for the parity probes.
+pub mod manifest;
 pub mod origin;
 pub mod package_root;
 pub mod paging;
@@ -104,6 +118,10 @@ pub mod read;
 pub mod registry;
 pub mod runtime;
 pub mod server;
+/// The built UI mirror: `packages/underload/harness/src/server/static.ts`, ported - the media-type
+/// table, the `assets`-is-immutable cache rule, the SPA fallback, the traversal guard and the
+/// GET/HEAD-only verb gate.
+pub mod static_files;
 pub mod store;
 pub mod stream;
 pub mod tools;

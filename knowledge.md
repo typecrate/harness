@@ -58,12 +58,17 @@ stage can re-check it instead of re-deriving it.
     link, the `local/basalt` provider default, and the three cheap contract corrections (the published
     `tool_result_bytes`, the `paused` thread status, the `session` instruction source). NO plugin hook
     executes - see "T10" below for what is ported and what is not.
-13. Still to port - the module host that turns a session-created tool's installed source into a callable
-    registration, and the runtime-compiler tools the catalogue lists but this build cannot execute (see
-    "T4"). A worker backend for the two `*_EXECUTION=worker` knobs is the other unported half: today the
-    knobs validate and REPORT, and the runtime refuses to start on them (see "T9"). The plugin HOST is
-    the third unported half: T10 shipped the catalogue, the settings contract and the durability, and no
-    hook executes (`README.md` Deviations item 16).
+13. Still to port (re-verified against the source 2026-11-27 - the current state is
+    "## Audit re-verification - README and knowledge.md - 2026-11-27" below, and it supersedes what was
+    written here while this list was current). The module host that turns a session-created tool's
+    installed source into a callable registration, and the runtime-compiler tools the catalogue lists
+    but this build cannot execute (see "T4"). A worker backend for the two `*_EXECUTION=worker` knobs is
+    the other unported half: today the knobs validate and REPORT, and the runtime refuses to start on
+    them (see "T9"). The plugin host is NO LONGER unported - `src/plugin/` carries the bus, the dispatch
+    loop and the context seam - but no hook runs in production either: nothing in `src/` calls
+    `PluginHost::run`, the only runtime is `NullRuntime`, and neither shipped core id has a `Plugin`
+    module (`README.md` Deviations item 16 restates the current shape). A fourth gap this list did not
+    carry: the session record engine (`api/records.rs` answers 500).
 
 ## Decisions
 
@@ -82,7 +87,11 @@ stage can re-check it instead of re-deriving it.
   change") and explicit `null` ("restore the shipped default") are different instructions
   (`api.ts:1382-1407`), so the nesting is required. Where TS only writes `?: string` (e.g.
   `RunnerSettingsInput`), a plain `Option<String>` is enough because serde maps JSON `null` to
-  `None`, which is exactly how `settingsInputOf` (`api.ts:548-561`) treats a null.
+  `None`, which is how `settingsInputOf` (`api.ts:599-631`) treats a null FIELD. The null
+  BLOCK is the exception: that helper returns early only for `undefined` (`:605`) and its next
+  guard is `settings === null` (`:607-608`), so `{"settings": null}` is the refusal
+  `"body.settings" must be an object.` — a shape a serde decode cannot express, which is one of
+  the reasons `POST {root}/sessions` reads its body by hand (`api/sessions.rs`).
 - **No `deny_unknown_fields` anywhere.** The TS server rejects unknown body fields at the handler
   level with `Unknown field "<key>". Allowed fields: ...` (`api.ts:504-510`), so that job belongs
   to `contract::require_known_fields`. A schema-level rejection would print serde's wording.
@@ -274,6 +283,12 @@ type, so a later stage cannot send a misspelled field on those paths.
   `D:\Projects\typescript\temporary\dump` on this machine, matching
   `packages/underload/service/server.ts:43` and `default_database_root()` in `packages/typecrate/services/src/server/mod.rs` (decl `:119`).
   The directory is not created here.
+  *Re-verified 2026-11-27:* the rule itself still matches - `packages/underload/service/server.ts:25`
+  joins `('..', 'temporary', 'dump')`, and `provider-server.ts:80-84` repeats it behind
+  `UNDERLOAD_DATABASE_ROOT` - but both line cites have moved: the services Rust default is now
+  `src/server/mod.rs:139`. The machine-specific path above is a Windows observation, not part of the
+  rule. The TypeScript HARNESS package contributes no default of its own ("no root means in-memory",
+  `src/server/service.ts:327`); the root always arrives from its host.
 
 ### Crate / build
 
@@ -295,6 +310,17 @@ Same rule as above: every entry names the TypeScript source it came from, and ev
 brief and `persistence.ts` disagreed is recorded with the side that won and why.
 
 ### On-disk shape
+
+> **Still the shape this crate writes - but "compatible with the TypeScript server" is no longer true.**
+> `persistence::HARNESS_DATABASE_VERSION` is `1` and the document is still the single
+> `harness/state.json` (`src/persistence.rs:70`/`:77`), so everything below is current for THIS crate.
+> What has moved is the other side: the reference is at **v2** and never opens `state.json`
+> (`packages/underload/harness/src/server/persistence.ts:223`, `:31-33`), and it neither shares the
+> default root's meaning nor keeps this envelope for `agents.json` (its `readHarnessAgentRecords`
+> requires a bare array, `:3570`). "Audit re-verification - 2026-11-27", item 4, and `README.md`
+> Deviations item 18 carry the consequence - one root serves one runtime, and the reference's erase
+> pass can destroy this crate's journals. A line cite into the reference's `persistence.ts` from before
+> that split is stale on its own: the file is 3608 lines now.
 
 - **`baseURL`, capital `URL`.** `rename_all = "camelCase"` would print `baseUrl`, which is NOT what
   TS writes (`persistence.ts:134-137`, `sessions.ts databaseRecord`), so `base_url` carries an
@@ -361,6 +387,15 @@ brief and `persistence.ts` disagreed is recorded with the side that won and why.
 
 ### Journal
 
+> **Superseded - read fact 2 of the 2026-11-11 section instead.** The event line below is the brief's
+> envelope, not what the writer emits today: the current line is the reference's
+> `{type:"event", v:1, turnId, index, at, event}` (`journal_event_line`, `src/journal.rs:144-153`), the
+> per-file `sequence` cursor is gone (`src/journal.rs:45-46`), and a journal written in the envelope
+> described here is now REFUSED on read (`src/journal.rs:74-80`). The `{"type":"header", ...}` first
+> line and the "accepts both spellings on scan" tolerance recorded below are the parts that survive -
+> though "both spellings" today means the reference's two key ORDERINGS (the append order and the
+> rewrite order, `src/journal.rs:15-33`), not this section's envelope, which is refused.
+
 - **The event line is the brief's envelope, the header line is TS's.** `{"version":1,"sequence":N,
   "timestamp":<ms>,"event":{...}}` replaced TS's per-turn `{"type":"event","v":1,"turnId","index",
   "at"}` (`journal.ts:99-106`) because `read(from_sequence, limit)` needs a per-FILE cursor, and the
@@ -392,7 +427,14 @@ brief and `persistence.ts` disagreed is recorded with the side that won and why.
 - **The harness name pattern is TS's `^[A-Za-z][A-Za-z0-9_-]{0,63}$`**, not the brief's
   `^[a-z][a-z0-9_-]*$`: the refusal sentence the registry prints names a 64-character ceiling and
   both cases, and the message and the rule have to agree.
-- **`demo`/`flaky` are not shipped** - as agents and as presets. The catalogue has six entries, so
+- **`demo`/`flaky` are not shipped** - as agents and as presets. *(SUPERSEDED 2026-11-27 on the counts,
+  unchanged on the decision: `demo` and `flaky` are still absent, and the presets module says why -
+  upstream deleted them, and a card a user picks has to be a configuration that runs a model. What has
+  changed is that the catalogue is no longer six: `agents/profiles.rs::shipped_profiles()` returns
+  EIGHT profiles and `registry/presets.rs::shipped_presets()` returns EIGHT cards (`general`, `instruct`,
+  `research`, `workspace`, `reviewer`, `planner`, `debugger`, `chat`), so the "Known agents: ..." refusal
+  prints the eight names the reference prints (`agents/profiles.rs:27`). The tool catalogue is a third
+  table again: `tools/catalogue.rs::ENTRIES: [Entry; 36]`.)* The catalogue has six entries, so
   the "Known agents: ..." refusal lists six names instead of TS's eight, and a saved row that names a
   fixture is skipped on restore (a built-in row this build does not ship) instead of being created.
 - **`get` is direct, `find`/`resolve` follow an alias** - the TS distinction at
@@ -640,12 +682,20 @@ blocking `std::process` would park the turn's task while a build runs.
 ### The catalogue is generated, not typed
 
 `catalogue.rs` is written by `Temp/typecrate-harness/t4/generate-catalogue.mjs` from
-`packages/underload/harness/src/core/tool-manifest.ts` (the AST scan of `src/tools/**/*.tool.ts`)
+`packages/underload/harness/src/engine/core/tool-manifest.ts` (the AST scan of
+`src/tools/**/*.tool.ts`; that is where the manifest sits since the upstream engine split of
+2026-11-21, and it is `src/core/tool-manifest.ts` in every reference written before that date)
 plus the `metadata` literals of `src/server/tools/shared/*.tool.ts`. Regenerate instead of editing: a
-hand-copied description or schema drifts silently, and `/tools` is a document the model quotes back.
+hand-copied description or schema drifts silently, and `/tools` is a document the model quotes back —
+except that generator is not a checked-in artifact, so the table is HAND-MIRRORED row by row against
+the TypeScript bytes, and every wave that does it gets a dated note below.
 36 rows in `GET /tools` order (core, presets, app tools, then `search`/`fetch`), never sorted by
 name. They are the TypeScript inventory minus one name: TS has **37** distinct tool rows (the 32 in
-`tool-manifest.ts` — 22 runtime + 10 preset — plus the five `server/tools/shared` literals), and its
+`tool-manifest.ts` — 22 runtime + 10 preset — plus the five `server/tools/shared` literals;
+RE-COUNTED on 2026-11-27, the manifest now answers **34** package rows, because `knowledge` and
+`sleep` joined it, so the reference has 39 names and this table still carries 36 — `knowledge`,
+`sleep` AND `threadDelete` are all unported here, and the two new names are listed in the TS
+roster, so that gap is a port-owner question like `threadDelete`'s, not this wave's to answer), and its
 `/tools` page composes **32** of them: `createCoreToolEntries()` answers 15 (the runtime rows the
 manifest advertises) and `createToolCatalogue()` 17 (the ten presets, the five shared app rows,
 `search`, `fetch`), joined at `api.ts:1050-1051`. This table carries those 37 minus `threadDelete`,
@@ -653,12 +703,14 @@ and withholds four by name, so BOTH surfaces answer 32 LISTED rows — pinned by
 `tests/tools.rs:189-195` and by the gateway at `packages/typecrate/services/tests/harness_gateway.rs:586-612`.
 The deviations from the TS table are stated in the generated header, and the two that matter for a
 diff are: TS withholds FIVE runtime rows from `/tools` — `toolCancel`, `threadDelete`, `threadSend`,
-`threadRead`, `threadList` (`tool-manifest.ts:1446, 2219, 2265, 2379, 2410`) — while `search`/`fetch`
+`threadRead`, `threadList` (`tool-manifest.ts:1875, 2650, 2696, 2810, 2841` — each row's
+`listed: false` line on the 2026-11-27 TypeScript tree; the numbers before that date pointed at the
+pre-split `src/core/tool-manifest.ts`) — while `search`/`fetch`
 carry the same flag yet stay listed because the server appends them through their own factories, and
 the `listed: false` on the 10 preset rows is a GROUP rule the server does not apply; here the four
-withheld names are `catalogue::UNLISTED` (`const UNLISTED: [&str; 4]`, `catalogue.rs:563`). The fifth withheld name,
+withheld names are `catalogue::UNLISTED` (`const UNLISTED: [&str; 4]`, `catalogue.rs:575`). The fifth withheld name,
 `threadDelete`, is the only name-level difference between the two tables, and it is NOT restated
-here: `README.md`'s "Tool catalogue" parity row (`README.md:145`) is the one place this crate states
+here: `README.md`'s "Tool catalogue" parity row (`README.md:223`) is the one place this crate states
 what it does with that name and why keeping it unported is an open port-owner decision.
 `search`/`fetch` rows follow the SERVER's "not session-bound" reading rather than the descriptor
 table's. `execution` is `{scope: session_required | global, manual: true}` per the stage contract;
@@ -707,6 +759,184 @@ that session**, so the edit is text-verified only - the string literals were re-
 every `description:` / `parameters_json:` value still terminates where it should and the counts
 above did not move, and no Rust test pins description text anyway
 (`packages/typecrate/services/tests/harness_gateway.rs:626` pins names and counts).
+
+### Dated 2026-11-27, first pass: seven rows re-mirrored; the fork gained a write door and `agentResult` a second answer
+
+The TypeScript package's week of fix waves (upstream `src/engine/core/tool-manifest.ts`, the copy
+at `src/core/tool-manifest.ts` on `1eb612a` 2026-11-19 diffed against `e66bce8` 2026-11-27 — the
+path itself changed in the 2026-11-21 engine split) moved the manifest text of SEVEN names that have
+rows here. Every one of them was re-copied byte-for-byte, which is why the rows also absorbed the
+older drift they were carrying. The numbers are the DECODED text length of the Rust row before the
+sync, then of the TypeScript row it now matches byte for byte — SUPERSEDED IN PART the same day: the
+wave became EIGHT rows when another lane re-mirrored `threadRead`, and two of the rows below moved
+again under the correction wave. The live state is the second-pass note that follows; this section
+stays as the record of what the first pass changed:
+
+| Row | description | `parameters_json` | tags |
+| --- | --- | --- | --- |
+| `agentManage` | 1 314 → 2 510 chars | unchanged (the row takes no arguments) | `subagent` → `rank` |
+| `agentResult` | 3 110 → 5 356 | 899 → 1 540 (new `message` argument + the `offsetClamped` prose) | `subagent` → `rank` |
+| `delegate` | 2 697 → 3 131 | 3 538 → 3 767 | `subagent` → `rank` |
+| `threadFork` | 2 226 → 2 890 | 1 641 → 2 393 (new `allowFamilyWrites`) | — |
+| `toolCancel` | 1 208 → 1 535 | 208 → 380 (a branch id names the call) | — |
+| `threadSend` | 3 403 → 4 466 | 862 → 1 526 (a running branch is addressable) | — |
+| `threadList` | 3 223 → 4 736 | unchanged | — |
+
+What the new prose actually says, in one line each: `threadFork` is ISOLATED by default — inside a
+branch run `threadSend`, `delegate` and `threadDelete` are refused unless the fork passed
+`allowFamilyWrites: true`, and the READ doors are never gated; `delegate` refuses the same thing from
+the other side; `toolCancel` accepts a background fork's `branch-N` id as well as its `callId` and the
+receipt then echoes `branchId`/`invocationId`/`threadId`; `threadSend` separates `resumed` (status
+"stopped" AND a continuable `stopReason`) from `started`, and withholds its redirect `note` when the
+default conversation addressed IS the calling run; `agentResult` names WHICH message the answer was
+(`answerMessageIndex`), lists up to 4 `answerCandidates`, and `message` pages one of them through the
+same offset/limit machinery; `agentManage` splits ring-wide from per-agent result counts
+(`hiddenResults`); `threadList` now spells out the two writing doors' lineage gates and why
+`ownerThreadId` is absent for both kinds of top-level thread.
+
+**The `subagent` → `rank` tag swap is pre-existing drift this sync absorbed**, not this wave's change:
+the rename happened upstream before 2026-11-19. It is stated because `tags` feed `toolRequest`'s
+capability search, and no test pins these three rows' tags (`tests/tools.rs:378-383` pins only
+`timeNow`, `grep` and `shell`).
+
+**Confirmed, not synced: `threadDelete` still has no row here.** The row moved upstream too
+(description +339, `parameters_json` +206 — the pointer-loss warning and `removedInvocationIds`), but
+this crate never ported the tool: no `Entry`, no `UNLISTED` member, no `dispatch` arm
+(`catalogue.rs:34-52`, `src/tools/mod.rs`'s dispatch), so there was nothing to rewrite and the fifth
+withheld name stays exactly five.
+
+**Left alone on purpose — `threadRead` SUPERSEDED the same day, the rest still stands:** at this pass
+`threadRead`'s TS text had NOT moved in the window (the 2026-11-19 and 2026-11-27 trees are identical
+for that row), so its standing drift (description 3 264 vs 3 630, `parameters_json` 3 462 vs 3 718)
+was reported rather than touched. Another lane has since re-mirrored it and its TypeScript text moved
+again, so `threadRead` is byte-exact now (3 879 / 3 845 both sides) and the lagging set is FIFTEEN
+rows — the list below without it: `toolRequest`, `toolList`, `toolManage`, `toolCreate`, `records`,
+`tasks`, `profiles`, `chapters`, `locations`, `read`, `write`, `edit`, `files`, `glob`, `grep` (16 of
+the 36 rows as counted at this pass, `search`/`fetch` excluded — their `sessionBound` difference is
+the documented SERVER reading in `catalogue.rs`'s header, not drift). The next wave that touches one
+of those tools should re-mirror that whole row, which is what this wave did for its seven.
+
+**`threadList` is the wave's one judgement call.** It sits in the "check whether it moved" list rather
+than the "sync it" list, and its TypeScript text DID move in this same window (+1 513 chars — the
+`actOn` lineage-gate rules and the `ownerThreadId` absence rule, the same thread-runtime wave that
+rewrote `threadSend` and `threadDelete`), so it was re-mirrored along with the six. Its
+`parameters_json` did not move and is untouched.
+
+**Nothing else moved, and the pins held.** `ENTRIES` stays `[Entry; 36]` (`catalogue.rs:115`),
+`UNLISTED` stays `[&str; 4]` (`:575`), `MISSING_CAPABILITY` stays `[(&str, &str); 15]`
+(`src/tools/mod.rs:78`), and the gateway still sees 32 LISTED rows and the same four withheld names.
+No test pins a catalogue DESCRIPTION — `tests/tools.rs:437-438` and `:1702` compare a row's description
+with the descriptor that was built FROM that row, so they follow any wording change automatically —
+and no fixture was touched: the two files that contain fork/delegation prose
+(`tests/fixtures/journal-cases/ts-reader-observations.json`,
+`tests/fixtures/lane-compaction/durable/state.json`) are RECORDED TypeScript documents the journal
+and restore tests compare byte-for-byte, and rewriting them would falsify the record. Unlike the
+2026-11-15 note, `cargo` WAS run here, from `packages/typecrate/harness`, after the last
+edit: `cargo fmt -- --check` (clean), `cargo check --all-targets` (0 warnings),
+`cargo clippy --all-targets -- -D warnings` (clean) and `cargo test --no-fail-fast` —
+**561 passed / 0 failed across 23 targets**, `tests/tools.rs` among them (25 tests, the catalogue
+order/visibility/tag/withheld-name pins) — plus
+`cargo test --manifest-path ../services/Cargo.toml --test harness_gateway`, 8 passed / 0 failed,
+which is the cross-package half of the pin (32 LISTED rows, the four withheld names). The wording
+mirror is also recorded in `README.md`'s "Tool catalogue" parity row and in `docs/parity.md`'s
+"Not ported, and not claimed" table.
+
+**The standing caveat is unchanged.** These rows describe the TypeScript contract; this runtime still
+refuses all seven of them with the `MISSING_CAPABILITY` sentence, so closing the gap remains a
+behaviour port (the branch runtime, the thread runtime, the delegation runtime and the result ring),
+not another wording change. The one behavioural *surface* the mirror does move is advertised metadata:
+`GET /tools/{threadFork}` and `/agentResult` now publish the two new arguments, which is exactly what
+the reference's model is offered.
+
+**Follow-up this wave deliberately did not do:** the pre-split line numbers still sit in
+`src/ports.rs:153`, `src/tools/mod.rs:394, 408, 942-943, 1070` and `tests/tools.rs:202-212`
+(`tool-manifest.ts:1446, 2219, 2265, 2379, 2410` → `1875, 2650, 2696, 2810, 2841`), and this crate has
+no row at all for the manifest's two newest names, `knowledge` and `sleep`.
+
+### Dated 2026-11-27, second pass: the correction wave re-touched two rows and `threadRead` joined
+
+The TypeScript working copy moved AGAIN after the first pass, in three places, and the live state of
+this table now measures EIGHT mirrored rows rather than seven:
+
+- **`agentManage`** `description:` +339 chars (2 510 → 2 849). A completed row now advertises
+  `answerMessageIndex` beside its preview — the position, in that run's own transcript, of the message
+  the preview came from, which `threadRead` takes as its `message` argument — while the candidate list
+  itself stays an `agentResult` fact. Measured side effect, because it is the upstream watch item:
+  that sentence put the FIRST occurrences of the substring `thread` in this SEARCHABLE description
+  (offsets 793 and 849; the pre-correction text carried none at all). Nothing here changes observably
+  as a result — `toolRequest` selects on names and tags, never on description substrings, and the row
+  is one of the 15 `MISSING_CAPABILITY` refusals anyway.
+- **`threadSend`** `parameters_json:` +2 chars (1 526 → 1 528): the `thread` argument's stopped-row
+  sentence regained its separator — "a turn-cap, a timeout, a parent that closed **-** answers
+  `started`". The row's `description:` was already byte-identical, so only the schema line moved. For
+  the record: the restored character is an ASCII hyphen inside that schema string, not an em dash —
+  the prose elsewhere in the same row does use em dashes, which is why the two are easy to confuse.
+- **`threadRead`** joined the mirrored set: another lane re-mirrored it between the two passes, and the
+  TypeScript side moved again across that same interval (description +249 to 3 879 chars,
+  `parameters_json` +127 to 3 845). This pass re-derived that from the manifest rather than trusting
+  it, and the row measures byte-exact on both fields.
+
+The eight mirrored rows, measured against the current TypeScript working copy (decoded chars,
+`description` then `parameters_json`, Rust side / TypeScript side):
+
+| Row | description | `parameters_json` |
+| --- | --- | --- |
+| `agentManage` | 2 849 / 2 849 | 62 / 62 |
+| `agentResult` | 5 356 / 5 356 | 1 540 / 1 540 |
+| `delegate` | 3 131 / 3 131 | 3 767 / 3 767 |
+| `threadFork` | 2 890 / 2 890 | 2 393 / 2 393 |
+| `toolCancel` | 1 535 / 1 535 | 380 / 380 |
+| `threadSend` | 4 466 / 4 466 | 1 528 / 1 528 |
+| `threadRead` | 3 879 / 3 879 | 3 845 / 3 845 |
+| `threadList` | 4 736 / 4 736 | 62 / 62 |
+
+`agentResult`, `delegate`, `threadFork`, `toolCancel` and `threadList` did not move under the
+correction wave and are unchanged at their first-pass values.
+
+**The whole table, measured the same way (31 rows with a manifest row to compare against):** SIXTEEN
+match the manifest on `description`, `parameters_json` and `tags` — the eight above plus `toolRegistry`,
+`actionRequest`, `syntax`, `shell`, `gitDiff`, `download`, `search`, `fetch` — and FIFTEEN still lag on
+text, all of them pre-existing drift no lane in this wave touched: `toolRequest`, `toolList`,
+`toolManage`, `toolCreate`, `records`, `tasks`, `profiles`, `chapters`, `locations`, `read`, `write`,
+`edit`, `files`, `glob`, `grep`. The five app rows (`timeNow`, `textCount`, `diceRoll`, `noteSearch`,
+`textSummarize`) have no manifest row to compare — they come from the `server/tools/shared` `metadata`
+literals. The honest breakdown: `search` and `fetch` sit in the SIXTEEN on those three fields only, and
+a checker that also compares `sessionBound` literally reports 14/17 — the two extra rows are exactly
+those two, and their difference is the documented reading of the TS SERVER (their rows are not
+session-bound on the server, `catalogue.rs`'s DEVIATIONS header), not drift and not something a mirror
+pass should silently "fix".
+
+**Method and verification, this pass.** The mirror is still done and proved by DECODE-BACK: the TS row
+is parsed out of the manifest, re-embedded with the file's own escaping (`".."` with `\\` and `\"`
+only; `r#"…"#,` verbatim JSON, and the tool refuses a payload containing the `"#` terminator), then the
+Rust file is parsed back and every field compared to the manifest (scratch tooling in
+`Temp/typecrate-harness/f3/`: `extract_ts.py`, `verify.py`, `apply_r2.py`). Two lines changed, nothing
+else. `ENTRIES` stays `[Entry; 36]`, `UNLISTED` stays `[&str; 4]`, `MISSING_CAPABILITY` stays
+`[(&str, &str); 15]`, and the gateway pin still measures 32 LISTED rows and the same four withheld
+names. From `packages/typecrate/harness` after the last edit: `cargo fmt -- --check` exits 0 with no
+reformat needed, `cargo clippy --all-targets -- -D warnings` is clean, `cargo test --no-fail-fast` is
+**561 passed / 0 failed across the 23 targets** (`tests/tools.rs` among them, 25 passed — the catalogue
+order/visibility/tag/withheld-name pins, including the self-referential description comparisons), and
+`cargo test --manifest-path ../services/Cargo.toml --test harness_gateway` is 8 passed / 0 failed, which
+is the cross-package half of the pin (32 LISTED rows, the four withheld names).
+
+**The caveat is now the crate's standing one, and it is not softer than before.** These rows describe
+the TypeScript contract. All eight of them remain `MISSING_CAPABILITY` refusals in this runtime: the
+branch runtime, the thread runtime, the delegation runtime and the agent-result ring are unported, so
+closing the gap is a behaviour port, not another wording change. What the mirror does move is
+advertised metadata — the schemas `GET /tools` and `GET /tools/{name}` publish are the ones the
+reference's model is offered, which is the point of keeping them byte-exact.
+
+**One follow-up this pass measured and deliberately did NOT chase.** The prose cites `catalogue.rs` line
+numbers that another lane's Rust edits have already moved: `ENTRIES` is at `src/tools/catalogue.rs:119`
+(cited as `:115` in `README.md`'s tool-catalogue row and at `knowledge.md:825`), `UNLISTED` is at
+`src/tools/catalogue.rs:579` (cited as `:575` in the same row and at `knowledge.md:711`), and
+`MISSING_CAPABILITY` is at `src/tools/mod.rs:78` (cited as `:103` in `README.md`'s `delegate` row). They
+were left alone on purpose: with several lanes editing this crate at once, a number corrected now moves
+again before the pass ends, whereas the ARRAYS are pinned by size (`[Entry; 36]`, `[&str; 4]`,
+`[(&str, &str); 15]`) and by `tests/tools.rs`, so the counts above are the load-bearing claim and the
+offsets are decoration. The pre-split `tool-manifest.ts:` references listed in the first pass's follow-up
+belong to the same sweep.
 
 ### Executable here, catalogued only
 
@@ -783,6 +1013,22 @@ one is a rule a later stage might otherwise re-break:
 * Tool calls in one message run SEQUENTIALLY, in the order the model asked. TS launches a message's
   calls through its scheduler concurrently; sequential execution keeps file side effects in the
   requested order and keeps the event order deterministic for the projector.
+* The reference's reserved per-call `async` argument (`{"async":true}` asks for a BACKGROUND launch,
+  `false` a sync one, absence the tool's own default; a LONE `delegate` call now defaults to SYNC)
+  asks for exactly the scheduler this crate does not have, so `async: true` has no effect here: every
+  call still runs inline and awaited, and `tool_result` always settles with `pending: []`
+  (`turn.rs:708`), the same reason no `pending:set` is ever minted (see "The projector seam's limits").
+  `HarnessPendingTool` is the wire type for a pending call and is never minted (`contract.rs:891-896`).
+* That acceptance is ABSENCE, not a RULE: argument checking stops at the documented `required`
+  properties (`tools/mod.rs:644-659`), nothing reads `properties` or `additionalProperties`, and a full
+  JSON-Schema validator is not a dependency (`tools/mod.rs:638-643`), so `async` falls into the same
+  accepted-and-ignored class as any other unknown argument key — with no error text, and with the
+  declarations still advertising the closed schema (`transport::wire_tool` sends `parameters_json`
+  verbatim, `transport.rs:639-648`). The raw `arguments` string is likewise kept verbatim and echoed
+  (events `turn.rs:612-618`, the block route's `args` `api/turns.rs:499-500`, `argsPreview`
+  `projector.rs:1419-1427`, provider replay `transport.rs:1145`), and that is parity rather than a
+  delta: the reference strips the key before validation and `execute` but does NOT rewrite the stored
+  raw string either (`src/engine/types/index.ts:100-123`).
 * `transport` emits at most one `usage` event per REQUEST (from the response the request settled
   with), matching `harness.ts:6656`, because the store folds every event it sees. The per-chunk
   `StreamEvent::Usage` exists for callers that want it and is deliberately not forwarded by `turn`.
@@ -893,6 +1139,12 @@ real provider or the network.
 any runtime work) -> per-root runtime -> mount guard -> route match -> verb -> handler, where the
 body is read under the route's cap ONLY if the handler asks for it. A wrong verb and an unknown id
 therefore never parse a body (`api.ts:4009`, `:4022-4024`).
+
+SUPERSEDED 2026-11-27 on the figures: `pub static ROUTES: [Route; 52]` at `src/api/mod.rs:704`, and the
+pin now asserts 52 templates, 74 operations, and GET 42 / POST 14 / PATCH 11 / DELETE 6 / PUT 1
+(`tests/routes.rs::the_table_declares_seventy_four_operations_with_the_contracts_verb_split`). The
+reference table is 52 keys at `src/engine/shared/harness-api.ts:54-107`, not `:54-100`. The paragraph
+below is what T5a pinned, kept as the record of that wave.
 
 The route table is `pub static ROUTES: [Route; 45]` - one id, the verbatim TS template, and the
 operations in TS declaration order - paired with an `Operation` enum and ONE match in
@@ -1063,7 +1315,10 @@ refusals, and the exact `limit` echo of a short page).
 NARROWER than what `src/server/api.ts` builds in the TypeScript rail. The five differences a session
 stage must not re-derive:
 
-1. **The mounted surface is 45 templates / 64 operations.** `api.ts` also answers a bare
+1. **The mounted surface is 45 templates / 64 operations.** *(SUPERSEDED 2026-11-27: 52 templates / 74
+   operations, nothing held back - `api::ROUTES` at `src/api/mod.rs:704`,
+   `tests/routes.rs::this_build_mounts_every_contract_operation_with_nothing_held_back`. The rest of
+   this item is about `api.ts` extras and is unchanged.)* `api.ts` also answers a bare
    `{root}/session`, a `{root}/sessions/{id}/toolbox`, and the instruction ladder reads
    (`/agents/{a}/instructions`, `/agents/{a}/prompt`); `POST {root}/sessions/{id}/actions` and
    `DELETE /agents/{a}/instruction` are not contract operations either. The generated table wins, and
@@ -1806,13 +2061,20 @@ auto-scanned in TypeScript, so the only thing an operator can change is a settin
 ### The decisions a later stage must not re-break
 
 * **The catalogue is a `static`, not a scan.** `src/plugins.rs::BUILTIN_PLUGINS` is the Rust shape of
-  the GENERATED `src/plugin/manifest.ts`: the same two rows, in scan order (`async-ping` before
+  the GENERATED `src/plugin/manifest.ts` *(now `src/engine/plugin/manifest.ts`; and as of 2026-11-27 the
+  table is THREE rows - `async-ping`, `context-compaction`, `context-trimmer` - still path-ascending, so
+  the rule below is intact and only the count grew)*: the same two rows, in scan order (`async-ping` before
   `context-compaction`, path ascending), with the metadata each `*.plugin.ts` declares copied verbatim.
   Order is contract-visible - the page renders in it and the 404 sentence joins those names - so a
   reordering is a wire change, not a refactor. It is `static` rather than `LazyLock` because `Value` is
   not const-constructible and the descriptor defaults are `DeclaredDefault`; the price is one enum, the
   gain is that no request can ever see a different catalogue than the next.
-* **No hook executes here.** There is no plugin host in this crate, so `hooks` is server-visible
+* **No hook executes here.** *(Status 2026-11-27: the host HAS landed since this sentence was written -
+  `src/plugin/**` carries the bus, `plugin::host::PluginHost::run`, and the context seam - and the
+  sentence's conclusion still holds for a different reason: no `src/` code calls `run`, `NullRuntime` is
+  the only `PluginRuntime`, and `context-compaction` / `context-trimmer` have no `Plugin` module.
+  `README.md` Deviations item 16 is the current wording.)* There is no plugin host in this crate, so
+  `hooks` is server-visible
   metadata and the two built-ins do not ping or compact. `README.md` Deviations item 16 states it, and
   the port deliberately does NOT grow an execution engine to make the row "true": the contract the UI
   consumes is metadata + values + validation + durability.
@@ -1863,10 +2125,10 @@ auto-scanned in TypeScript, so the only thing an operator can change is a settin
 
 | Drift | Contract | This build after T10 |
 | --- | --- | --- |
-| `limits.tool_result_bytes` | `262144` (`harness-api.ts:216`, `harness.swagger.yaml:243`) | the boot document publishes `contract::PUBLISHED_TOOL_RESULT_BYTES = 262_144`; the ENFORCED budget stays `MODEL_TOOL_RESULT_BUDGET_BYTES = 65_536` until the tool stage widens (Deviations item 17), and both figures are asserted so the gap cannot drift |
+| `limits.tool_result_bytes` | `262144` (`harness-api.ts:216`, `harness.swagger.yaml:243`) - **the figures on this row are as of T10.** The contract figure is 32768 at `src/engine/shared/harness-api.ts:218-234` (`HARNESS_SERVICE_LIMITS.tool_result_bytes`), mirrored in `src/harness-server.swagger.yaml`, and this build is AT parity: `MODEL_TOOL_RESULT_BUDGET_BYTES = 32 * 1024` with `PUBLISHED_TOOL_RESULT_BYTES` DERIVED from it (`src/contract.rs:122`/`:129`, pinned equal by `tests/foundation.rs`). What is still open is the measurement CURRENCY, not the magnitude - `src/contract.rs:107-113`. See "Audit re-verification - 2026-11-27". | the boot document publishes `contract::PUBLISHED_TOOL_RESULT_BYTES = 262_144`; the ENFORCED budget stays `MODEL_TOOL_RESULT_BUDGET_BYTES = 65_536` until the tool stage widens (Deviations item 17), and both figures are asserted so the gap cannot drift |
 | `ThreadSummary.status` | `"idle" \| "running" \| "paused" \| "stopped"` (`harness-api.ts:1481`) | `ThreadLifecycle::Paused` exists, `store::lifecycle_str` / `store::read::parse_lifecycle` carry the word, and a `paused` record no longer collapses into `Idle`. The `?status=` FILTER vocabulary stays the contract's three (`api.ts:3497`), so `?status=paused` is still a 400 there |
 | `HarnessInstructionSummaryEntry.source` | `"catalogue" \| "global" \| "harness" \| "session"` (`harness-api.ts:451`) | `InstructionSource::Session` exists, so a session-defined member's provenance parses instead of failing the read. This port models provenance as ONE enum, so the two narrower TypeScript members (`:547`, `:594`) accept the extra spelling on the way in and never emit it - an accepted superset, stated on the enum |
-| default model | `local/basalt` (`config.ts:105-111`) | `config::DEFAULT_MODEL`, the boot reset target of `PATCH /config {"model": null}`, and `apply_config_patch`'s reset all moved with it; the base URL is unchanged |
+| default model | `local/basalt` (`config.ts:105-111` - the file is `src/server/config.ts`, and the constant sits at `:278` as of 2026-11-27) | `config::DEFAULT_MODEL`, the boot reset target of `PATCH /config {"model": null}`, and `apply_config_patch`'s reset all moved with it; the base URL is unchanged |
 
 ### Test inventory
 
@@ -1899,8 +2161,18 @@ auto-scanned in TypeScript, so the only thing an operator can change is a settin
    `context-compaction` actually run, and would then need the live provider that
    `sessions.ts buildHarness` hands every harness. Nothing in the HTTP contract changes when that
    lands, which is the point of porting the surface first.
+   **Status 2026-11-27: half landed.** The bus and the host ARE ported (`src/plugin/**`,
+   `plugin::host::PluginHost::run`), and `async-ping` has a Rust `Plugin` module. What is still open is
+   the INTEGRATION and the runtime: no `src/` code calls `PluginHost::run` (only `tests/plugin_host.rs`
+   drives it), `NullRuntime` is the only `PluginRuntime`, and `context-compaction` / `context-trimmer`
+   still have no `Plugin` module - so no hook fires during a turn. `README.md` Deviations item 16.
 2. Widening `MODEL_TOOL_RESULT_BUDGET_BYTES` to the contract's 256 KiB belongs to the tool stage: it
    changes what a model is shown, and `tests/tools.rs`'s budget envelope moves with it.
+   **Closed 2026-11-27, and not in the direction this row expected.** The cap is `32 * 1024` and the
+   published figure is DERIVED from it (`src/contract.rs:122`/`:129`), because the contract figure is
+   32768, not 262144 - see the R7 row above. The live gap is the measurement currency
+   (`src/contract.rs:107-113`), and `READ_CONTENT_BUDGET` (64 KiB) now sits above the cap, which
+   `src/contract.rs:114-121` reports instead of fixing.
 3. A session-defined created agent would make `InstructionSource::Session` a value this build EMITS,
    not merely accepts - the same hole "still to port" already records for the created-tool module host.
 
@@ -2071,3 +2343,205 @@ rustc 1.99.1):
   `src/core_pruning.rs:76,80,331,541,778` and `src/plugins.rs:904,1598`; none in a file this pass
   touched. They are toolchain-version findings in that stage's own WIP files and were left for that
   stage.
+
+## Audit re-verification - README and knowledge.md - 2026-11-27
+
+### Why this section exists, and what it may claim
+
+Both documents had drifted from the source they describe: the crate restructured its module layout
+after the earlier stages wrote their sections, the reference TypeScript package moved its engine under
+`src/engine/**`, and three waves landed without a section of their own. This pass re-derived every
+public claim from the files, and it is deliberately **cargo-free** (another agent was building, so no
+`cargo` invocation was run here). The rule this section follows, and the one `README.md` now follows:
+a count is stated only when a checked-in artifact pins it - a `const`, a static's declared length, a
+fixture, or a test's NAME - and a figure that only a test run can prove is written as a target list,
+never as a total. Numbers that were true at a dated stage stay recorded in that stage's section,
+labelled as of that date.
+
+### The path map (older sections cite the pre-restructure layout)
+
+Some paths cited by the stage sections above no longer exist, and the reference package's engine moved
+under `src/engine/**`. The sections are left as written - they are the record of what landed where - and
+this table resolves them. Verified against the current tree (`find src -type f` and the `src/lib.rs`
+module list) and the reference's tree, 2026-11-27.
+
+| Superseded path | Current location |
+|---|---|
+| `src/paths.rs` | `src/package_root.rs` (133 lines; `default_database_root()` at `:96`). The README cited `src/paths.rs:215` when this pass opened; this file's own "Environment and paths" decisions name the symbols (`package_root()`, `repo_root()`, `default_database_root()`) rather than the file. A line number carried from a `paths.rs` cite belonged to a larger file and must be re-found, not carried |
+| `src/routes.rs`, `src/routes/**`, `src/resource.rs`, `src/api/handlers/**` (the README cited the route table living here) | `src/api/mod.rs` (`ROUTES`, `Operation`, `dispatch_operation`) plus 17 area modules under `src/api/` and `mod.rs` - there is no `handlers/` directory |
+| `src/turns.rs` **(8 live cites in this file, e.g. `turns.rs:114-298`)** | `src/turn.rs` - 805 lines, so every line range carried with a `turns.rs` cite must be re-found. `tests/turn.rs` is the target; `tests/turns.rs` never was one. `src/store/turns.rs` is a DIFFERENT module and its cites are fine |
+| `src/templates/**`, `src/templates/{presets,profiles}.rs`, `src/tool_runtime.rs` | layout drift with no live cite in either document today: the cards are `src/registry/presets.rs` + `src/registry/descriptor.rs`, the profiles are `src/agents/profiles.rs`, and the tool runtime is `src/tools/**` with the seam in `src/ports.rs` (`ToolRuntime`, `ToolExecCtx`, `ToolPolicy`) |
+| `src/session.rs`, `src/sessions/**` | no live cite uses those paths: `src/store/session.rs` (the spelling this file's cites use, and it is current) and `src/api/sessions.rs` |
+| `src/store/records.rs`, `src/records/**` | **not landed** - there is no record-store module to cite, only the route: `src/api/records.rs` answers the placeholder |
+| `src/plugins/**` **(1 live cite here)** | `src/plugins.rs` (the metadata + settings table) and `src/plugin/**` (the host) |
+| `src/wasm.rs` | gone - the crate is native-only: `Cargo.toml` says so in its header (`:19-22`) and names no `wasm32`/`wasm_bindgen` target |
+| `noobscript-core`, and the `noobscript_core::…` / `src/core/**` paths that came with it | **no crate by that name exists in this repository as of 2026-11-27** - see the note below the table |
+| reference `src/shared/harness-api.ts` | `packages/underload/harness/src/engine/shared/harness-api.ts` |
+| reference `src/{tools,plugins,plugin,agents,types,core,shared}/**`, `src/harness.ts`, `src/harness-stream.ts` | `src/engine/{tools,plugins,plugin,agents,types,core,shared}/**`, `src/engine/harness.ts`, and `src/engine/shared/harness-stream.ts` / `src/engine/shared/turn-display.ts` / `src/engine/shared/harness-api.ts` (the shared wire vocabulary stayed together under `engine/shared/`; so `src/core/tool-manifest.ts` is now `src/engine/core/tool-manifest.ts`) |
+| reference `src/harnesses/**` - `createCoreToolEntries`, `createToolCatalogue` | `src/server/harnesses/**` (`src/server/harnesses/core.ts:76`, `src/server/harnesses/index.ts:112`) - it moved to the SERVER side, not to the engine |
+| reference `config.ts` (the R7 row's `config.ts:105-111`) | `src/server/config.ts`; `DEFAULT_MODEL = 'local/basalt'` sits at `:278` |
+| reference `src/harness.swagger.yaml` / `harness.swagger.yaml` | `packages/underload/harness/src/harness-server.swagger.yaml` |
+| reference `src/server/**` | unchanged - `api.ts` and `api-reads.ts` are still there |
+
+**There is no `noobscript-core` here.** `Cargo.toml` `[dependencies]` lists
+exactly axum, tokio, serde, serde_json, base64, uuid, dotenvy, http-body-util, reqwest, futures-util,
+regex, thiserror, tokio-util, oxc_parser, oxc_allocator, oxc_span (plus `tokio` with `features = ["full"]`
+and `tokio-tungstenite` as dev-dependencies), and `Cargo.lock`'s `typecrate-harness` entry records those
+same 17 crates - no `noobscript-core`. `grep` for `noobscript_core` across `src/**/*.rs` returns nothing.
+It is not a missing path dependency either: the root workspace's members are `rust/crates/*`, which
+holds agentic-harness, godspace-blueprint, godspace-core, noobscript-node (its lib name is `noobscript`),
+noobscript-wasm, presource-utility, runtime-data and underload-comfy - and no `Cargo.toml` in the
+repository names `noobscript-core`. So the tool seam this crate codes against is its own
+`ports::ToolRuntime` (the import at `src/tools/mod.rs:52`), the catalogue is its own
+`src/tools/catalogue.rs` (`ENTRIES: [Entry; 36]`, `:103`), and the build prerequisite the README carried
+when this pass opened - "`noobscript-core`'s `wasm32-unknown-unknown` build fails in `paths.rs:5`, so
+`cargo test` also requires it to be built" - is recorded here as history rather than as a requirement.
+The README now states only what the manifest says.
+
+### What the source says today (re-counted 2026-11-27, each from a checked-in artifact)
+
+| Surface | Current fact | Pinned by |
+|---|---|---|
+| Route table | `pub static ROUTES: [Route; 52]` at `src/api/mod.rs:704`; the `(operation, method)` entries run to `:1062`; the split is GET 42, POST 14, PATCH 11, DELETE 6, PUT 1 | `tests/routes.rs::the_table_carries_the_52_contract_templates_in_the_contracts_order`, `::the_table_declares_seventy_four_operations_with_the_contracts_verb_split`, `::this_build_mounts_every_contract_operation_with_nothing_held_back` |
+| Reference table | `HARNESS_PATH_TEMPLATES` is an object of 52 template keys at `src/engine/shared/harness-api.ts:54-107` (keys on `:55-106`) | the same 52 `(id, template)` pairs in `tests/routes.rs` |
+| Plugin catalogue | `BUILTIN_PLUGINS: [PluginMetadata; 3]` at `src/plugins.rs:159`, declared in the reference's scan order: `async-ping` (1 settings key - `intervalMs`), `context-compaction` (6 - `contextLimit`, `modelLimits`, `enabled`, `minTokens`, `safetyTurns`, `mode`), `context-trimmer` (12 - `enabled`, `dropSupersededToolCalls`, `dropInvalidToolCallsOnceAnswered`, `invalidOutcomes`, `dropOldThoughts`, `thoughtKeepUnits`, `supersedeMatch`, `dropDuplicateCalls`, `minTokens`, `minThoughtChars`, `safetyUnits`, `maxUnits`) | `tests/plugins.rs::the_catalogue_answers_both_builtins_with_their_declared_metadata_and_values` (the NAME still says "both" while the table ships three rows) plus the settings-count assertions in that file; `src/plugins.rs:1193` and `:1824` are what "in scan order" means |
+| Agent profiles | EIGHT, in `src/agents/profiles.rs::shipped_profiles()` at `:283`: general, instruct, research, workspace, reviewer, planner, debugger, summarizer | `tests/data_plane.rs::catalogue_ships_eight_profiles_and_replays_operator_edits` |
+| Preset cards | EIGHT in `src/registry/presets.rs::shipped_presets()`: general, instruct, research, workspace, reviewer, planner, debugger, chat. The `chat` card (`:347-355`) reuses the **general** profile with an empty toolbox, and `summarizer` ships as a profile with no card | `tests/data_plane.rs::registry_ships_edits_and_tombstones_the_eight_presets` |
+| Tool-result budgets | `MODEL_TOOL_RESULT_BUDGET_BYTES = 32 * 1024` (`src/contract.rs:122`), `PUBLISHED_TOOL_RESULT_BYTES` derived from it (`:129`), aggregate `MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES = 96 * 1024 = 98304` (`:142`) | the `R7` follow-up below is closed on the NUMBERS; what is left is the measurement currency note at `src/contract.rs:107-113` (this crate measures raw UTF-8 bytes where the reference gates on escaped payload bytes) |
+| Projector op kinds | it mints 14 of the contract's 18 - attempt:commit, attempt:discard, context:add, context:remove, context:set, node:append, node:insert, node:set, section:open, section:set, step:set, tail:clear, tail:set, usage - and never mints `turn`, `section:remove`, `node:remove` or `pending:set` | the `"op": "..."` literals in `src/projector.rs`; see the note below about its own header |
+| Session records | mounted, answers 500 through `api::records::record_store_missing` (`src/api/records.rs:118-121`); the 404 and malformed-`since` 400 gates run first | `tests/wave_one.rs::the_records_route_runs_its_gates_before_the_placeholder` |
+| Integration targets | 19 binaries, one per `.rs` directly under `tests/`: context_lane, contract_message_flags, data_plane, foundation, http_host, http_sessions, plugin_host, plugins, projector, routes, runtime_execution, store, store_restore, stream, tools, transport, turn, wave_one, worker_execution_http | `Cargo.toml` carries no `[[test]]` table and no `autotests` key, so cargo's autodiscovery IS the inventory |
+
+**Two in-crate doc comments now contradict the code they document** (the `.rs` files were out of scope
+for this documentation pass, so they are recorded here rather than edited):
+
+* `src/registry/presets.rs:29-36` still announces "TWO CARDS NAME AGENTS THIS PORT DOES NOT SHIP" and
+  "this crate ships six profiles". Both halves are stale: `shipped_profiles()` returns eight profiles
+  including `general` and `debugger`, and all eight cards name a profile this crate ships.
+* `src/projector.rs:13-15` says the op-kind list is complete "apart from `pending:set`". The behaviour
+  is the authority: four kinds are never minted, not one. The T7b section's "three kinds" prose is a
+  third figure for the same set, and it is also under the behaviour.
+
+### What landed after the sections above, and what they now overstate
+
+1. **The plugin host exists - and no hook runs in production.** `src/plugin/` carries the bus
+   (`mod.rs`), the dispatch loop (`host.rs`, `PluginHost::run` at `:32`), the tool/provider seam
+   (`context.rs`), settings, hooks, events and diagnostics. Three facts bound what that means, and all
+   three hold as of 2026-11-27: nothing in `src/` calls `PluginHost::run` (its only call site is
+   `tests/plugin_host.rs`), the only `PluginRuntime` implementation is `NullRuntime`
+   (`src/plugin/host.rs:389-391`), and the only `Plugin` implementation is `async_ping` (`async-ping`
+   is the one catalogue row with a Rust policy module; `context-compaction` and `context-trimmer` have
+   none). So the T10
+   sentence "There is no plugin host in this crate" is superseded by a narrower truth: the host is
+   ported and unit-pinned, and it is not wired into the session path. `README.md` Deviations item 16
+   carries the current wording.
+2. **A session agent's `role` became a `rank`.** `contract::AgentRank` is the vocabulary (its
+   `rank_index_of` / `rank_below` helpers at `src/contract.rs:461`/`:516`), `SessionAgentBinding` carries
+   `rank: AgentRank` (`:2564`), the two writable bodies carry `rank: Option<AgentRank>`
+   (`CreateSessionAgentRequest` `:2619`, `UpdateSessionAgentRequest` `:2651`), and the harness side
+   carries `entry` + `ranks: BTreeMap<String, AgentRank>` (`HarnessCard` `:1860`/`:1864`).
+   `api::ROUTES` carries the prefix route - one template,
+   `/v1/harness/sessions/{session_id}/agents/{agent_id}/prefix` (`src/api/mod.rs:899`,
+   `Operation::GetSessionAgentPrefix`); the reference table gained that entry too. There is NO
+   prefix-history and no rank route on either side, so do not expect one.
+   The `AgentEntryRole` / `AgentDetailRole` DTOs the T7b section describes are gone, and the reference
+   template list gained the prefix route - which is one reason its count is 52 rather than the 45 the
+   T5a section pinned. `src/api/session_agents.rs:9-10` still describes the old "the contract has no
+   rank field" deviation in its own header; the test names are the authority
+   (`tests/http_sessions.rs::the_session_agent_rank_vocabulary_is_the_contracts`,
+   `::a_started_conversation_keeps_its_ranks`). `README.md` Deviations item 22 states the finished shape.
+3. **`PATCH .../turns/{turn_id}/blocks/{block_id}` is no longer a placeholder.** The 2026-11-11
+   section's follow-up 1 says the route "keeps its documented placeholder" and answers 501; the handler
+   is now real - `src/api/turns.rs::patch_session_turn_block`, the two-axis write
+   (`included`, `reasoningIncluded`) with the contract's guard sentences - and the 501 placeholder test
+   is gone from `tests/wave_one.rs`. The current pins there are
+   `::the_block_write_shapes_use_the_contract_spellings` and `::the_block_write_guards_answer_before_the_segment_lookup`.
+   The route's own comment at `src/api/mod.rs:1019` still labels it "Wave 1", which is the wave that
+   mounted it, not a statement about the handler.
+4. **The reference moved to persistence v2; this crate is still v1.** `persistence::HARNESS_DATABASE_VERSION`
+   is `1`, and the document is still the single `harness/state.json` (`src/persistence.rs:70`/`:77`) the
+   T2 section describes. What moved is the OTHER side: the reference has been at **v2** since its shard
+   split (`HARNESS_DATABASE_VERSION = 2` at `packages/underload/harness/src/server/persistence.ts:223`)
+   and never opens `state.json` (`:31-33`). Neither side migrates a v1 document. On this side the legacy
+   roster fields are tolerated on read (`primary: Option<String>`, and `subagents` read as a rank
+   statement and dropped on the next write, `src/persistence.rs:174-204`) while `context_lane` stays
+   `Option<u64>` (`:936`). `README.md` Deviations item 18 carries the shape and the destructive
+   consequence - the reference's commit pass erases `harness/sessions/<id>` as ONE footprint, which is
+   the directory this crate writes its journals into.
+5. **The `availability` vocabulary is honest per state.** `tools/mod.rs::availability_of` (`:224`)
+   fills `availability.hint` from `MISSING_CAPABILITY` (`:78`) for the rows this build lists but cannot
+   execute, so a model gets the capability it is missing rather than a bare `missing`. The earlier
+   "catalogued-only tools" prose is still right about WHICH rows those are; `README.md` Deviations
+   item 23 records the vocabulary.
+6. **The session-plugin trio is mounted and answers the catalogue** (`GET .../sessions/{id}/plugins`
+   and `GET`/`PATCH .../sessions/{id}/plugins/{plugin_id}`), per-session store included - see
+   `README.md`'s "What ships" table. What it does NOT imply is a hook execution: that is item 1 above.
+
+### Corrections to this file's own sentences
+
+These are the places where a reader would take a dated figure for a current one:
+
+* "The route table is `pub static ROUTES: [Route; 45]`" and the "64 operations ... GET 37, POST 13,
+  PATCH 7, DELETE 6, PUT 1" split in the T5a section, and the "45 templates / 64 operations" line in
+  the wave-3 section, are the counts those stages pinned. Current: 52 templates / 74 operations with
+  the split in the table above.
+* "`shared/harness-api.ts:54-100`" - the file moved and the range grew: `src/engine/shared/harness-api.ts:54-107`.
+* The "six entries ... six names instead of TS's eight" sentence in T3's decisions is superseded twice
+  over: the tool catalogue is `src/tools/catalogue.rs` (`ENTRIES`), and the agent/preset counts are the
+  8 / 8 above.
+* The T10 decision "the same two rows, in scan order (`async-ping` before `context-compaction`, path
+  ascending)" is stale on the COUNT only: `BUILTIN_PLUGINS` carries three rows, and the rule still
+  holds - `context-trimmer` sorts after `context-compaction` and is declared third. The scan-order rule
+  is contract-visible (the page renders in it, and the 404 sentence joins those names), so this is a
+  count correction, not an order correction. The generated TS file it mirrors is now
+  `src/engine/plugin/manifest.ts`.
+* `harness-stream.ts:122-149` for the op union is now `src/engine/shared/harness-stream.ts:161` (the
+  18-kind union line), and `src/engine/shared/turn-display.ts:1340` for the `pending:set` arm; the
+  "Stable, opaque, server-minted" sentence attributed to `harness-stream.ts:46-54` is at
+  `src/engine/shared/turn-display.ts:1047`.
+* The T2 section's "Journal" subsection (the brief's `{"version":1,"sequence":N,"timestamp":<ms>,
+  "event":{...}}` envelope, with a per-FILE cursor) is superseded by fact 2 of the 2026-11-11 section,
+  and fact 2 matches the source: the event line is the reference's
+  `{type:"event", v:1, turnId, index, at, event}` - `journal_event_line` at `src/journal.rs:144-153` -
+  the header line `{"type":"header","v":1,"sessionId","createdAt"}` is still line 1
+  (`journal_header`, `src/journal.rs:132-134`), and the legacy Rust envelope
+  `{version, sequence, timestamp, event}` is REFUSED on read, reported the way the reference reports it
+  (`src/journal.rs:74-80`). There is no per-file `sequence` filter any more
+  (`src/journal.rs:45-46`), and the word "timeline" appears nowhere in `src/journal.rs` or
+  `src/contract.rs`. A separate caution the 2026-11-11 section already carries: the fixture's events
+  load through `state.json`'s per-turn `events` array, so do not claim journal-FILE interoperability
+  beyond what that section claims.
+* The per-stage verification blocks name targets that no longer exist (`turns`) and a target that was
+  never there (`store_durable`); the 19 names above are the current inventory.
+
+### Numbers this pass deliberately did not state
+
+The per-stage totals recorded above (414/16, 359, 372, 382, the per-target lists, and README's former
+"every pinned suite" counts) are dated run figures. They cannot be re-derived from the tree - a test
+count only a `cargo test` run can prove is not a claim about the source - and this pass ran no cargo,
+so none of them was restated as current. `README.md`'s Verification section now carries the target
+list with the symbol or fixture that pins each target instead.
+
+### One cross-package claim worth keeping straight
+
+`packages/typecrate/services` is native-only, and it is the consumer of this crate: its `Cargo.toml`
+states "Native-only: this crate is an HTTP server, so there is no wasm boundary and no wasm target"
+(`:19-20`) and depends on this crate as an ordinary path dependency,
+`typecrate-harness = { path = "../harness" }` (`:80`). The same comment block records the edge
+direction that keeps the graph acyclic - "`typecrate-harness` has no dependency on services (its
+manifest lists no path dependencies at all)" (`:78-79`) - which is the same fact the path map above
+reports about `noobscript_core`.
+
+The gateway test is the other document of the tool-catalogue contract, and it pins the SAME figure
+from the harness side: 32 LISTED rows - 36 rows in `tools/catalogue.rs` (`catalogue::ENTRIES`), minus
+the four the manifest marks `listed: false` (`catalogue::UNLISTED`) - because "this gateway serves that
+crate's catalogue rather than a copy of it" (`tests/harness_gateway.rs:588-597`). Two details there are
+stale in exactly the way this section exists to record: the line range it cites in the harness test
+(`../harness/tests/http_host.rs:1850-1855`) now sits inside an agent-404 assertion, while the figure it
+means lives at `tests/http_host.rs:1951` (the comment) and `:2003` (`page.body["limit"] == 32`); and the
+`scripts/check-playground.ts` `LISTING_JSON` fixture it is often quoted alongside is a row list whose
+length this pass did not re-count. Read those as pointers, not as pins.
+
+Older prose in either document about a services SIGTERM/wasm build failure was an observation from one
+build state, not a contract, so it is not repeated here as a current fact - and with no `cargo` run in
+this pass there is no fresh observation to replace it with.

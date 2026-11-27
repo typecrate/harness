@@ -38,11 +38,21 @@ struct Fixture {
 impl Fixture {
     fn new(name: &str) -> Self {
         let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        // FIXED-WIDTH name components, on purpose. One pin in this file asserts a refusal that
+        // quotes the BYTE LENGTH of a tool result whose JSON embeds this directory's absolute path
+        // (`an_oversized_json_read_result_is_refused_rather_than_truncated`), so an unpadded pid or
+        // sequence shifted that count by a byte whenever either gained a digit — the pin passed in
+        // isolation and failed under a full `cargo test`, where pids are longer and threads take the
+        // counter in a different order. Padding both keeps the path length constant per checkout.
         let directory = typecrate_harness::package_root::repo_root()
             .join("Temp")
             .join("typecrate-harness")
             .join("t4")
-            .join(format!("{}-{sequence}-{name}", std::process::id()));
+            .join(format!(
+                "{pid:0>9}-{sequence:0>4}-{name}",
+                pid = std::process::id()
+            ));
 
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).expect("a fixture directory is creatable");
@@ -244,8 +254,42 @@ fn the_catalogue_lists_every_group_in_the_published_order() {
             .all(|row| !row.session_bound)
     );
 
-    // The core rows carry the session hint and nothing else does.
-    for row in rows.iter().filter(|row| row.group == "Core tools") {
+    // A4: every core row states `available`, and the HINT is now the honest half. An executable core
+    // row carries the session-bound sentence (`harnesses/core.ts:87`); a row this build LISTS but
+    // cannot run carries the same capability sentence a call to it answers with, because a row that
+    // advertises a capability this server does not have was the defect the audit found.
+    let session_hint = "Runs inside a session harness: send a sessionId with the call.";
+
+    // The four core names the runtime stage actually executes (the rest of the group is
+    // catalogued-only), so the split below is a stated set rather than an inference.
+    let executable_core: Vec<&str> = rows
+        .iter()
+        .filter(|row| row.group == "Core tools")
+        .filter(|row| {
+            row.availability.as_ref().and_then(|a| a.hint.as_deref()) == Some(session_hint)
+        })
+        .map(|row| row.name.as_str())
+        .collect();
+
+    assert_eq!(
+        executable_core,
+        vec!["toolRequest", "toolList", "tasks", "actionRequest"],
+        "exactly the core rows this build executes keep the session-bound hint"
+    );
+
+    // Two verbatim pins, one per capability family, so a drifted sentence is caught by a literal and
+    // not only by the cross-check against execution.
+    for (name, capability) in [
+        ("delegate", "nested agent runs (the delegation runtime)"),
+        (
+            "toolRegistry",
+            "compiling and registering a tool from editable source (the runtime compiler)",
+        ),
+    ] {
+        let row = rows
+            .iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("{name} is listed"));
         let availability = row
             .availability
             .clone()
@@ -254,7 +298,54 @@ fn the_catalogue_lists_every_group_in_the_published_order() {
         assert_eq!(availability.state, ToolAvailabilityState::Available);
         assert_eq!(
             availability.hint.as_deref(),
-            Some("Runs inside a session harness: send a sessionId with the call.")
+            Some(format!(
+                "this server does not support {capability}, so \"{name}\" cannot run here. The capability is on the port list; use the tools that are executable to make progress."
+            ).as_str()),
+            "{name} advertises the sentence a call to it answers"
+        );
+    }
+
+    // Every OTHER catalogued-only row states the same shape, and no executable row states it.
+    let stated_only: Vec<&str> = rows
+        .iter()
+        .filter(|row| {
+            row.availability
+                .as_ref()
+                .and_then(|a| a.hint.as_deref())
+                .is_some_and(|hint| hint.starts_with("this server does not support"))
+        })
+        .map(|row| row.name.as_str())
+        .collect();
+
+    assert_eq!(
+        stated_only,
+        vec![
+            "toolRegistry",
+            "toolManage",
+            "toolCreate",
+            "records",
+            "profiles",
+            "chapters",
+            "locations",
+            "agentManage",
+            "agentResult",
+            "delegate",
+            "threadFork",
+        ],
+        "the catalogued-only rows in listing order - and only they - advertise the missing capability"
+    );
+
+    for row in rows.iter().filter(|row| row.group == "Core tools") {
+        let availability = row
+            .availability
+            .clone()
+            .expect("a core row states availability");
+
+        assert_eq!(availability.state, ToolAvailabilityState::Available);
+        assert!(
+            availability.hint.is_some(),
+            "{} states a hint, never an empty availability block",
+            row.name
         );
     }
 
@@ -290,6 +381,50 @@ fn the_catalogue_lists_every_group_in_the_published_order() {
         vec!["files", "grep", "search", "content", "regex", "filesystem"]
     );
     assert_eq!(tags("shell"), vec!["shell", "command", "process"]);
+}
+
+/// A4: the row a client reads and the call the client makes must tell ONE story.
+///
+/// Every advertised row whose `availability.hint` names a missing capability must answer a call to
+/// that tool with that exact sentence inside the failed-call body, and no row that does NOT name one
+/// may ever answer with it. The hint and the refusal come from the same function
+/// (`tools::missing_capability_hint`); this test is the half that proves it, because a shared helper
+/// can still be bypassed by a second call site.
+#[tokio::test]
+async fn every_advertised_availability_hint_agrees_with_what_execution_answers() {
+    let runtime = registry();
+    let fixture = Fixture::new("hint-parity");
+
+    for row in runtime.summaries() {
+        let hint = row
+            .availability
+            .as_ref()
+            .and_then(|availability| availability.hint.clone())
+            .unwrap_or_default();
+
+        let outcome = call(&runtime, &row.name, json!({}), &fixture.directory).await;
+
+        if hint.starts_with("this server does not support ") {
+            assert!(
+                !outcome.ok,
+                "{} advertises a missing capability, so the call cannot succeed",
+                row.name
+            );
+            assert_eq!(
+                outcome.content,
+                format!("Tool \"{}\" failed: {hint}", row.name),
+                "{} answers the sentence its row advertises, byte for byte",
+                row.name
+            );
+        } else {
+            assert!(
+                !outcome.content.contains("this server does not support"),
+                "{} is executable, yet execution answered with the capability refusal: {}",
+                row.name,
+                outcome.content
+            );
+        }
+    }
 }
 
 #[test]
@@ -1157,18 +1292,25 @@ async fn paths_resolve_against_the_cwd_and_reject_nul() {
 }
 
 #[tokio::test]
-async fn an_oversized_read_is_bounded_by_the_tool_not_by_the_result_envelope() {
+async fn an_oversized_json_read_result_is_refused_rather_than_truncated() {
     let runtime = registry();
     let fixture = Fixture::new("result-budget");
 
+    // Named from the contract rather than mirrored as a literal, so a future budget change moves
+    // this pin with it instead of leaving a stale number behind.
+    let budget = typecrate_harness::contract::MODEL_TOOL_RESULT_BUDGET_BYTES;
+
     // One line per 2 KiB, 200 lines: `read` caps its OWN content at 64 KiB and says so with
-    // `truncated`, so the document arrives at ~65 KiB — inside the 256 KiB model-facing tool
-    // budget (`contract::MODEL_TOOL_RESULT_BUDGET_BYTES`, the reference's
-    // `core/result-budget.ts MODEL_TOOL_RESULT_BUDGET_BYTES`). The registry therefore hands
-    // back the read document whole. The named budget envelope is a DELIVERY-layer rule
-    // (`result::bound_tool_result`, unit-tested in `src/tools/result.rs`), and double-capping
-    // here would replace that document with the envelope and drop the paging keys a model
-    // needs to resume — which is the failure this pin exists to prevent.
+    // `truncated`, so the document arrives ABOVE the model-facing budget (the exact byte count is in
+    // the refusal literal below).
+    // The reference's file tools cap their content at the same 64 KiB
+    // (`engine/tools/files/files.tool.ts:408 FILES_CONTENT_BUDGET`), so the reference can produce
+    // the same oversize document, and its cutter answers that document with a REFUSAL: an
+    // over-budget result that PARSES as JSON is dropped whole (`rejected: { reason:
+    // 'oversized-json' }`, `truncated: false`) while only prose is cut into the head/tail envelope
+    // (`engine/core/result-budget.ts:655-724`). The "256 KiB" premise this pin used to carry came
+    // from this crate's wrong published budget, which made the case unreachable; at the real
+    // 32,768-byte budget the refusal is what the wire must carry.
     let text = (0..200)
         .map(|line| format!("{:0<2047}\n", format!("line {line}")))
         .collect::<String>();
@@ -1182,27 +1324,34 @@ async fn an_oversized_read_is_bounded_by_the_tool_not_by_the_result_envelope() {
         &fixture.directory,
     )
     .await;
-    let document: Value =
-        serde_json::from_str(&outcome.content).expect("the read document is JSON");
 
-    assert!(outcome.ok, "{}", outcome.error.unwrap_or_default());
+    // An oversized JSON result is a FAILED call, not a delivered one: the reference classifies the
+    // same outcome `failed` when the bounded result carries `rejected`
+    // (`engine/harness.ts:11181 outcome = delivered.rejected ? 'failed' : 'completed'`), while the
+    // text it records is the refusal sentence itself (`engine/harness.ts:10842-10845`).
+    // The count is the byte length of the read tool's own JSON document, which embeds the fixture's
+    // absolute path, so it is constant for a checkout as long as `Fixture::new` keeps its name widths
+    // fixed (see the note there). 65,859 was the number for the unpadded layout, and it moved whenever
+    // a pid or the counter gained a digit.
+    let refusal = "Tool result too large to deliver: 65864 bytes against a 32768-byte budget. The result was discarded, not truncated: no part of it reached this transcript. Re-run the tool call with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it. If this call could have written anything, that write may already be applied — re-read before retrying.";
+
+    assert!(
+        !outcome.ok,
+        "an oversized JSON document is refused, not delivered"
+    );
     assert_eq!(
-        document["truncated"],
-        json!(true),
-        "the tool reports its own cut"
+        outcome.error.as_deref(),
+        Some(refusal),
+        "the refusal is the reference's sentence, byte for byte"
+    );
+    assert_eq!(outcome.content, refusal);
+    assert!(
+        serde_json::from_str::<Value>(&outcome.content).is_err(),
+        "a refusal is plain text, so a client can tell it from a bounded document"
     );
     assert!(
-        document["files"].is_array(),
-        "the read document survives intact"
-    );
-    assert!(
-        document.get("budgetBytes").is_none(),
-        "no envelope was substituted here"
-    );
-    assert!(document.get("originalBytes").is_none());
-    assert!(
-        result::utf8_byte_length(&outcome.content) <= 400_000,
-        "the tool's own cap keeps the document well inside the model budget"
+        result::utf8_byte_length(&outcome.content) <= budget,
+        "the refusal is itself inside the budget it enforces"
     );
 }
 

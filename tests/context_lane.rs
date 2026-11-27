@@ -446,6 +446,9 @@ fn the_published_block_carries_the_lane_the_spec_publishes() {
             args_chars: None,
             result_chars: None,
             in_prompt: None,
+            // C1/R3: the live verdict is joined at READ time by the display and block-detail routes,
+            // so a decoded projector block carries none.
+            included: None,
             event_from: None,
             event_to: None,
             call_id: None,

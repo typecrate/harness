@@ -110,7 +110,7 @@ struct AgentOverlay {
     retired: bool,
 }
 
-/// The catalogue of selectable agents: six compiled-in profiles, the operator's overlay, and the
+/// The catalogue of selectable agents: eight compiled-in profiles, the operator's overlay, and the
 /// retirement tombstones.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCatalogue {
@@ -129,7 +129,7 @@ impl Default for AgentCatalogue {
 }
 
 impl AgentCatalogue {
-    /// The compiled-in catalogue, with no overlay: the six profiles in `shipped_profiles()` order.
+    /// The compiled-in catalogue, with no overlay: the eight profiles in `shipped_profiles()` order.
     #[must_use]
     pub fn builtin() -> Self {
         Self {

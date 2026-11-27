@@ -81,12 +81,16 @@ pub fn global_config_document(config: &ServerConfig, hub: &EventHub) -> GlobalCo
 }
 
 /// A definition card: identity, membership, declared tools, and the revision counter
-/// (`harnessCardOf`, `api-reads.ts:1026-1037`).
+/// (`harnessCardOf`, `api-reads.ts:1654-1670`).
 ///
 /// `tools` is the card's REGISTERED list - the declared toolbox plus the environment-backed names
-/// this host can run (`descriptor.ts:69-95`) - not the raw preset list. `subagents` is ALWAYS on
-/// the wire (`harness-api.ts:428`): an empty array states that `delegate` is not registered, so
-/// it must not be skipped.
+/// this host can run (`descriptor.ts:69-95`) - not the raw preset list.
+///
+/// THREE INDEPENDENT FACTS, EMITTED WHOLE (`api-reads.ts:1659-1665`): `entry` (routing), `ranks`
+/// (authority, ALWAYS serialized - an empty map honestly states "no member was granted authority"),
+/// and `agents` (the roster in declaration order). They replaced `primary` + `subagents`, and a card
+/// carries NO `agent_prefixes`: the identified read below is that map's only publisher, which is what
+/// keeps a list row's shape unchanged.
 #[must_use]
 pub fn harness_card_of(definition: &HarnessDescriptor, hub: &EventHub) -> HarnessCard {
     harness_card_of_revision(
@@ -104,8 +108,10 @@ pub fn harness_card_of_revision(definition: &HarnessDescriptor, revision: u64) -
         title: definition.title.clone(),
         description: definition.description.clone(),
         requires_endpoint: definition.requires_endpoint,
-        primary: definition.primary.clone(),
-        subagents: definition.subagents.clone(),
+        entry: definition.entry.clone(),
+        // The RESOLVED map, copied whole: what the harness RUNS, never a subset an operator happened
+        // to write (`registry.ts` fills the gaps at write time).
+        ranks: definition.ranks.clone(),
         agents: definition.agents.clone(),
         tools: definition.registered_tools(),
         builtin: definition.builtin,
@@ -155,6 +161,14 @@ pub fn harness_definition_of_revision(
         } else {
             Some(definition.agent_colors.clone())
         },
+        // U6 + F2: THE ONE MAP WITHOUT THE NON-EMPTY RULE ON THIS READ (`api-reads.ts:1692-1720`).
+        // Presence is a capability flag: ABSENT means "a server with no preset-history editor", `{}`
+        // means "an editor that exists and seeds nothing", and a client may only PATCH the map it has
+        // READ because a harness PATCH REPLACES it and a stated `{}` is the explicit clear. So the
+        // identified read always supplies a map - and a member keyed with an empty band keeps its key,
+        // because "this member seeds no history" is a choice the read must echo. The SAVED SESSION's
+        // copy keeps the non-empty rule (`crate::store::read`'s session definition projection).
+        agent_prefixes: Some(definition.agent_prefixes.clone()),
         instruction_summary: Some(crate::registry::instruction_summary_of(definition, agents)),
     }
 }

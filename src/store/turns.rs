@@ -598,9 +598,16 @@ impl SessionStore {
     /// TS names it `thread-<n>` with the session's next ordinal, marks it `host`, and gives it no owner:
     /// an unfocused submit is a top-level request, so nothing is a parent of it. It runs AS the harness's
     /// entry agent, which is the only agent a host conversation may impersonate without a delegation.
+    ///
+    /// A session whose roster is full answers **429** with the runtime's remedy sentence, not a 409: this
+    /// is the door the reference's `createSubmitThread` wraps in `threadError`, whose capacity arm is a
+    /// `SessionError(429, ...)` (`sessions.ts:10318-10338`), and it is the one thread refusal the tasks
+    /// route's declared 429 covers. See [`crate::store::threads::thread_cap_submit_error`].
     pub(crate) fn open_host_thread(&self, state: &mut SessionState) -> Result<String, ApiError> {
         if state.threads.len() >= crate::store::threads::MAX_THREADS {
-            return Err(crate::store::threads::thread_cap_error());
+            return Err(crate::store::threads::thread_cap_submit_error(
+                state.threads.len(),
+            ));
         }
 
         let agent = state.primary_agent();

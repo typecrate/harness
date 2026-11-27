@@ -56,7 +56,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::contract::{self, AgentResultReference, HarnessAttachment, HarnessEvent, HarnessUsage};
+use crate::contract::{
+    self, AgentRank, AgentResultReference, HarnessAttachment, HarnessEvent, HarnessPrefixTurn,
+    HarnessUsage,
+};
 use crate::error::ApiError;
 use crate::events;
 use crate::labels;
@@ -168,10 +171,37 @@ pub struct HarnessPresetRecord {
     pub description: String,
     #[serde(default)]
     pub requires_endpoint: bool,
-    #[serde(default)]
-    pub primary: String,
-    #[serde(default)]
-    pub subagents: Vec<String>,
+    /// THE ENTRY AGENT (routing) - the durable replacement for `primary` (`persistence.ts:286`).
+    ///
+    /// TS declares this REQUIRED and refuses a row without it; this port keeps it `Option` so a
+    /// pre-rank document written by an older build still RESTORES (see [`Self::primary`] for the
+    /// rule). A row this crate writes always carries the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+    /// THE RANK MAP (authority): agent id -> A-Z letter (`persistence.ts:294`), stored RESOLVED -
+    /// every member of `agents` is keyed, because the registry fills the gaps with the kernel's own
+    /// rule at WRITE time (`toolbox.ts` `resolveRosterRanks`). That is what makes it part of the
+    /// EXECUTABLE definition the harness is rebuilt from: an operator's rank decision survives a
+    /// restart instead of being re-derived.
+    ///
+    /// OPTIONAL HERE, where TS makes it required: a row written before the rank pass carries no
+    /// `ranks` key at all, and refusing it would refuse a store that loads fine today. The reader
+    /// derives the map with the kernel's rule-1 default (entry `A`, every other member one rank
+    /// below), which is the exact statement the legacy `primary`/`subagents` pair made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranks: Option<BTreeMap<String, AgentRank>>,
+    /// LEGACY (`primary`, `persistence.ts:281-285`): the pre-rank spelling of the entry agent.
+    ///
+    /// TS refuses a row that still carries it (`readPresetRecord` -> `requireNoLegacyRosterKeys`).
+    /// This port reads it, and a row this crate writes never carries it again: `to_record` emits the
+    /// new spelling and clears both legacy keys, so a legacy document is UPGRADED by the first save
+    /// after restore rather than refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
+    /// LEGACY (`subagents`): the pre-rank delegation allowlist, read as a rank statement - entry
+    /// above, every name here one rank below - and dropped on the next write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagents: Option<Vec<String>>,
     #[serde(default)]
     pub agents: Vec<String>,
     #[serde(default)]
@@ -197,6 +227,20 @@ pub struct HarnessPresetRecord {
     /// entry carries one, and read back with the same absent-means-empty rule (`registry.ts:793`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_colors: Option<BTreeMap<String, String>>,
+    /// PER-AGENT PRESET HISTORY (U6, `persistence.ts:334`): agent id -> that member's complete
+    /// ordered band of seeded `system` / `user` / `assistant` turns.
+    ///
+    /// ADDITIVE and written only when the map carries a key, so every registry row and every frozen
+    /// session saved before U6 keeps its exact pre-U6 key set. It is EXECUTABLE state in the same
+    /// sense as the four maps above it: the band is what the harness seeds a member's transcript
+    /// with, so a band that did not survive a restart would silently change the transcript the model
+    /// reads on turn one.
+    ///
+    /// ONE shape rule the reader must honour: an EMPTY band keeps its key (`{ "writer": [] }` is the
+    /// statement "this member seeds no history"), so the non-empty gate is on the MAP, never on a
+    /// band (`registry.ts:1016-1018`, `descriptor.ts:133-135`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_prefixes: Option<BTreeMap<String, Vec<HarnessPrefixTurn>>>,
     #[serde(default)]
     pub builtin: bool,
     #[serde(default)]
@@ -441,10 +485,21 @@ pub struct HarnessDescriptorRecord {
     pub description: String,
     #[serde(default)]
     pub requires_endpoint: bool,
-    #[serde(default)]
-    pub primary: String,
-    #[serde(default)]
-    pub subagents: Vec<String>,
+    /// THE ENTRY AGENT (routing) - `protocol.ts:399`. Optional for the same tolerant-read reason the
+    /// preset record states it (`persistence.ts:281-286`): a session frozen before the rank pass
+    /// carries `primary`/`subagents` here instead, and this port restores it. A definition this crate
+    /// freezes always writes the new spelling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+    /// THE RANK MAP (authority) - `protocol.ts:400`, stored RESOLVED like the preset record's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranks: Option<BTreeMap<String, AgentRank>>,
+    /// LEGACY: see [`HarnessPresetRecord::primary`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
+    /// LEGACY: see [`HarnessPresetRecord::subagents`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagents: Option<Vec<String>>,
     #[serde(default)]
     pub agents: Vec<String>,
     #[serde(default)]
@@ -460,6 +515,11 @@ pub struct HarnessDescriptorRecord {
     /// with no key at all (`descriptor.ts:117-119`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_colors: Option<BTreeMap<String, String>>,
+    /// U6's fourth map (`protocol.ts:443-453`): agent id -> that member's seeded band, as FROZEN at
+    /// creation. This is the UNTOUCHED definition statement, and the copy a `null` prefix patch
+    /// restores from - no session write ever rewrites it (`api.ts:4476-4479`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_prefixes: Option<BTreeMap<String, Vec<HarnessPrefixTurn>>>,
     #[serde(default)]
     pub builtin: bool,
     #[serde(default)]
@@ -754,6 +814,34 @@ pub struct HarnessSessionRecord {
     /// the one surface that can show it is the session's own problem list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_diagnostics: Option<Vec<Value>>,
+    /// THIS SESSION'S OWN plugin-setting overrides, in exactly the shape the process-level
+    /// [`HarnessPluginSettingsRecord`] uses (`HarnessSessionRecord.pluginSettings`,
+    /// `sessions.ts:4128-4146`; read by `persistence.ts:1840-1877`).
+    ///
+    /// WHY THE SESSION HAS ITS OWN COPY (the R4 copy-down): a new session is seeded with the process
+    /// store's overrides at creation, and after that only the three session plugin routes write it. So a
+    /// `PATCH {root}/plugins/{plugin_id}` changes what a session created AFTER the write starts with and
+    /// changes nothing about a session that already exists - and a session's own edit never climbs back
+    /// into the template. The durable member is the ONLY record of that per-session delta, which is why
+    /// a restart re-seeds from here and never from today's template.
+    ///
+    /// THE FIELD IS AN OPAQUE `Value`, not the typed map, and that is the tolerance rule rather than
+    /// laziness: `persistence.ts:1854-1877` DROPS a non-object block, drops a non-object plugin entry,
+    /// and drops a value that is not a finite number / boolean / string, because one hand-edited slot in
+    /// one session must not cost the whole store every session it holds. A typed
+    /// `Option<HarnessPluginSettingsRecord>` would instead fail at the serde boundary and take the whole
+    /// document down (the same reason `labelSeeds` and `turnInstructionSources` are `Value`). The
+    /// document-level block keeps the typed shape because ITS reader is strict
+    /// ([`validate_document`]'s `pluginSettings` pass).
+    ///
+    /// ADDITIVE, and deliberately NOT a version bump: absent means "this session has never changed a
+    /// plugin setting", the case every document written before the feature has, and the writer omits the
+    /// key when the map is empty (`:4140-4146`) — so such a document keeps its exact previous bytes.
+    /// [`normalize_session_plugin_settings`] canonicalizes what was read, and
+    /// `SessionState::durable_record` re-derives it from the live store on every write, so the in-memory
+    /// copy is never what reaches the disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_settings: Option<Value>,
     /// The last committed core snapshot (`:232-236`; `HarnessSnapshot` from `types/index.ts`).
     /// Opaque because the core owns that schema; [`repair_interrupted_snapshot`] walks it as
     /// data, exactly as `repairInterruptedToolCalls` does.
@@ -1120,6 +1208,14 @@ fn validate_session_value(value: &Value, label: &str) -> Result<(), String> {
         return Err(format!("{label} must be an object."));
     };
 
+    // ONE deliberate absence: a session's `pluginSettings` block gets NO pass here. The document-level
+    // block is strict (`validate_document`'s `pluginSettings` arm prints the offending slot) because a
+    // malformed TEMPLATE is a deployment defect worth naming, while a malformed per-session slot is one
+    // hand edit in one conversation. TS reads the session copy tolerantly for that reason
+    // (`persistence.ts:1854-1877`, "tolerant: a non-object block is dropped"), and
+    // [`normalize_session_plugin_settings`] is this port's half of that read - refusing here would lose
+    // every session in the document to save one map.
+
     // `requireRecord(record.settings, ...)` then the outright refusal of a persisted credential
     // (`:887-893`): it would mean an older/foreign writer stored one, and silently dropping it
     // would hide that defect.
@@ -1482,6 +1578,58 @@ pub fn normalize_plugin_diagnostics(entries: &Option<Vec<Value>>) -> Option<Vec<
     Some(kept.split_off(start))
 }
 
+/// TOLERANT read of one session's `pluginSettings` block (`persistence.ts:1854-1877`).
+///
+/// Three drops, in this order, none of which may refuse the session:
+///   * a block that is absent, `null`, an array, or any other non-object → no block;
+///   * a plugin entry that is `null`, an array, or any other non-object → that plugin;
+///   * a stored value that is not a finite number, a boolean, or a string → that key.
+///
+/// Names are NEVER checked against this build's catalogue: `PluginSettingsStore::restore` is what
+/// decides whether a plugin or a key still means anything, so a plugin that ships again later gets its
+/// stored override back. Keeping the shape check here and the meaning check there is also what keeps a
+/// malformed slot from failing the serde boundary and losing every session in the document.
+///
+/// NORMALIZATION is what makes a load -> save round trip byte-stable: entries are re-emitted in the
+/// document's own key order (the writer emits catalogue order, and `serde_json`'s `preserve_order` keeps
+/// it), an entry whose values were all dropped disappears, and a block that ends up empty - absent,
+/// `{}`, or all-dropped - normalizes to ABSENT, which is exactly what the writer emits for "this session
+/// changed nothing".
+#[must_use]
+pub fn normalize_session_plugin_settings(block: &Option<Value>) -> Option<Value> {
+    let entries = block.as_ref()?.as_object()?;
+
+    let mut kept = Map::new();
+
+    for (plugin, raw) in entries {
+        let Some(values) = raw.as_object() else {
+            continue;
+        };
+
+        let mut settings = Map::new();
+
+        for (key, value) in values {
+            let keep = match value {
+                // `Number.isFinite`: an `Infinity`/`NaN` written by hand would otherwise come back as
+                // the value the row paints, and JSON cannot even spell it.
+                Value::Number(number) => number.as_f64().is_some_and(f64::is_finite),
+                Value::Bool(_) | Value::String(_) => true,
+                _ => false,
+            };
+
+            if keep {
+                settings.insert(key.clone(), value.clone());
+            }
+        }
+
+        if !settings.is_empty() {
+            kept.insert(plugin.clone(), Value::Object(settings));
+        }
+    }
+
+    (!kept.is_empty()).then(|| Value::Object(kept))
+}
+
 fn normalize_database(database: &mut HarnessDatabase) {
     if let Some(deleted) = &database.deleted {
         let mut names: Vec<String> = Vec::with_capacity(deleted.len());
@@ -1527,6 +1675,11 @@ fn normalize_database(database: &mut HarnessDatabase) {
         // on the DESERIALIZED value so a journal a hand-edit grew past the cap restores to a document
         // this crate can re-write identically. Nothing here can refuse the session.
         session.plugin_diagnostics = normalize_plugin_diagnostics(&session.plugin_diagnostics);
+
+        // R1: the session's OWN plugin overrides, tolerant-read and normalized (see the reader). The
+        // store then seeds `SessionState::plugins` from THIS and never from the process store, which is
+        // what makes a per-session edit survive a restart while a later template edit does not reach it.
+        session.plugin_settings = normalize_session_plugin_settings(&session.plugin_settings);
 
         if session.title.as_deref().is_some_and(str::is_empty) {
             session.title = None;

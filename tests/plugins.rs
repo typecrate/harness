@@ -1,5 +1,7 @@
-//! The built-in PLUGIN surface over real HTTP: `GET /v1/harness/plugins` and
-//! `PATCH /v1/harness/plugins/{plugin_id}` - the Rust port of
+//! The built-in PLUGIN surface over real HTTP: the two process-scope routes
+//! (`GET /v1/harness/plugins`, `PATCH /v1/harness/plugins/{plugin_id}`) and the three session-scope
+//! routes C3 added (`GET /v1/harness/sessions/{session_id}/plugins`,
+//! `GET`/`PATCH /v1/harness/sessions/{session_id}/plugins/{plugin_id}`) - the Rust port of
 //! `packages/underload/harness/src/server/plugins-api.test.ts`.
 //!
 //! WHAT THIS FILE PINS, IN THE REFERENCE SUITE'S ORDER (one item per line, the shape
@@ -13,6 +15,8 @@
 //! 4. NORMALIZATION - a numeric STRING lands as a NUMBER, an integral value keeps its INTEGER spelling, `step` is NOT enforced, and an explicit `null` restores the declared default and drops the plugin's now-empty override map.
 //! 5. DURABLE - `state.json` carries the override and nothing else, a fresh runtime on the same root boots with it, the counter restarts at 0 while the value does not, and a deployment that never edited anything writes no `pluginSettings` field at all.
 //! 6. RESTORE - an override naming a retired plugin, a retired key, or another plugin's key is dropped silently; a stored value outside the declared bounds is dropped rather than fatal; a document whose `pluginSettings` SHAPE is wrong names the slot.
+//! 7. SESSION SCOPE - one conversation's own copy of the store (`sessions.ts:864-876`): it answers the template's rows byte for byte, it is SEEDED from the process store at creation and not retro-moved afterwards, its counter moves only for itself, its delta lands in its own record, and an unknown session or plugin is refused with the session-flavoured sentence.
+//! 8. DISPLAY METADATA - each row's `group`/`parentKey` and each plugin's `system_prompt`, in the order the contract emits them, exactly as the details pane reads them.
 //!
 //! Every test owns its own DATABASE ROOT: the runtime cache is keyed by root, so the revision
 //! counters a parallel test asserts are never shared state. Fixtures live under
@@ -65,6 +69,36 @@ fn compaction_values(limit: Value) -> Value {
         "mode": "summarize",
     })
 }
+
+/// The read-only system prompt the compaction row carries (`PluginSummary.system_prompt`,
+/// `context-compaction.plugin.ts:414-441`), pinned HERE rather than read back from
+/// `plugins::system_prompt_of`: the whole point of this file's pins is that the router cannot agree
+/// with itself. Text is verbatim, including the `\"` escapes and the closing sentence - the pane
+/// prints it as-is, so a reword is a contract change and has to break a test.
+///
+/// It is ABSENT on the other two rows (neither plugin declares a `systemPrompt`), which is why it
+/// appears in exactly one row literal below rather than in the row-key set.
+const COMPACTION_SYSTEM_PROMPT: &str = "[context compaction] Automated system prompt (not from the user): your context window has reached its limit. Compact your knowledge now. Reply with one structured summary and nothing else, using these headings (omit any that does not apply):
+## Objective
+- [one or two sentences on what you are trying to accomplish]
+## Requirements
+- [constraints, preferences and scope the user stated, or \"(none)\"]
+## Decisions
+- [decisions made and why, or \"(none)\"]
+## Work State
+### Completed
+- [goals completed that still matter to the current or pending work; otherwise \"(none)\"]
+### Active
+- [what you are working on right now and exactly where you left off, with the details needed to resume; otherwise \"(none)\"]
+### Blocked
+- [what is blocking progress, and why; otherwise \"(none)\"]
+## Next Move
+1. [ordered next actions, or \"(none)\"]
+## Relevant Files
+- [at most 15 paths, most important first, each with a brief reason; or \"(none)\"]
+## Important Context
+- [facts you cannot recover from the code or the files listed; or \"(none)\"]
+Keep each section terse: single-line bullets, not prose. Preserve exact file paths, symbols, commands, error strings, URLs and identifiers. Carry forward only unanswered questions or work still requiring action, in the user's own words. Preserve consequential workflow state: uncommitted, committed, pushed, under review, merged. Summarize only what the user and you said and did — leave out instruction files such as AGENTS.md, repository conventions and environment details: the next turn gets current versions of those. This summary will be your only retained memory of the earlier conversation: be specific but compact. Do not call tools and do not start any other work in this reply.";
 
 // ---------------------------------------------------------------------------
 // Fixtures and the test listener
@@ -484,6 +518,12 @@ async fn the_catalogue_answers_both_builtins_with_their_declared_metadata_and_va
                     the estimate reaches the effective limit, which is the per-model override for \
                     the model the conversation is running, capped by that model's declared \
                     context window when one is declared.",
+            // C1/R2: the display-only prompt this plugin sends to the model. It sits right after
+            // `description` because that is the contract's member order
+            // (`harness-api.ts:1128-1141`, YAML `PluginSummary.system_prompt` after `description`),
+            // and the pane opens its details with it. `the_display_metadata_is_what_the_pane_reads`
+            // pins the key ORDER of the row; this literal pins the text.
+            "system_prompt": COMPACTION_SYSTEM_PROMPT,
             "version": "1.0.0",
             "tags": [
                 "context",
@@ -1846,4 +1886,1282 @@ async fn the_store_projects_declared_defaults_until_an_override_lands() {
     );
 
     runtime::evict_runtime(&root.path);
+}
+
+/// C1/R2: the two DTO members the port was missing, pinned against the contract's own shape.
+///
+/// `harness-server.swagger.yaml:5341-5408` (`PluginSetting`) declares `group` and `parentKey`
+/// AFTER `description`, and `harness-api.ts:1071-1112` mirrors them;
+/// `harness-server.swagger.yaml:5410-5445` (`PluginSummary`) declares `system_prompt` AFTER
+/// `description`, mirrored at `harness-api.ts:1128-1141`. Both are OPTIONAL and follow the
+/// contract's absent-not-null rule, and `parentKey` is one of the very few camelCase keys on this
+/// contract — the display subtree keeps camelCase while every other multi-word key is snake_case.
+///
+/// C3 populated the catalogue, so the routed rows DO carry these members now -
+/// `the_display_metadata_files_each_setting_row_under_its_section` pins the projection and
+/// `a_session_plugin_read_answers_one_row_with_this_sessions_values` pins the emitted row order.
+/// This test stays one level lower, on the DTO itself: the catalogue table and the contract struct
+/// are two different things a client depends on, and the camelCase `parentKey` spelling is pinned
+/// here whether or not a shipped row happens to use it.
+#[test]
+fn the_plugin_dto_carries_the_display_members_the_contract_declares() {
+    use typecrate_harness::contract::{PluginSetting, PluginSettingGroup, PluginSettingType};
+
+    // A grouped row, serialized: the contract's property ORDER, `parentKey` camelCase, and the
+    // `group` sub-object with both required members.
+    let grouped = PluginSetting {
+        key: "trimInvalidToolsWindow".to_owned(),
+        label: "Invalid-tool window".to_owned(),
+        kind: PluginSettingType::Number,
+        default: serde_json::json!(12),
+        min: Some(serde_json::json!(1)),
+        max: Some(serde_json::json!(64)),
+        step: None,
+        description: Some("How many recent calls to re-check.".to_owned()),
+        group: Some(PluginSettingGroup {
+            id: "invalid-tools".to_owned(),
+            title: "Invalid Tools".to_owned(),
+        }),
+        parent_key: Some("trimInvalidTools".to_owned()),
+    };
+
+    let wire = serde_json::to_value(&grouped).expect("a descriptor serializes");
+
+    assert_eq!(
+        wire,
+        json!({
+            "key": "trimInvalidToolsWindow",
+            "label": "Invalid-tool window",
+            "type": "number",
+            "default": 12,
+            "min": 1,
+            "max": 64,
+            "description": "How many recent calls to re-check.",
+            "group": { "id": "invalid-tools", "title": "Invalid Tools" },
+            "parentKey": "trimInvalidTools",
+        })
+    );
+
+    // The EMITTED order, not a sorted view: the contract lists the properties in this order and a
+    // client that reads positionally (or snapshots the row) is pinned by it.
+    let emitted: Vec<String> = wire
+        .as_object()
+        .expect("an object")
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(
+        emitted,
+        vec![
+            "key",
+            "label",
+            "type",
+            "default",
+            "min",
+            "max",
+            "description",
+            "group",
+            "parentKey",
+        ]
+    );
+
+    // The camelCase spelling is what the wire says, so it is also what a client sends back:
+    // `parent_key` in code, `parentKey` on the wire, and the pair round-trips.
+    let parsed: PluginSetting =
+        serde_json::from_value(wire.clone()).expect("the contract spelling deserializes");
+
+    assert_eq!(parsed, grouped);
+    assert_eq!(
+        parsed.parent_key.as_deref(),
+        Some("trimInvalidTools"),
+        "`parentKey` binds to `parent_key`, not to a silently-dropped unknown field"
+    );
+
+    // ABSENT, never `null`: an ungrouped row sends neither key.
+    let flat = PluginSetting {
+        group: None,
+        parent_key: None,
+        ..grouped
+    };
+    let flat_wire = serde_json::to_value(&flat).expect("a descriptor serializes");
+
+    assert!(flat_wire.get("group").is_none(), "no group, no key");
+    assert!(
+        flat_wire.get("parentKey").is_none(),
+        "no parent, no key — never `parentKey: null`"
+    );
+    assert!(
+        serde_json::from_value::<PluginSetting>(
+            serde_json::json!({ "key": "k", "label": "L", "type": "boolean", "default": true })
+        )
+        .expect("the four required members are enough")
+        .group
+        .is_none(),
+        "both members deserialize as optional"
+    );
+
+    // `system_prompt` sits between `description` and `version` in the row, and is absent when the
+    // plugin never prompts.
+    use typecrate_harness::contract::PluginSummary;
+
+    let row = PluginSummary {
+        name: "context-compaction".to_owned(),
+        title: "Context Compaction".to_owned(),
+        description: Some("Compacts a full window.".to_owned()),
+        system_prompt: Some("[context compaction] Compact your knowledge now.".to_owned()),
+        version: Some("1.0.0".to_owned()),
+        tags: None,
+        hooks: None,
+        builtin: true,
+        enabled: true,
+        settings: vec![flat],
+        values: Map::new(),
+    };
+
+    let row_wire = serde_json::to_value(&row).expect("a row serializes");
+    let row_keys: Vec<String> = row_wire
+        .as_object()
+        .expect("an object")
+        .keys()
+        .cloned()
+        .collect();
+
+    assert_eq!(
+        row_keys,
+        vec![
+            "name",
+            "title",
+            "description",
+            "system_prompt",
+            "version",
+            "builtin",
+            "enabled",
+            "settings",
+            "values",
+        ]
+    );
+    assert_eq!(
+        row_wire["system_prompt"],
+        json!("[context compaction] Compact your knowledge now.")
+    );
+    assert_eq!(
+        serde_json::from_value::<PluginSummary>(row_wire)
+            .expect("the row deserializes")
+            .system_prompt
+            .as_deref(),
+        Some("[context compaction] Compact your knowledge now."),
+        "`system_prompt` is snake_case on the wire, like every other multi-word key"
+    );
+
+    let unprompted = PluginSummary {
+        system_prompt: None,
+        ..row
+    };
+
+    assert!(
+        serde_json::to_value(&unprompted)
+            .expect("a row serializes")
+            .get("system_prompt")
+            .is_none(),
+        "a plugin that never prompts sends NO key, which keeps every other row's shape \
+         byte-identical (`harness-api.ts:1128-1141`)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7 - the session scope: `{root}/sessions/{session_id}/plugins` and
+//     `{root}/sessions/{session_id}/plugins/{plugin_id}`
+//
+// C3's reason for existing. R4 of the TypeScript contract gave each CONVERSATION its own plugin
+// settings store (`sessions.ts:864-876` + `:3447`, seeded from the process store at creation and
+// restored from the session record), and three routes to read and move it. The catalogue stays
+// shared with the two global routes - rows, descriptors, defaults, validation sentences - so what
+// these tests can legitimately pin is everything AROUND the shared part: which counter moves, which
+// document member lands, which scope does NOT move, and the three session-flavoured refusals.
+// ---------------------------------------------------------------------------
+
+/// The smallest session body this build accepts: a card, and an endpoint it will never be asked to
+/// reach. No test in this section runs a turn, so the base url is a dead loopback - a plugin settings
+/// write has no idle gate (`api.ts:3189-3196`), and pinning that is the session-agent suite's job.
+async fn create_session(server: &TestServer, title: &str) -> String {
+    let created = Reply::send(
+        client()
+            .post(server.url(&format!("{MOUNT}/sessions")))
+            .json(&json!({
+                "title": title,
+                "harness": "instruct",
+                "settings": {
+                    "base_url": "http://127.0.0.1:1/v1",
+                    "api_key": "scope-test-key",
+                    "model": "mock/one"
+                }
+            })),
+    )
+    .await;
+
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "`{title}` creates: {}",
+        created.body
+    );
+
+    created.body["session"]["id"]
+        .as_str()
+        .expect("a created session reports its id")
+        .to_owned()
+}
+
+/// `GET {root}/sessions/{id}/plugins`, with an optional query string.
+async fn session_list(server: &TestServer, session: &str, query: &str) -> Reply {
+    let suffix = if query.is_empty() {
+        String::new()
+    } else {
+        format!("?{query}")
+    };
+
+    Reply::send(client().get(server.url(&format!("{MOUNT}/sessions/{session}/plugins{suffix}"))))
+        .await
+}
+
+/// `GET {root}/sessions/{id}/plugins/{plugin}`.
+async fn session_get(server: &TestServer, session: &str, plugin: &str) -> Reply {
+    Reply::send(client().get(server.url(&format!("{MOUNT}/sessions/{session}/plugins/{plugin}"))))
+        .await
+}
+
+/// `PATCH {root}/sessions/{id}/plugins/{plugin}` with the `{ settings }` envelope.
+async fn session_patch(server: &TestServer, session: &str, plugin: &str, settings: Value) -> Reply {
+    session_patch_body(server, session, plugin, json!({ "settings": settings })).await
+}
+
+/// `PATCH {root}/sessions/{id}/plugins/{plugin}` with a WHOLE body document, so a missing or extra
+/// top-level field is reachable.
+async fn session_patch_body(
+    server: &TestServer,
+    session: &str,
+    plugin: &str,
+    body: Value,
+) -> Reply {
+    Reply::send(
+        client()
+            .patch(server.url(&format!("{MOUNT}/sessions/{session}/plugins/{plugin}")))
+            .json(&body),
+    )
+    .await
+}
+
+/// The EFFECTIVE map one row of this session's page reports. `plugin` is the catalogue index, which
+/// is stable because the catalogue is this build's, in scan order.
+async fn session_values(server: &TestServer, session: &str, plugin: usize) -> Value {
+    session_list(server, session, "").await.body["items"][plugin]["values"].clone()
+}
+
+/// The `pluginSettings` slot one session record carries, read from DISK. `Value::Null` spells the
+/// ABSENT case, which is the shape of a conversation that never edited anything.
+fn session_slot(root: &Root, session: &str) -> Value {
+    session_record(root, session)
+        .and_then(|record| record.get("pluginSettings").cloned())
+        .unwrap_or(Value::Null)
+}
+
+/// One session's durable record, out of the whole-document checkpoint (`persistence.rs`
+/// `HARNESS_SESSIONS_DIR`/`state.json`: sessions are an ARRAY in `state.json`, not one file each).
+fn session_record(root: &Root, session: &str) -> Option<Value> {
+    root.state()["sessions"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .find(|entry| entry["id"].as_str() == Some(session))
+        .cloned()
+}
+
+/// The durable record's member ORDER, which is how an ADDITIVE slot is reviewed: a reader must see
+/// the new member between the two it landed between, not appended past `core`.
+fn session_record_keys(root: &Root, session: &str) -> Vec<String> {
+    session_record(root, session)
+        .and_then(|record| {
+            record
+                .as_object()
+                .map(|entry| entry.keys().cloned().collect())
+        })
+        .unwrap_or_default()
+}
+
+/// One row's `settings` entries reduced to the display projection: the key, and the two contract
+/// members the pane reads. An absent member reads `null` HERE only - the absence itself is pinned by
+/// the key-order assertion in the same test - so a 12-row table stays readable.
+fn display_projection(row: &Value) -> Vec<Value> {
+    row["settings"]
+        .as_array()
+        .expect("a settings array")
+        .iter()
+        .map(|entry| {
+            json!({
+                "key": entry["key"],
+                "group": entry.get("group"),
+                "parentKey": entry.get("parentKey"),
+            })
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_fresh_session_answers_the_template_rows_and_starts_its_own_counter_at_zero() {
+    let root = Root::new("session-list");
+    let server = TestServer::start(&root).await;
+    let session = create_session(&server, "fresh").await;
+
+    let page = session_list(&server, &session, "").await;
+
+    assert_eq!(page.status, StatusCode::OK);
+
+    // THE ONE HEADER DIFFERENCE between the two scopes: this page hands `json()` its revision argument
+    // (`api.ts:3169`), so the figure rides the header AS WELL AS the body; the global list hands it two
+    // arguments (`api.ts:1988-1991`) and stamps nothing. Both rules are pinned here because the
+    // difference is the thing a pane uses to decide whether THIS conversation's rows are stale.
+    assert_eq!(page.header(&REVISION_HEADER).as_deref(), Some("0"));
+
+    // The same five page members as the global page (`pageMeta`, `api.ts:3157-3160`).
+    let mut keys: Vec<&String> = page
+        .body
+        .as_object()
+        .expect("a page object")
+        .keys()
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["items", "limit", "next_cursor", "observed_at", "revision"]
+    );
+
+    // Untouched: this session's counter is 0, and it is THIS session's counter - the template's
+    // counter is a different number the moment they diverge (`api.ts:3116-3131`).
+    assert_eq!(page.body["revision"], 0);
+    assert_eq!(page.body["limit"], 3);
+    assert_eq!(page.body["next_cursor"], Value::Null);
+    assert!(page.body["observed_at"].is_u64());
+    assert_eq!(page_names(&page.body), CATALOGUE);
+
+    // THE ANTI-DRIFT PIN: an untouched conversation answers the template's rows byte for byte,
+    // including `system_prompt` and the display metadata. The catalogue is not session state
+    // (`api.ts:3128-3130`), so a session scope that grew its own second catalogue is a bug, and this
+    // is the assertion that says so in one line.
+    let template = list(&server, "").await;
+    assert_eq!(
+        page.body["items"], template.body["items"],
+        "the session scope must not reshape a row"
+    );
+    assert_eq!(
+        page.body["items"][1]["system_prompt"],
+        COMPACTION_SYSTEM_PROMPT
+    );
+    assert_eq!(
+        page.body["items"][1]["values"],
+        compaction_values(json!(200_000)),
+        "a fresh conversation is at the declared defaults"
+    );
+
+    // Filter and paging are the global route's rules, applied to this session's copy
+    // (`api.ts:3141-3156`): the haystack and the effective-`limit` echo are shared helpers.
+    let filtered = session_list(&server, &session, "q=trimmer").await;
+    assert_eq!(
+        page_names(&filtered.body),
+        vec!["context-trimmer".to_owned()]
+    );
+    assert_eq!(filtered.body["limit"], 1);
+    assert_eq!(filtered.body["next_cursor"], Value::Null);
+
+    let first_two = session_list(&server, &session, "limit=2").await;
+    assert_eq!(
+        page_names(&first_two.body),
+        vec!["async-ping".to_owned(), "context-compaction".to_owned()]
+    );
+    let cursor = first_two.body["next_cursor"]
+        .as_str()
+        .expect("a cursor past a short first page")
+        .to_owned();
+    let second_page = session_list(&server, &session, &format!("limit=2&cursor={cursor}")).await;
+    assert_eq!(
+        page_names(&second_page.body),
+        vec!["context-trimmer".to_owned()]
+    );
+    assert_eq!(second_page.body["next_cursor"], Value::Null);
+
+    // The paging guard is the shared one, but it runs AFTER the session identity check, in both
+    // directions (`api.ts:3134`): an unusable `limit` on a conversation that exists is still a 400,
+    // and on one that does not it is still a 404.
+    let bad_limit = session_list(&server, &session, "limit=o").await;
+    assert_eq!(bad_limit.status, StatusCode::BAD_REQUEST);
+    assert_eq!(bad_limit.message(), LIMIT_MESSAGE);
+
+    let ghost_limit = session_list(&server, "ghost", "limit=o").await;
+    assert_eq!(
+        ghost_limit.status,
+        StatusCode::NOT_FOUND,
+        "identity outranks a malformed query parameter"
+    );
+    assert_eq!(ghost_limit.message(), "Unknown session \"ghost\".");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_session_patch_moves_that_session_and_no_other_scope() {
+    let root = Root::new("session-scope");
+    let server = TestServer::start(&root).await;
+    let first = create_session(&server, "first").await;
+    let second = create_session(&server, "second").await;
+
+    let patched = session_patch(
+        &server,
+        &first,
+        "context-compaction",
+        json!({ "enabled": false, "contextLimit": 4000 }),
+    )
+    .await;
+
+    assert_eq!(patched.status, StatusCode::OK);
+    assert_eq!(
+        patched.header(&REVISION_HEADER).as_deref(),
+        Some("1"),
+        "one bump per ACCEPTED patch, on THIS session's counter"
+    );
+    assert_eq!(patched.body["plugin"]["name"], "context-compaction");
+    assert_eq!(
+        patched.body["plugin"]["enabled"],
+        json!(false),
+        "the reserved `enabled` key is a row member, not only a value"
+    );
+    assert_eq!(
+        patched.body["plugin"]["values"],
+        json!({
+            "contextLimit": 4000,
+            "modelLimits": "{}",
+            "enabled": false,
+            "minTokens": 200,
+            "safetyTurns": 6,
+            "mode": "summarize",
+        }),
+        "the answer is the WHOLE row with this session's values, as it is on the global route"
+    );
+
+    let mine = session_list(&server, &first, "").await;
+    assert_eq!(mine.body["revision"], 1);
+    assert_eq!(mine.header(&REVISION_HEADER).as_deref(), Some("1"));
+
+    let sibling = session_list(&server, &second, "").await;
+    assert_eq!(
+        sibling.body["revision"], 0,
+        "another conversation's counter is untouched by this write"
+    );
+    assert_eq!(sibling.header(&REVISION_HEADER).as_deref(), Some("0"));
+    assert_eq!(
+        sibling.body["items"][1]["values"],
+        compaction_values(json!(200_000)),
+        "and another conversation keeps the value it was created with"
+    );
+
+    // The template: untouched in value, in counter, and in the header rule that distinguishes it.
+    let template = list(&server, "").await;
+    assert_eq!(
+        template.body["revision"], 0,
+        "a session edit never moves the template's counter"
+    );
+    assert!(
+        template.header(&REVISION_HEADER).is_none(),
+        "and the global list still stamps no `X-Harness-Revision`"
+    );
+    assert_eq!(
+        template.body["items"][1]["values"],
+        compaction_values(json!(200_000))
+    );
+    assert_eq!(
+        saved_overrides(&root),
+        Value::Null,
+        "the harness document gains no `pluginSettings` member from a session write"
+    );
+
+    // The sibling editing a different plugin has its own counter from zero, and moves nothing the
+    // first conversation can see.
+    let trimmed = session_patch(
+        &server,
+        &second,
+        "context-trimmer",
+        json!({ "dropDuplicateCalls": true }),
+    )
+    .await;
+    assert_eq!(trimmed.status, StatusCode::OK);
+    assert_eq!(
+        trimmed.header(&REVISION_HEADER).as_deref(),
+        Some("1"),
+        "the sibling's counter starts at 0, so a shared process counter would say otherwise"
+    );
+
+    let first_trimmer = session_get(&server, &first, "context-trimmer").await;
+    assert_eq!(
+        first_trimmer.body["plugin"]["values"]["dropDuplicateCalls"],
+        json!(false)
+    );
+    assert_eq!(
+        first_trimmer.header(&REVISION_HEADER).as_deref(),
+        Some("1"),
+        "reading never moves the counter the route stamps"
+    );
+
+    let template_write = patch_body(&server, "context-compaction", json!({})).await;
+    assert_eq!(
+        template_write.status,
+        StatusCode::BAD_REQUEST,
+        "the global route is still there, and a session write did not change how it answers"
+    );
+    assert_eq!(
+        template_write.message(),
+        "A plugin settings patch requires a \"settings\" object.",
+        "the template's own write path answers its own sentence for the same body"
+    );
+
+    // A plugin settings write does not touch the SESSION resource: `updateSessionPluginSettings`
+    // (`sessions.ts:2702-2712`) updates the store and persists; it neither bumps `record.revision`
+    // nor touches the conversation's status, because no structural registration moved.
+    let read = Reply::send(client().get(server.url(&format!("{MOUNT}/sessions/{first}")))).await;
+    assert_eq!(
+        read.body["session"]["revision"], 1,
+        "creation is the only write these tests moved the session resource with"
+    );
+
+    // Durable: each record carries its OWN delta.
+    assert_eq!(
+        session_slot(&root, &first),
+        json!({ "context-compaction": { "contextLimit": 4000, "enabled": false } }),
+        "the session record carries overrides only, exactly like the harness document does"
+    );
+    assert_eq!(
+        session_slot(&root, &second),
+        json!({ "context-trimmer": { "dropDuplicateCalls": true } }),
+        "and one session's slot never picks up another's"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_session_created_after_a_template_edit_is_born_with_the_edited_values() {
+    let root = Root::new("session-seed");
+    let server = TestServer::start(&root).await;
+
+    // A conversation that exists BEFORE the template moves.
+    let before = create_session(&server, "before-edit").await;
+
+    let edited = patch_settings(
+        &server,
+        "context-compaction",
+        json!({ "contextLimit": 150_000 }),
+    )
+    .await;
+    assert_eq!(edited.status, StatusCode::OK);
+
+    // ... and one created AFTER it.
+    let after = create_session(&server, "after-edit").await;
+
+    // R4's whole point, pinned in two lines: a template edit reaches the sessions created after it and
+    // NOT the ones that already exist (`sessions.ts:2656-2660`).
+    assert_eq!(
+        session_values(&server, &before, 1).await,
+        compaction_values(json!(200_000)),
+        "an existing conversation is not retro-moved by a template edit"
+    );
+
+    let seeded = session_list(&server, &after, "").await;
+    assert_eq!(
+        seeded.body["items"][1]["values"],
+        compaction_values(json!(150_000)),
+        "a new conversation starts from the template's values at the moment it was created"
+    );
+    assert_eq!(
+        seeded.body["revision"], 0,
+        "the copy-down is not a PATCH, so the new counter starts at zero"
+    );
+    assert_eq!(seeded.header(&REVISION_HEADER).as_deref(), Some("0"));
+
+    // The seeded copy becomes this conversation's OWN durable copy: one more key and the record
+    // restates the seed beside it, which is what frees the session from the template from here on.
+    let moved = session_patch(
+        &server,
+        &after,
+        "context-compaction",
+        json!({ "mode": "exclude" }),
+    )
+    .await;
+    assert_eq!(moved.status, StatusCode::OK);
+    assert_eq!(
+        session_slot(&root, &after),
+        json!({ "context-compaction": { "contextLimit": 150_000, "mode": "exclude" } }),
+        "the seeded value is restated in the session's own record"
+    );
+    assert_eq!(
+        session_slot(&root, &before),
+        Value::Null,
+        "a conversation that edited nothing carries no `pluginSettings` member at all"
+    );
+
+    // The template moves AGAIN, then the process restarts. Each conversation restores from its own
+    // slot: the seeded one keeps 150000, the untouched one keeps the declared default, and only the
+    // template itself reports 100000. This is the drift a shared store would produce, pinned shut.
+    let again = patch_settings(
+        &server,
+        "context-compaction",
+        json!({ "contextLimit": 100_000 }),
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::OK);
+
+    server.stop().await;
+    runtime::evict_runtime(&root.path);
+    let restarted = TestServer::start(&root).await;
+
+    let restored = session_list(&restarted, &after, "").await;
+    assert_eq!(
+        restored.body["items"][1]["values"],
+        json!({
+            "contextLimit": 150_000,
+            "modelLimits": "{}",
+            "enabled": true,
+            "minTokens": 200,
+            "safetyTurns": 6,
+            "mode": "exclude",
+        }),
+        "a restored conversation reads its own slot, not the template's newer value"
+    );
+    assert_eq!(
+        restored.body["revision"], 0,
+        "the per-session counter is epoch-local like the process one"
+    );
+    assert_eq!(restored.header(&REVISION_HEADER).as_deref(), Some("0"));
+    assert_eq!(
+        session_values(&restarted, &before, 1).await,
+        compaction_values(json!(200_000))
+    );
+
+    let template = list(&restarted, "").await;
+    assert_eq!(
+        template.body["items"][1]["values"],
+        compaction_values(json!(100_000))
+    );
+    assert_eq!(
+        saved_overrides(&root),
+        json!({ "context-compaction": { "contextLimit": 100_000 } }),
+        "the two scopes stay two separate members of the same document"
+    );
+
+    restarted.stop().await;
+}
+
+#[tokio::test]
+async fn a_session_plugin_read_answers_one_row_with_this_sessions_values() {
+    let root = Root::new("session-member");
+    let server = TestServer::start(&root).await;
+    let session = create_session(&server, "member").await;
+
+    let row = session_get(&server, &session, "context-compaction").await;
+
+    assert_eq!(row.status, StatusCode::OK);
+    assert_eq!(row.header(&REVISION_HEADER).as_deref(), Some("0"));
+
+    // The envelope is the global route's `PluginDetailResponse` - one `plugin` member - so the pane
+    // parses ONE shape for both scopes (`api.ts:3184`).
+    assert_eq!(
+        row.body
+            .as_object()
+            .expect("an envelope")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["plugin"]
+    );
+    assert_eq!(row.body["plugin"]["name"], "context-compaction");
+    assert_eq!(
+        row.body["plugin"]["values"],
+        compaction_values(json!(200_000))
+    );
+    assert_eq!(
+        row.body["plugin"]["system_prompt"],
+        COMPACTION_SYSTEM_PROMPT
+    );
+
+    // The EMITTED row order, not a sorted view: `system_prompt` rides right after `description`
+    // (`harness-api.ts:1128-1141`, YAML `PluginSummary`), which is the position the details pane opens
+    // with. `serde_json` writes fields in declaration order, so this pins the bytes.
+    assert_eq!(
+        row.body["plugin"]
+            .as_object()
+            .expect("a row")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec![
+            "name",
+            "title",
+            "description",
+            "system_prompt",
+            "version",
+            "tags",
+            "hooks",
+            "builtin",
+            "enabled",
+            "settings",
+            "values"
+        ]
+    );
+
+    // The two members that only exist on a plugin that prompts: async-ping declares no
+    // `systemPrompt`, so the key is ABSENT - never `null` - exactly like a plugin that declares no
+    // description on any other row.
+    let ping = session_get(&server, &session, "async-ping").await;
+    assert!(
+        ping.body["plugin"]
+            .as_object()
+            .unwrap()
+            .get("system_prompt")
+            .is_none()
+    );
+
+    // async-ping also shows the reserved switch's two homes: `enabled` is a REQUIRED row member read
+    // from the store, while `values` is the DECLARED projection - so the write lands, the row flips,
+    // and `values` still reports only the one key the plugin declares.
+    let flipped = session_patch(&server, &session, "async-ping", json!({ "enabled": false })).await;
+    assert_eq!(flipped.status, StatusCode::OK);
+    assert_eq!(flipped.body["plugin"]["enabled"], json!(false));
+    assert_eq!(
+        flipped.body["plugin"]["values"],
+        json!({ "intervalMs": 600_000 }),
+        "`values` is declared-only (`plugins.ts` `valuesOf`), so the framework key is not in it"
+    );
+    assert_eq!(
+        session_slot(&root, &session),
+        json!({ "async-ping": { "enabled": false } }),
+        "while the RAW override is stored, because the provider must see a switch no row reports"
+    );
+
+    let reread = session_get(&server, &session, "async-ping").await;
+    assert_eq!(reread.body["plugin"]["enabled"], json!(false));
+    assert_eq!(
+        reread.body["plugin"]["values"],
+        json!({ "intervalMs": 600_000 }),
+        "and reading it back does not turn the override into a declared value"
+    );
+
+    // The template's own row is the process store's answer, and this write never reached it.
+    let template = list(&server, "").await;
+    assert_eq!(template.body["items"][0]["enabled"], json!(true));
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn every_session_plugin_refusal_says_what_was_wrong_and_changes_nothing() {
+    let root = Root::new("session-refusals");
+    let server = TestServer::start(&root).await;
+    let session = create_session(&server, "refusals").await;
+
+    // Every sentence below is the one the equivalent GLOBAL route answers, verbatim, because the
+    // session write reuses `settings_patch` and the store's own validator (`api.ts:3197-3231`);
+    // nothing in the session scope rewords them, and that is what the pane's inline errors depend on.
+    for (plugin, label, body, message) in [
+        (
+            "context-compaction",
+            "no settings field",
+            json!({}),
+            "A plugin settings patch requires a \"settings\" object.",
+        ),
+        (
+            "context-compaction",
+            "settings null",
+            json!({ "settings": null }),
+            "A plugin settings patch must change at least one setting.",
+        ),
+        (
+            "context-compaction",
+            "settings empty",
+            json!({ "settings": {} }),
+            "A plugin settings patch must change at least one setting.",
+        ),
+        (
+            "context-compaction",
+            "settings a number",
+            json!({ "settings": 5 }),
+            "A plugin settings patch must change at least one setting.",
+        ),
+        (
+            // A STRING spreads into its indices, which is what the global route's own spread test
+            // pins (`a_non_object_settings_block_produces_the_sentence_its_spread_produces`) - the
+            // session scope inherits it rather than inventing a guard.
+            "context-compaction",
+            "settings a string",
+            json!({ "settings": "enabled=true" }),
+            "Unknown setting \"0\" for plugin \"context-compaction\". Allowed settings: contextLimit, modelLimits, enabled, minTokens, safetyTurns, mode.",
+        ),
+        (
+            "context-compaction",
+            "an extra body field",
+            json!({ "enabled": true }),
+            "Unknown field \"enabled\". Allowed fields: settings.",
+        ),
+        (
+            "context-compaction",
+            "an unknown key",
+            json!({ "settings": { "nope": true } }),
+            "Unknown setting \"nope\" for plugin \"context-compaction\". Allowed settings: contextLimit, modelLimits, enabled, minTokens, safetyTurns, mode.",
+        ),
+        (
+            // The allow-list APPENDS the framework's reserved key for a plugin that never declares it,
+            // so `enabled` is nameable in the sentence the operator reads.
+            "async-ping",
+            "an unknown key on a plugin without an enabled setting",
+            json!({ "settings": { "nope": true } }),
+            "Unknown setting \"nope\" for plugin \"async-ping\". Allowed settings: intervalMs, enabled.",
+        ),
+        (
+            "context-compaction",
+            "a value below the declared floor",
+            json!({ "settings": { "contextLimit": 3 } }),
+            "\"contextLimit\" of plugin \"context-compaction\" must be at least 1000; 3 was submitted.",
+        ),
+        (
+            "context-compaction",
+            "a value of the wrong declared type",
+            json!({ "settings": { "modelLimits": 123 } }),
+            "\"modelLimits\" of plugin \"context-compaction\" must be a string (it is declared \"string\").",
+        ),
+        (
+            "context-trimmer",
+            "a trimmer key of the wrong declared type",
+            json!({ "settings": { "invalidOutcomes": 123 } }),
+            "\"invalidOutcomes\" of plugin \"context-trimmer\" must be a string (it is declared \"string\").",
+        ),
+    ] {
+        let refused = session_patch_body(&server, &session, plugin, body).await;
+
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{label}");
+        assert_eq!(refused.message(), message, "{label}");
+        assert!(refused.header(&REVISION_HEADER).is_none(), "{label}");
+    }
+
+    // Two 404s with DIFFERENT sentences, and the split is deliberate (`api.ts:3182` vs
+    // `plugins.ts`'s store error): a GET for a plugin this build does not ship names the SESSION,
+    // because the caller's question was about this conversation.
+    let missing = session_get(&server, &session, "nope").await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        missing.message(),
+        format!("Unknown plugin \"nope\" in session \"{session}\".")
+    );
+
+    // A PATCH for one is answered by the CATALOGUE, because the store - not the conversation - is what
+    // refuses, and it lists what it ships. `sessions.ts:2693-2696`: validation before mutation.
+    let missing_write = session_patch(&server, &session, "nope", json!({ "enabled": true })).await;
+    assert_eq!(missing_write.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        missing_write.message(),
+        "Unknown plugin \"nope\". This build ships: async-ping, context-compaction, context-trimmer."
+    );
+
+    // An unknown SESSION is a 404 on both routes, and on both it is the FIRST thing checked - before
+    // the plugin id, before the body, before a query parameter (`api.ts:3134` / `:3173` / `:3197`).
+    for (label, reply) in [
+        ("list", session_list(&server, "ghost", "").await),
+        (
+            "member",
+            session_get(&server, "ghost", "context-compaction").await,
+        ),
+        (
+            "write",
+            session_patch(
+                &server,
+                "ghost",
+                "context-compaction",
+                json!({ "enabled": false }),
+            )
+            .await,
+        ),
+    ] {
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{label}");
+        assert_eq!(reply.message(), "Unknown session \"ghost\".", "{label}");
+    }
+
+    // NOTHING MOVED: the store refuses before it mutates, so the counters, the rows, the session
+    // record and the template are all exactly as they were.
+    let page = session_list(&server, &session, "").await;
+    assert_eq!(
+        page.body["revision"], 0,
+        "no refusal bumped the session counter"
+    );
+    assert_eq!(page.header(&REVISION_HEADER).as_deref(), Some("0"));
+    assert_eq!(
+        page.body["items"][1]["values"],
+        compaction_values(json!(200_000))
+    );
+    assert_eq!(
+        session_slot(&root, &session),
+        Value::Null,
+        "and no refusal wrote a document member"
+    );
+
+    let template = list(&server, "").await;
+    assert_eq!(template.body["revision"], 0, "nor the template's");
+    assert_eq!(saved_overrides(&root), Value::Null);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_session_plugin_write_is_durable_before_the_answer_and_survives_a_restart() {
+    let root = Root::new("session-durable");
+    let first = TestServer::start(&root).await;
+    let session = create_session(&first, "durable").await;
+    let untouched = create_session(&first, "untouched").await;
+
+    let patched = session_patch(
+        &first,
+        &session,
+        "context-compaction",
+        json!({ "contextLimit": 4000 }),
+    )
+    .await;
+
+    assert_eq!(patched.status, StatusCode::OK);
+
+    // DURABLE BEFORE THE ANSWER, read from the BYTES rather than from a second request: a 200 here is a
+    // receipt that the document carrying the value is already on disk (`sessions.ts:2702-2712`,
+    // `persistOrThrow` before the return).
+    assert_eq!(
+        session_slot(&root, &session),
+        json!({ "context-compaction": { "contextLimit": 4000 } })
+    );
+    assert!(
+        root.state().get("pluginSettings").is_none(),
+        "the slot is a member of the SESSION record; the harness-level slot stays absent"
+    );
+    assert_eq!(
+        session_slot(&root, &untouched),
+        Value::Null,
+        "and a conversation that changed nothing keeps the record shape it had"
+    );
+
+    // The ADDITIVE slot's position in the record, pinned because a durable shape is reviewed by where
+    // a new member lands: `pluginSettings` arrives after `threadSequence` and before `core`, which is
+    // `persistence.rs`'s `HarnessSessionRecord` field order.
+    assert_eq!(
+        session_record_keys(&root, &session),
+        vec![
+            "id",
+            "harness",
+            "preset",
+            "definition",
+            "settings",
+            "title",
+            "status",
+            "createdAt",
+            "updatedAt",
+            "turns",
+            "queue",
+            "threadSequence",
+            "pluginSettings",
+            "core"
+        ]
+    );
+
+    first.stop().await;
+
+    // BOOT TWO: the value is read back before the first request, and the counter restarts.
+    runtime::evict_runtime(&root.path);
+    let second = TestServer::start(&root).await;
+
+    let page = session_list(&second, &session, "").await;
+    assert_eq!(
+        page.status,
+        StatusCode::OK,
+        "a restored conversation answers its own plugin scope"
+    );
+    assert_eq!(
+        page.body["revision"], 0,
+        "the per-session counter is epoch-local, so a restart does not inherit it"
+    );
+    assert_eq!(page.header(&REVISION_HEADER).as_deref(), Some("0"));
+    assert_eq!(
+        page.body["items"][1]["values"],
+        compaction_values(json!(4000)),
+        "while the VALUE does survive it"
+    );
+
+    let sibling = session_list(&second, &untouched, "").await;
+    assert_eq!(
+        sibling.status,
+        StatusCode::OK,
+        "both conversations come back"
+    );
+    assert_eq!(
+        sibling.body["items"][1]["values"],
+        compaction_values(json!(200_000))
+    );
+
+    // The restored store IS the live one: an edit after the restart moves the same map, the document
+    // follows it, and the slot restates the whole delta - the restored half and the new half together.
+    let edited = session_patch(
+        &second,
+        &session,
+        "context-compaction",
+        json!({ "mode": "exclude" }),
+    )
+    .await;
+    assert_eq!(edited.status, StatusCode::OK);
+    assert_eq!(edited.header(&REVISION_HEADER).as_deref(), Some("1"));
+    assert_eq!(
+        edited.body["plugin"]["values"],
+        json!({
+            "contextLimit": 4000,
+            "modelLimits": "{}",
+            "enabled": true,
+            "minTokens": 200,
+            "safetyTurns": 6,
+            "mode": "exclude",
+        })
+    );
+    assert_eq!(
+        session_slot(&root, &session),
+        json!({ "context-compaction": { "contextLimit": 4000, "mode": "exclude" } }),
+        "the record is rewritten whole, not patched against the template"
+    );
+
+    second.stop().await;
+}
+
+#[tokio::test]
+async fn the_session_plugin_paths_answer_405_naming_the_verbs_they_take() {
+    let root = Root::new("session-verbs");
+    let server = TestServer::start(&root).await;
+    let session = create_session(&server, "verbs").await;
+
+    let list_path = format!("{MOUNT}/sessions/{session}/plugins");
+    let member_path = format!("{list_path}/context-compaction");
+
+    // The collection is GET-only, exactly like `{root}/plugins`: there is no POST-create for a plugin
+    // (loading is auto-scanned) and no DELETE-reset.
+    for (method, reply) in [
+        (
+            "POST",
+            Reply::send(client().post(server.url(&list_path))).await,
+        ),
+        (
+            "DELETE",
+            Reply::send(client().delete(server.url(&list_path))).await,
+        ),
+    ] {
+        assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        assert_eq!(
+            reply.message(),
+            format!("Use GET for {list_path}."),
+            "{method}"
+        );
+    }
+
+    // The member path declares GET and PATCH, so the 405 sentence names BOTH - the one shape the
+    // router prints for a two-verb path (`tests/http_host.rs`'s verb-list rule).
+    for (method, reply) in [
+        (
+            "POST",
+            Reply::send(client().post(server.url(&member_path))).await,
+        ),
+        (
+            "PUT",
+            Reply::send(client().put(server.url(&member_path))).await,
+        ),
+        (
+            "DELETE",
+            Reply::send(client().delete(server.url(&member_path))).await,
+        ),
+    ] {
+        assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        assert_eq!(
+            reply.message(),
+            format!("Use GET, PATCH for {member_path}."),
+            "{method}"
+        );
+    }
+
+    // A 405 never parses the body, so a verb that does not exist still answers the verb sentence even
+    // with an unparsable one attached.
+    let with_body = Reply::send(
+        client()
+            .delete(server.url(&member_path))
+            .header("content-type", "application/json")
+            .body("[not json"),
+    )
+    .await;
+    assert_eq!(with_body.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        with_body.message(),
+        format!("Use GET, PATCH for {member_path}.")
+    );
+
+    // A path under the session that the table does not name at all stays a 404, not a 405.
+    let unknown = Reply::send(client().get(server.url(&format!("{list_path}/x/y")))).await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        unknown.message(),
+        format!("Unknown API route: GET {list_path}/x/y")
+    );
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// 8 - the DISPLAY metadata a row projects (C1's DTO members, populated)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_display_metadata_files_each_setting_row_under_its_section() {
+    let root = Root::new("display");
+    let server = TestServer::start(&root).await;
+
+    let page = list(&server, "").await;
+    assert_eq!(page.status, StatusCode::OK);
+
+    // THE TRIMMER: the only plugin in this catalogue that files its rows into sections. The table is
+    // upstream's, in DECLARATION order (`context-trimmer.plugin.ts:529-749`), and every parent key
+    // names a boolean row that this catalogue actually SHIPS - a `parentKey` naming an absent row
+    // would hide its child in the pane forever, which is why the two parents upstream names
+    // (`trimInvalidTools`, `trimThoughts`) are remapped to this build's toggles.
+    assert_eq!(
+        display_projection(&page.body["items"][2]),
+        vec![
+            json!({ "key": "enabled", "group": null, "parentKey": null }),
+            json!({
+                "key": "dropSupersededToolCalls",
+                "group": { "id": "superseded-tools", "title": "Superseded Tools" },
+                "parentKey": null,
+            }),
+            json!({
+                "key": "dropInvalidToolCallsOnceAnswered",
+                "group": { "id": "invalid-tools", "title": "Invalid Tools" },
+                "parentKey": null,
+            }),
+            json!({
+                "key": "invalidOutcomes",
+                "group": { "id": "invalid-tools", "title": "Invalid Tools" },
+                "parentKey": "dropInvalidToolCallsOnceAnswered",
+            }),
+            json!({
+                "key": "dropOldThoughts",
+                "group": { "id": "chain-of-thoughts", "title": "Chain of Thoughts" },
+                "parentKey": null,
+            }),
+            json!({
+                "key": "thoughtKeepUnits",
+                "group": { "id": "chain-of-thoughts", "title": "Chain of Thoughts" },
+                "parentKey": null,
+            }),
+            json!({
+                "key": "supersedeMatch",
+                "group": { "id": "superseded-tools", "title": "Superseded Tools" },
+                "parentKey": "dropSupersededToolCalls",
+            }),
+            json!({
+                "key": "dropDuplicateCalls",
+                "group": { "id": "duplicate-tools", "title": "Duplicate Tools" },
+                "parentKey": null,
+            }),
+            json!({
+                "key": "minTokens",
+                "group": { "id": "global-limits", "title": "Global Limits" },
+                "parentKey": null,
+            }),
+            json!({
+                "key": "minThoughtChars",
+                "group": { "id": "chain-of-thoughts", "title": "Chain of Thoughts" },
+                "parentKey": null,
+            }),
+            json!({
+                "key": "safetyUnits",
+                "group": { "id": "global-limits", "title": "Global Limits" },
+                "parentKey": null,
+            }),
+            json!({
+                "key": "maxUnits",
+                "group": { "id": "global-limits", "title": "Global Limits" },
+                "parentKey": null,
+            }),
+        ],
+        "every section id and title is one `PLUGIN_SETTING_GROUPS` can print"
+    );
+
+    // The EMITTED key order of a grouped row: the two display members ride at the END, right after
+    // `description`, in the contract's property order (`harness-api.ts:1096-1112`, YAML
+    // `PluginSetting`). `invalidOutcomes` is the entry that carries BOTH, so it is the one that pins
+    // the order; `min`/`max`/`step` presence is a different assertion (the row literals above).
+    assert_eq!(
+        page.body["items"][2]["settings"][3]
+            .as_object()
+            .expect("a grouped row")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec![
+            "key",
+            "label",
+            "type",
+            "default",
+            "description",
+            "group",
+            "parentKey"
+        ]
+    );
+
+    // THE COMPACTION rows carry NEITHER member - upstream declares no `group`/`parentKey` on this
+    // plugin at all, which the parity source confirms (`context-compaction.plugin.ts` has no
+    // `group:`/`parentKey:` anywhere in its settings array). Absent, not `null`: an entry with no
+    // display hint sends the same keys it did before C3.
+    let compaction_keys: Vec<Vec<&str>> = page.body["items"][1]["settings"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|entry| {
+            entry
+                .as_object()
+                .expect("an entry")
+                .keys()
+                .map(String::as_str)
+                .collect()
+        })
+        .collect();
+    for emitted in &compaction_keys {
+        assert!(
+            !emitted.contains(&"group") && !emitted.contains(&"parentKey"),
+            "a compaction row is ungrouped: {emitted:?}"
+        );
+    }
+    assert_eq!(
+        display_projection(&page.body["items"][1]),
+        vec![
+            json!({ "key": "contextLimit", "group": null, "parentKey": null }),
+            json!({ "key": "modelLimits", "group": null, "parentKey": null }),
+            json!({ "key": "enabled", "group": null, "parentKey": null }),
+            json!({ "key": "minTokens", "group": null, "parentKey": null }),
+            json!({ "key": "safetyTurns", "group": null, "parentKey": null }),
+            json!({ "key": "mode", "group": null, "parentKey": null }),
+        ],
+        "six declared rows, none filed under a section"
+    );
+    assert_eq!(
+        display_projection(&page.body["items"][0]),
+        vec![json!({ "key": "intervalMs", "group": null, "parentKey": null })]
+    );
+
+    // The session scope answers the SAME projection, because it is built from the same catalogue
+    // (`api.ts:3128-3130`) - a session pane that filed rows into different sections would be a bug.
+    let session = create_session(&server, "display").await;
+    let scoped = session_list(&server, &session, "").await;
+    assert_eq!(
+        display_projection(&scoped.body["items"][2]),
+        display_projection(&page.body["items"][2])
+    );
+
+    server.stop().await;
 }

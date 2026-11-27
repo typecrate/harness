@@ -1,10 +1,12 @@
 //! `{root}/sessions/{session_id}/agents**` - the per-session agent bindings.
 //!
-//! TypeScript origin: `src/server/api.ts` - `getSessionAgents` (`:2455-2468`), `findAgentBinding`
-//! (`:2470-2471`), `getSessionAgent` (`:2473-2482`), `assertDurableRoster` (`:2511-2525`),
-//! `patchSessionAgent` (`:2527-2599`), `postSessionAgent` (`:2601-2692`), `deleteSessionAgent`
-//! (`:2694-2731`), `patchSessionAgentInstruction` (`:2737-2768`) and `getSessionAgentInstruction`
-//! (`:2770-2835`).
+//! TypeScript origin: `src/server/api.ts` - `getSessionAgents` (`:3963-3977`), `findAgentBinding`
+//! (`:3978-3980`), `getSessionAgent` (`:3981-4018`), `assertDurableRoster` (`:4019-4034`),
+//! `patchSessionAgent` (`:4035-4175`), `postSessionAgent` (`:4176-4299`), `deleteSessionAgent`
+//! (`:4300-4342`), `patchSessionAgentInstruction` (`:4343-4375`) and `getSessionAgentInstruction`
+//! (`:4376-4448`). THE LINE NUMBERS IN THIS FILE WERE RE-DERIVED FROM THE CURRENT `api.ts` while the
+//! `prefix` write landed, because the ones it carried predated the U6/B3 route growth and no longer
+//! point at the handlers they name.
 //!
 //! THE PRECEDENCE LADDER THIS FILE ENFORCES (`api.ts:2621-2651`, restated at `:2698-2706`)
 //! ---------------------------------------------------------------------------------------
@@ -33,12 +35,28 @@ use crate::store::read::session_agent_rows_of;
 
 use super::sessions::{number_of, plain, require_session, session_of, store_of};
 
-/// The fields `POST .../agents` accepts (`api.ts:2607`) - a CLOSED body, which is what makes binding
-/// an existing trusted profile unable to inject code.
-const BIND_FIELDS: [&str; 5] = ["name", "profile", "model", "instruction", "role"];
+/// The fields `POST .../agents` accepts (`api.ts:4188` - `requireKnownFields(body, ['name', 'profile',
+/// 'model', 'instruction', 'rank', 'prefix'])`) - a CLOSED body, which is what makes binding an existing
+/// trusted profile unable to inject code.
+///
+/// THE OLD FIELD `role` IS NOT ON THIS LIST, and that is deliberate rather than an oversight: the
+/// contract's `CreateSessionAgentRequest` is these six members under `additionalProperties: false`
+/// (`harness-api.ts:1883-1942`), and `api.ts:4184-4186` states the rule out loud - "the OLD field `role`
+/// is not accepted at all - it lands in the unknown-field refusal below". So a legacy body does not get a
+/// quiet reinterpretation, it gets `Unknown field "role". Allowed fields: name, profile, model,
+/// instruction, rank, prefix.` (`tests/http_sessions.rs` pins both this list and that refusal).
+const BIND_FIELDS: [&str; 6] = ["name", "profile", "model", "instruction", "rank", "prefix"];
 
-/// The fields `PATCH .../agents/{agent_id}` accepts (`api.ts:2532`).
-const PATCH_FIELDS: [&str; 2] = ["model", "instruction"];
+/// The fields `PATCH .../agents/{agent_id}` accepts (`api.ts:4040` in the live route:
+/// `requireKnownFields(body, ['model', 'instruction', 'rank', 'prefix'])`).
+///
+/// ALL FOUR of TS's names now, `rank` included: the gap this comment used to describe was the wire row,
+/// not the route - [`crate::contract::SessionAgentBinding`] now carries the `rank` member
+/// `harness-api.ts:1770` requires, so the authority write has something to project and the field is
+/// accepted exactly as TypeScript accepts it. The refusal sentence this gate answers names these four
+/// in this order, and `tests/http_sessions.rs:2829` pins it verbatim (NOT `tests/http_host.rs`, which is
+/// where an earlier revision of this comment claimed the pin lived).
+const PATCH_FIELDS: [&str; 4] = ["model", "instruction", "rank", "prefix"];
 
 /// The fields `PATCH .../agents/{agent_id}/instruction` accepts (`api.ts:2742`).
 const INSTRUCTION_FIELDS: [&str; 1] = ["instruction"];
@@ -104,14 +122,16 @@ pub async fn post_session_agent(ctx: &mut Ctx) -> ApiResult {
         }
     }
 
-    // The role vocabulary is closed (`:2617-2619`).
-    if let Some(role) = body.get("role").filter(|role| !role.is_null())
-        && !matches!(role.as_str(), Some("primary") | Some("subagent"))
-    {
-        return Err(ApiError::bad_request(
-            "\"role\" must be \"primary\" or \"subagent\".",
-        ));
-    }
+    // THE RANK VOCABULARY, at the edge and BEFORE the durability gate — TS's precedence, restated at
+    // `api.ts:4199` ("Calling it HERE, before the durability and idle gates, keeps the established
+    // precedence: an invalid body answers 400 on ANY session, not 409 about a busy one"). The retired
+    // two-valued `role` this block replaced is gone with R2: a body that still sends one is refused by
+    // the closed-field gate above, so nothing here can quietly reinterpret it into a rank.
+    //
+    // AN OMITTED OR `null` RANK IS NOT AN ERROR: `harness-api.ts:1932-1937` states that arm as "asks for
+    // NO authority", and the row it answers reports the frozen definition's letter for the member, or the
+    // LOWEST letter when no map names it (`api-reads.ts:1564`, `rankOfMember`).
+    require_binding_rank(body.get("rank"))?;
 
     let name = body
         .get("name")
@@ -143,6 +163,21 @@ pub async fn post_session_agent(ctx: &mut Ctx) -> ApiResult {
         )));
     }
 
+    // U6 ON THE BIND BODY TOO: `prefix` is one of the six members the contract's
+    // `CreateSessionAgentRequest` carries (`harness-api.ts:1922-1931`), and TypeScript validates it at the
+    // edge with the ONE band validator before anything moves (`api.ts:4231-4249`, "a malformed array is a
+    // 400 on ANY session rather than a 409 about a scripted template"). The label is the bare `` `prefix` ``
+    // rather than TS's PATCH label `` `prefix.<agent>` `` for one reason: a bind has no member to name yet,
+    // and TS's own POST call passes no member (`api.ts:4238`, `requirePrefixTurns(body.prefix, 'prefix')`).
+    //
+    // A STATED `null` IS NOT A WRITE HERE, and that is a real difference from the PATCH: the bind's `null`
+    // arm asks for NOTHING of its own (`harness-api.ts:1927-1931`), while the PATCH's `null` restores the
+    // definition's band. `api.ts:4273-4276` spells the consequence - `bindingPrefix` stays `undefined` and
+    // the field is not forwarded at all - so the `null` is dropped from the payload below.
+    if let Some(prefix) = body.get("prefix").filter(|prefix| !prefix.is_null()) {
+        crate::registry::require_prefix_turns(prefix, "prefix", "")?;
+    }
+
     // Durability first, before the roster moves (`:2651`).
     assert_durable_roster(ctx, &session_id, "bind an agent")?;
 
@@ -150,6 +185,10 @@ pub async fn post_session_agent(ctx: &mut Ctx) -> ApiResult {
     // ones this route just validated.
     body.insert("name".to_owned(), Value::String(name.clone()));
     body.insert("profile".to_owned(), Value::String(profile));
+
+    if body.get("prefix").is_none_or(|prefix| prefix.is_null()) {
+        body.remove("prefix");
+    }
 
     let created = store_of(ctx)
         .create_session_agent(&session_id, &Value::Object(body))
@@ -188,7 +227,34 @@ pub async fn patch_session_agent(ctx: &mut Ctx) -> ApiResult {
         ));
     }
 
-    for field in PATCH_FIELDS {
+    // THE RANK HALF, validated HERE and before the band (`api.ts:4050-4058`: "one validator for the
+    // binding rank, at the HTTP edge for the same reason POST validates it here — an invalid body answers
+    // 400 before any store gate can turn it into a 409 about a busy or started session"). TS runs
+    // `validateBindingRank` and THEN the stated-but-no-authority check, which is why a malformed letter and
+    // a stated `null` answer two different sentences; both are reproduced verbatim by the two helpers.
+    let rank = require_patched_rank(body.get("rank"))?;
+
+    // U6: THE PRESET-HISTORY BAND, validated HERE rather than left to the store (`api.ts:4052-4077`).
+    // The reason is TS's, stated at that site: the same patch carries a model and an instruction half the
+    // store would already have written, so a band with a `tool` turn, a content block, or a 65th turn has
+    // to answer 400 naming the turn index BEFORE a busy-session gate can answer 409 about a body that was
+    // never valid. `null` is not validated here - TS skips it too (`:4061`), because it names no band: it
+    // is the undo, and the store resolves it to the frozen definition's own history.
+    //
+    // THE ORDER AHEAD OF THE OVERRIDE SHAPES IS LOAD-BEARING: TS validates the band at `:4060` and only
+    // then type-checks `instruction` at `:4095`, so a body that is wrong about BOTH answers about the band
+    // (`tests/http_sessions.rs` pins that precedence).
+    //
+    // THE ONE VALIDATOR, shared with the harness-definition write and with the store's own re-check, so
+    // PATCHing this band into a definition and into a session answers the same 400 either way, with only
+    // the `prefix.<agent>[<i>]` label distinguishing them (`crate::registry::require_prefix_turns`).
+    if let Some(prefix) = body.get("prefix")
+        && !prefix.is_null()
+    {
+        crate::registry::require_prefix_turns(prefix, "prefix", &agent_id)?;
+    }
+
+    for field in ["model", "instruction"] {
         if let Some(value) = body.get(field)
             && !value.is_null()
             && !value.is_string()
@@ -199,10 +265,41 @@ pub async fn patch_session_agent(ctx: &mut Ctx) -> ApiResult {
         }
     }
 
-    let payload = restore_payload(&body, &PATCH_FIELDS);
+    // THE DURABLE-ROSTER GATE, for the rank arm only, and only when a rank is actually stated
+    // (`api.ts:4103-4110`): "unlike a model/instruction override, a rank change rewrites the team a restart
+    // resolves, so it takes the same durable-roster gate as bind/detach: a scripted or injected template
+    // cannot honour the saved map, and answering 200 would be a lie the next boot takes back." A band or an
+    // override stays writable on every template, which is why this gate sits inside the rank arm and never
+    // ahead of the patch.
+    if rank.is_some() {
+        assert_durable_roster(ctx, &session_id, "change an agent rank")?;
+    }
+
+    // `restore_payload` re-attaches the RESTORE arms of the two OVERRIDES by rewriting a stated `null`
+    // into the blank string the store reads as "no override" (`:405-410` above). A band has no such
+    // string to borrow - `[]` is a real choice that reads back as `source: session`, while `null` reads
+    // back as `source: harness` - so `prefix` moves to the store VERBATIM and the store tells the two
+    // arms apart itself (`store::agents.rs`'s prefix write).
+    let mut payload = restore_payload(&body, &["model", "instruction"]);
+
+    // THE RANK MOVES AS THE LETTER THE ROUTE VALIDATED, not as the caller's JSON value: the validator proved
+    // it is one upper-case letter, and re-emitting `AgentRank::as_str` is what stops a body that spelled the
+    // letter some other way (or a `null`, already refused above) reaching the store's decoder.
+    if let Some(rank) = rank {
+        payload.insert("rank".to_owned(), Value::String(rank.as_str().to_owned()));
+    }
+
+    if let Some(prefix) = body.get("prefix") {
+        payload.insert("prefix".to_owned(), prefix.clone());
+    }
 
     let patched = store_of(ctx)
-        .update_session_agent(&session_id, &agent_id, &Value::Object(payload))
+        .update_session_agent(
+            &session_id,
+            &agent_id,
+            &Value::Object(payload),
+            crate::store::agents::AgentPatchRoute::Binding,
+        )
         .await?;
 
     let agent = patched.get("agent").cloned().unwrap_or(Value::Null);
@@ -295,7 +392,12 @@ pub async fn patch_session_agent_instruction(ctx: &mut Ctx) -> ApiResult {
     let payload = restore_payload(&body, &INSTRUCTION_FIELDS);
 
     store_of(ctx)
-        .update_session_agent(&session_id, &agent_id, &Value::Object(payload))
+        .update_session_agent(
+            &session_id,
+            &agent_id,
+            &Value::Object(payload),
+            crate::store::agents::AgentPatchRoute::Instruction,
+        )
         .await?;
 
     // The GET's document, with no body read this time - the PATCH's own body is already consumed, and
@@ -313,9 +415,81 @@ async fn instruction_document(ctx: &mut Ctx, session_id: &str, agent_id: &str) -
     plain(body)
 }
 
+/// `GET {root}/sessions/{session_id}/agents/{agent_id}/prefix` (`getSessionAgentPrefix`,
+/// `api.ts:4449-4510`): one member's PRESET HISTORY - the band it actually seeds, plus which layer
+/// wrote it.
+///
+/// WHY A DOCUMENT OF ITS OWN: a band is a LIST OF PROMPT-LENGTH STRINGS, so it stays out of the roster
+/// row (the same payload rule that keeps instruction text out of it) and is addressed per agent. The
+/// route is READ-ONLY by itself: the write is the session-agent PATCH's `prefix` field
+/// ([`patch_session_agent`], `api.ts:4128-4134`), and THIS route only projects the band the record
+/// carries - so a client editing a band and a client reading one never disagree about which call owns
+/// the change, and the `source` the read reports is decided by the write's three arms
+/// (band / `[]` / `null`).
+///
+/// `json(200, response)` with NO revision header (`api.ts:4510`), exactly like the instruction
+/// subresource: the body is a projection of state another route owns.
+pub async fn get_session_agent_prefix(ctx: &mut Ctx) -> ApiResult {
+    ctx.ignore_body().await;
+
+    let session_id = session_of(ctx);
+    let agent_id = ctx.param("agent_id").to_owned();
+
+    // The session-404-then-membership order is the store's, and it is TS's: `requireSession` runs
+    // before any roster question, so a request naming a session that never existed never learns which
+    // agents it does not have.
+    let response = store_of(ctx)
+        .session_agent_prefix(&session_id, &agent_id)
+        .await?;
+
+    plain(serde_json::to_value(response).unwrap_or(Value::Null))
+}
+
 // ---------------------------------------------------------------------------
 // The two route-side rules the store cannot see
 // ---------------------------------------------------------------------------
+
+/// `validateBindingRank` (`sessions.ts:1205-1222`), the ONE rank reader: `POST` calls it for the edge
+/// exactly as `api.ts:4200` does, and `PATCH` calls it through [`require_patched_rank`].
+///
+/// THE THREE ARMS ARE THE WHOLE FUNCTION, and TS's ordering of them is the contract's:
+/// - absent or `null` is `Ok(None)` — "ABSENT IS NOT AN ERROR: `undefined`/`null` means 'no authority
+///   requested' and returns `undefined`, leaving the caller to resolve it" (`sessions.ts:1199-1203`). On a
+///   bind the caller resolves it to the definition's letter or the lowest one; nothing here guesses.
+/// - one upper-case `A-Z` letter is `Ok(Some(letter))`, read through [`contract::agent_rank_of_text`] so
+///   this edge, the registry's rank map, and the kernel's own guard agree on what a rank IS.
+/// - anything else is the ONE refusal, and it never reinterprets the value: `'a'` is not `A`, `1` is not a
+///   letter, and the retired `primary` is not a rank either ("the validator NEVER reinterprets it as a
+///   rank, which is the whole point of not keeping a compat shim", `sessions.ts:1195-1198`).
+fn require_binding_rank(stated: Option<&Value>) -> Result<Option<contract::AgentRank>, ApiError> {
+    let Some(value) = stated.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+
+    match value.as_str().and_then(contract::agent_rank_of_text) {
+        Some(rank) => Ok(Some(rank)),
+        None => Err(ApiError::bad_request(contract::binding_rank_refusal())),
+    }
+}
+
+/// THE PATCH ARM, which is TS's two-step check at `api.ts:4051-4058` reproduced in TS's order:
+/// `validateBindingRank` first, THEN `if (body.rank !== undefined && rank === undefined)`.
+///
+/// The second step can only fire for a STATED `null`, and that is the point: a PATCH has no restore arm for
+/// `rank` — a letter is the only value that means anything — so a caller who writes `{"rank": null}` gets
+/// [`contract::rank_letter_refusal`] rather than the silent "no authority requested" a bind would accept.
+/// An absent key stays `Ok(None)`: "an omitted property is no change" (`harness-api.ts:1952`).
+fn require_patched_rank(stated: Option<&Value>) -> Result<Option<contract::AgentRank>, ApiError> {
+    let Some(value) = stated else {
+        return Ok(None);
+    };
+
+    if value.is_null() {
+        return Err(ApiError::bad_request(contract::rank_letter_refusal()));
+    }
+
+    require_binding_rank(Some(value))
+}
 
 /// `assertDurableRoster` (`api.ts:2511-2525`): the durability gate for the two MEMBERSHIP writes.
 ///

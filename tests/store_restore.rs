@@ -963,3 +963,285 @@ async fn the_provider_credential_is_never_persisted() {
         "a deployment without a key restores a keyless session"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The per-session `pluginSettings` slot: what a damaged or older one costs
+//
+// C3 added one additive member to the SESSION record (`HarnessSessionRecord::plugin_settings`,
+// `persistence.rs:840-844`), typed as an OPAQUE `Value` rather than the settings record on purpose:
+// the tolerant reader (`persistence::normalize_session_plugin_settings`, then
+// `PluginSettingsStore::restore`) is what decides what survives, so a hand-edited or older document
+// loses the SLOT and not every session in the document. A typed slot would fail serde for the whole
+// record, which is the difference between "one operator's stray edit" and "the deployment does not
+// boot".
+// ---------------------------------------------------------------------------
+
+/// A settings patch map, spelled as JSON so a call site reads like the request body it mirrors.
+fn patch_map(entries: Value) -> serde_json::Map<String, Value> {
+    entries
+        .as_object()
+        .expect("a settings patch is an object")
+        .clone()
+}
+
+/// This conversation's EFFECTIVE value for one declared key, off its own row.
+fn session_plugin_value(store: &Store, id: &str, plugin: &str, key: &str) -> Value {
+    store
+        .session_plugin_row(id, plugin)
+        .expect("the session exists")
+        .expect("the plugin ships")
+        .values
+        .get(key)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// Replaces ONE session record's `pluginSettings` member in the durable document and writes it back,
+/// which is how a test becomes the thing the next boot reads. Everything else in the document is the
+/// bytes the previous boot produced, so the case under test is the only variable.
+fn restamp_slot(fixture: &Fixture, store: &Store, id: &str, slot: Option<Value>) {
+    let mut database = persistence::read_harness_database_file(&fixture.document(store))
+        .expect("the document reads back");
+    let record = database
+        .sessions
+        .iter_mut()
+        .find(|record| record.id == id)
+        .expect("the session is in the document");
+
+    record.plugin_settings = slot;
+
+    persistence::write_harness_database(&fixture.directory, &database, "restamped-by-test")
+        .expect("the edited document is durable");
+}
+
+/// The `pluginSettings` member one session record carries on DISK, after the next boot wrote it.
+fn persisted_slot(store: &Store, id: &str) -> Option<Value> {
+    let path = store
+        .config()
+        .state_dir()
+        .join(persistence::HARNESS_DATABASE_FILE);
+
+    persistence::read_harness_database_file(&path)
+        .expect("the document is readable")
+        .sessions
+        .into_iter()
+        .find(|record| record.id == id)
+        .and_then(|record| record.plugin_settings)
+}
+
+#[tokio::test]
+async fn a_malformed_session_plugin_slot_costs_the_slot_and_nothing_else() {
+    let fixture = Fixture::new("plugin-slot");
+    let first = fixture.open(Vec::new(), "");
+    let id = session(&first, None).await;
+
+    first
+        .update_session_plugin_settings(
+            &id,
+            "context-compaction",
+            &patch_map(json!({ "mode": "exclude" })),
+        )
+        .expect("a conversation may set its own value");
+    first.save(&first.lock()).expect("the document is writable");
+    assert_eq!(
+        persisted_slot(&first, &id),
+        Some(json!({ "context-compaction": { "mode": "exclude" } })),
+        "the shape a C3 build writes, so the cases below start from a real document"
+    );
+
+    drop(first);
+
+    // Nine ways a slot goes wrong, and the one answer they all get: the session boots, the plugin is
+    // at its declared default, and the garbage is not resurrected by the next write. The first five
+    // are dropped by the document reader (`normalize_session_plugin_settings`: the block must be an
+    // object, a plugin's block must be an object, and only a finite number, a boolean or a string is
+    // a value); the last four are dropped by the store's own restore (`restore` walks the EFFECTIVE
+    // descriptor list and `check_value`s every entry), which is why a wrong type, an unknown plugin, an
+    // unknown key and an out-of-range value all land in the same place.
+    for (label, submitted) in [
+        ("a string", json!("context-compaction")),
+        ("an array", json!([{ "mode": "exclude" }])),
+        ("a number", json!(7)),
+        (
+            "a plugin block that is not an object",
+            json!({ "context-compaction": "exclude" }),
+        ),
+        (
+            "values that are not values",
+            json!({ "context-compaction": { "minTokens": null, "mode": { "any": "object" }, "contextLimit": [1] } }),
+        ),
+        (
+            "a value of the wrong declared type",
+            json!({ "context-compaction": { "contextLimit": "abc" } }),
+        ),
+        (
+            "a plugin this build does not ship",
+            json!({ "legacy-trimmer": { "enabled": true } }),
+        ),
+        (
+            "a key no plugin declares",
+            json!({ "context-compaction": { "nothingLikeThis": 1 } }),
+        ),
+        (
+            "a value past the declared bound",
+            json!({ "context-compaction": { "contextLimit": 1 } }),
+        ),
+    ] {
+        let editor = fixture.open(Vec::new(), "");
+        restamp_slot(&fixture, &editor, &id, Some(submitted));
+        drop(editor);
+
+        let booted = fixture.open(Vec::new(), "");
+
+        // The session is there, and so is every read the pane makes: tolerance here means the
+        // CONVERSATION still opens, which is the whole point of the opaque slot.
+        let read = booted
+            .get_session(&id)
+            .await
+            .unwrap_or_else(|error| panic!("{label}: the session must still load, got {error:?}"));
+        assert_eq!(read["session"]["id"], json!(id), "{label}");
+        assert_eq!(
+            booted
+                .session_plugin_revision(&id)
+                .expect("the session booted"),
+            0,
+            "{label}: a dropped slot is not a write, so the counter still starts at 0"
+        );
+        assert_eq!(
+            session_plugin_value(&booted, &id, "context-compaction", "mode"),
+            json!("summarize"),
+            "{label}"
+        );
+        assert_eq!(
+            session_plugin_value(&booted, &id, "context-compaction", "contextLimit"),
+            json!(200_000),
+            "{label}: the declared default, not the damaged override"
+        );
+        assert_eq!(
+            session_plugin_value(&booted, &id, "context-trimmer", "dropDuplicateCalls"),
+            json!(false),
+            "{label}"
+        );
+
+        // And the damaged half is GONE, not carried: the next write re-derives the member from the
+        // live store, so a stray key cannot outlive the restart that survived it.
+        booted
+            .update_session_plugin_settings(
+                &id,
+                "context-trimmer",
+                &patch_map(json!({ "dropDuplicateCalls": true })),
+            )
+            .expect("{label}: the restored store is writable");
+        booted
+            .save(&booted.lock())
+            .expect("the document is writable");
+        assert_eq!(
+            persisted_slot(&booted, &id),
+            Some(json!({ "context-trimmer": { "dropDuplicateCalls": true } })),
+            "{label}: the document keeps only what this boot actually holds"
+        );
+
+        drop(booted);
+    }
+}
+
+#[tokio::test]
+async fn a_record_without_the_plugin_slot_boots_empty_and_gains_it_on_the_first_write() {
+    let fixture = Fixture::new("plugin-slot-absent");
+    let first = fixture.open(Vec::new(), "");
+    let id = session(&first, None).await;
+    let sibling = session(&first, None).await;
+
+    first
+        .update_session_plugin_settings(
+            &id,
+            "context-compaction",
+            &patch_map(json!({ "contextLimit": 4000 })),
+        )
+        .expect("a conversation may set its own value");
+    first
+        .update_plugin_settings(
+            "context-compaction",
+            &patch_map(json!({ "modelLimits": "{\"m\": {\"limit\": 1}}" })),
+        )
+        .expect("the template has its own override");
+    first.save(&first.lock()).expect("the document is writable");
+    assert_eq!(
+        persisted_slot(&first, &id),
+        Some(json!({ "context-compaction": { "contextLimit": 4000 } }))
+    );
+
+    drop(first);
+
+    // THE PRE-C3 DOCUMENT: strip the member from both records, which is exactly what a database written
+    // by the previous build looks like, and boot. `#[serde(default)]` on the field is what makes this a
+    // load rather than a refusal, so an upgrade needs no migration step.
+    let editor = fixture.open(Vec::new(), "");
+    {
+        let mut database = persistence::read_harness_database_file(&fixture.document(&editor))
+            .expect("the document reads back");
+        for record in &mut database.sessions {
+            record.plugin_settings = None;
+        }
+        persistence::write_harness_database(&fixture.directory, &database, "pre-c3-by-test")
+            .expect("the edited document is durable");
+    }
+    drop(editor);
+
+    let booted = fixture.open(Vec::new(), "");
+    assert_eq!(
+        booted
+            .session_plugin_revision(&id)
+            .expect("the session booted"),
+        0,
+        "a record with no slot is a conversation with no overrides"
+    );
+    assert_eq!(
+        session_plugin_value(&booted, &id, "context-compaction", "contextLimit"),
+        json!(200_000),
+        "and it does NOT inherit the template's value on upgrade: the seed is a creation-time decision"
+    );
+    assert_eq!(
+        session_plugin_value(&booted, &sibling, "context-compaction", "contextLimit"),
+        json!(200_000)
+    );
+    assert_eq!(
+        booted.plugin_values("context-compaction")["modelLimits"],
+        json!("{\"m\": {\"limit\": 1}}"),
+        "the template's own durable override is untouched by any of this"
+    );
+
+    // A save that changes nothing must not stamp an empty slot into an old record: the member stays
+    // absent, which is what keeps an upgraded document byte-comparable with the one it came from.
+    booted
+        .save(&booted.lock())
+        .expect("the document is writable");
+    assert_eq!(
+        persisted_slot(&booted, &id),
+        None,
+        "no change, so no member"
+    );
+    assert_eq!(persisted_slot(&booted, &sibling), None);
+
+    // The first write after the upgrade lands the member normally, from the restored store.
+    booted
+        .update_session_plugin_settings(
+            &id,
+            "context-compaction",
+            &patch_map(json!({ "mode": "exclude" })),
+        )
+        .expect("an upgraded conversation is writable");
+    booted
+        .save(&booted.lock())
+        .expect("the document is writable");
+    assert_eq!(
+        persisted_slot(&booted, &id),
+        Some(json!({ "context-compaction": { "mode": "exclude" } })),
+        "and it carries only the new key, because the old slot really was empty"
+    );
+    assert_eq!(
+        booted.session_plugin_revision(&id).expect("exists"),
+        1,
+        "the counter starts at 0 on the new boot, as every other restored figure does"
+    );
+}

@@ -252,7 +252,9 @@ pub fn scope_filters(scope: &str) -> &'static [&'static str] {
 }
 
 /// `HARNESS_WS_SCOPE_BASELINES`: the revision-baseline set per scope, verbatim from the
-/// `StreamResourceKind` description. Every set is within `revision_records_per_state` (20).
+/// `StreamResourceKind` description. Every set is within `revision_records_per_state` (21,
+/// `contract::default_ws_limits`, and the YAML's `revision_records_per_state: 21` at
+/// `harness-server.swagger.yaml:3530`).
 #[must_use]
 pub fn scope_baselines(scope: &str) -> &'static [&'static str] {
     match scope {

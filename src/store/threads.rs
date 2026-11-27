@@ -29,8 +29,10 @@ use crate::store::{
 };
 
 /// Conversations one session may hold (`contract::MAX_THREAD_RECORDS`, `persistence.ts:107`
-/// `threadRecords: 256`). The refusal is a conflict: the cap is a property of the session, not of the
-/// request, so retrying with a smaller body does not help.
+/// `threadRecords: 256`). Each route states the refusal ITS OWN way, and the two codes are different:
+/// the roster route answers [`thread_cap_roster_error`] (500, the runtime sentence unwrapped) and an
+/// unfocused submit answers [`thread_cap_submit_error`] (429, the sentence wrapped in the store's
+/// context). Neither is a conflict, and the difference is the reference's, not a choice here.
 pub const MAX_THREADS: usize = crate::contract::MAX_THREAD_RECORDS;
 
 /// A conversation the caller named that this session does not have (`api.ts:2500`), byte-identical.
@@ -39,11 +41,89 @@ pub fn unknown_thread(thread_id: &str) -> ApiError {
     ApiError::not_found(format!("Unknown thread \"{thread_id}\"."))
 }
 
-/// The roster is full.
+/// The roster is full, as the ROSTER route answers it (`POST /sessions/{id}/threads`): **500** carrying
+/// the runtime's own remedy sentence, UNWRAPPED.
+///
+/// This is the reference's answer, not a classification this build makes. The chain, verified at
+/// `packages/underload/harness` @ `e66bce87777cb5f53504dbc47ad38ebd2c0ca6ff`:
+///   * `server/api.ts:5258-5304` `postSessionThread` calls `record.harness.createThread(...)` at
+///     `:5277-5281` with NO `try`/`catch` around it — of the 21 `catch` blocks in that file none
+///     covers this route — so the kernel's capacity `HarnessError`
+///     (`engine/harness.ts:8052-8056`, the same sentence [`thread_cap_submit_error`] quotes) escapes
+///     the dispatcher as a plain non-`HttpError` throw;
+///   * the listener then answers it as an uncaught error: `server/handler.ts:319` is
+///     `error instanceof HttpError ? error.status : 500`, and `:320` sends
+///     `sendJson(response, status, { error: { message: messageOf(error) } })`, i.e.
+///     `application/json; charset=utf-8` and the message VERBATIM (`start.ts:176-189` `sendFailure`
+///     is the same envelope for the same throw on the programmatic listener);
+///   * the swagger agrees: `POST /sessions/{id}/threads` declares 201/400/404/413/**500** and has no
+///     409 and no 429 arm (`harness-server.swagger.yaml:2544-2638`).
+///
+/// WHY THE SUBMIT GETS 429 AND THIS ROUTE GETS 500: only `server/sessions.ts:10318-10338`
+/// (`createSubmitThread` → `threadError`) classifies the refusal, and it runs on the submit path alone.
+/// Two routes, two codes, one sentence — so 500 here is the reference's, and "fixing" it to 429 would
+/// be a change the reference does not make. The remedy text is what makes the 500 actionable anyway:
+/// it names the count, says which conversation to delete, and states the bound.
+///
+/// `count` is THIS build's roster size, i.e. the figure the gate compared against; see
+/// [`thread_cap_submit_error`] for why the two builds' counters agree today and can only ever diverge
+/// EARLY once default conversations are materialized.
 #[must_use]
-pub fn thread_cap_error() -> ApiError {
-    ApiError::conflict(format!(
-        "A session cannot hold more than {MAX_THREADS} conversations."
+pub fn thread_cap_roster_error(count: usize) -> ApiError {
+    ApiError::internal(format!(
+        "This session already has {count} independent threads; delete a terminal one before creating \
+         another (maximum {MAX_THREADS})."
+    ))
+}
+
+/// The roster is full, as an UNFOCUSED SUBMIT answers it: **429**, with the runtime's own remedy sentence
+/// wrapped in the store's context.
+///
+/// The reference's chain is exact (`packages/underload/harness` @ `e66bce87777cb5f53504dbc47ad38ebd2c0ca6ff`):
+///   * the kernel refuses at 256 ACTIVE conversations with
+///     `` `This session already has ${n} independent threads; delete a terminal one before creating
+///        another (maximum ${MAX_THREAD_RECORDS}).` `` (`engine/harness.ts:8052-8056`,
+///     `engine/core/thread.ts:52` `MAX_THREAD_RECORDS = 256`);
+///   * the session layer wraps that refusal as `Could not open a new thread: <runtime sentence>` and maps
+///     it to **429** by regex (`server/sessions.ts:10318-10323` `createSubmitThread` → `:10326-10338`
+///     `threadError`, whose `/already has \d+ independent threads|delete a terminal one/i` arm is a
+///     `SessionError(429, ...)`). Any OTHER runtime refusal about a thread is a 400, so this arm is about
+///     capacity alone;
+///   * the dispatcher answers a `SessionError` with its own status (`server/api.ts:6266-6277`), so 429 is
+///     the code on the wire, and the swagger's `POST /sessions/{id}/tasks` declares 429
+///     (`harness-server.swagger.yaml:1488-1573`) alongside the pending-task cap's 429.
+///
+/// WHY NOT THE 500 ABOVE: capacity is retryable once somebody deletes a terminal conversation, which
+/// is what 429 says and what 500 does not. The reference calls this out at `sessions.ts:10315-10317`
+/// ("the runtime's host-thread bound is a lifecycle failure, not a server bug. It becomes an
+/// actionable 429"). The roster route never runs that classification, so it keeps the bare 500; the
+/// two codes are the reference's own split, not a coincidence.
+///
+/// `count` is THIS build's roster size, i.e. the figure its own cap gate compared against. WHAT THE
+/// TWO COUNTERS ACTUALLY COUNT — restated, because the first reading of this delta was wrong:
+///   * retired (inactive) rows are NOT a difference. The reference filters them out of its own count
+///     (`engine/harness.ts:8049`, `state.record.inactive !== true`) and this build never STORES one —
+///     [`SessionState::detach_thread`] removes the row instead of marking it — so neither side counts
+///     what the other has already dropped, and the delta from this source is exactly zero;
+///   * the one real difference is `origin: 'agent'` rows: the reference keeps a default conversation
+///     per agent in the same map (a plugin-added agent gets one at `engine/harness.ts:2304-2316`) but
+///     leaves it out of the bound, whose filter admits only `origin === 'host'`
+///     (`engine/harness.ts:8047-8050`), while this build's gate counts `state.threads.len()` over every
+///     row it holds;
+///   * those rows are UNREACHABLE today. The only producer is [`SessionState::resolve_thread`], which
+///     has no callers, and `POST {root}/sessions/{id}/threads` forces `origin: "host"` itself
+///     (`api/threads.rs:134-137`) behind a field gate that admits no other spelling
+///     (`api/threads.rs:44`). The observable difference right now is therefore **0**, on every route.
+///
+/// So this is a FORWARD-LOOKING gap, not present-tense behaviour: the day default conversations are
+/// materialized, a session that reaches the bound through them refuses EARLY by at most A rows (A = the
+/// agent's own default conversations), and it can never refuse LATE. Until then the sentence and the
+/// number agree across the two builds.
+#[must_use]
+pub fn thread_cap_submit_error(count: usize) -> ApiError {
+    ApiError::too_many_requests(format!(
+        "Could not open a new thread: This session already has {count} independent threads; delete a \
+         terminal one before creating another (maximum {MAX_THREADS})."
     ))
 }
 
@@ -148,7 +228,10 @@ impl SessionState {
         }
 
         if self.threads.len() >= MAX_THREADS {
-            return Err(thread_cap_error());
+            // The submit-side refusal: this is the conversation a TASK is trying to land in, so the
+            // code is the submit route's 429 with the wrapped remedy, not the roster route's 500.
+            // Unreachable today (`resolve_thread` has no callers); see [`thread_cap_submit_error`].
+            return Err(thread_cap_submit_error(self.threads.len()));
         }
 
         let record = self.create_thread(agent, ThreadOrigin::Agent, None, Some(&default_id));
@@ -251,7 +334,11 @@ impl SessionStore {
         }
 
         if state.threads.len() >= MAX_THREADS {
-            return Err(thread_cap_error());
+            // 500, not 409 and not 429: the reference wraps NOTHING around the kernel's refusal on
+            // this route, so the throw reaches the listener's uncaught handler
+            // (`handler.ts:319-320`), which is where 500 + `{error:{message}}` comes from. The
+            // sentence is the runtime's own, quoted with the count this gate compared against.
+            return Err(thread_cap_roster_error(state.threads.len()));
         }
 
         let at = crate::events::now_millis();

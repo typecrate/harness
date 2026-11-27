@@ -64,15 +64,29 @@ const EPOCH_HEADER: HeaderName = HeaderName::from_static("x-harness-epoch");
 const REVISION_HEADER: HeaderName = HeaderName::from_static("x-harness-revision");
 
 /// The five shipped presets, in the listing order `presets.ts:391-397` fixes (`instruct` first).
-const SHIPPED_HARNESSES: [&str; 5] = ["instruct", "research", "workspace", "reviewer", "planner"];
-
-/// The six trusted profiles, in catalogue order.
-const SHIPPED_AGENTS: [&str; 6] = [
+/// Card order is the contract: it is the order `GET /harnesses` returns, the order a picker
+/// renders, and the order the frontend palette assigns tones by (`presets.ts:522-538`).
+const SHIPPED_HARNESSES: [&str; 8] = [
+    "general",
     "instruct",
     "research",
     "workspace",
     "reviewer",
     "planner",
+    "debugger",
+    "chat",
+];
+
+/// The eight trusted profiles, in catalogue order (`agents/index.ts` `AGENT_PROFILE_NAMES`): the
+/// seven selectable roles, DEFAULT FIRST, then the delegated condenser.
+const SHIPPED_AGENTS: [&str; 8] = [
+    "general",
+    "instruct",
+    "research",
+    "workspace",
+    "reviewer",
+    "planner",
+    "debugger",
     "summarizer",
 ];
 
@@ -481,10 +495,11 @@ async fn the_boot_document_advertises_the_contract() {
             "pending_actions": 4,
             "steer_records": 64,
             "created_tools": 32,
-            // `harness-api.ts:222` / `harness.swagger.yaml:243`. Advertised AND enforced are the
-            // same 256 KiB in this build now (`core/result-budget.ts:54`); `tests/foundation.rs`
-            // pins both figures and their equality.
-            "tool_result_bytes": 262_144,
+            // `harness-api.ts:231` / `harness-server.swagger.yaml:296`: the contract publishes
+            // **32768**, and advertised AND enforced are the same number in this build
+            // (`contract::MODEL_TOOL_RESULT_BUDGET_BYTES`); `tests/foundation.rs` pins both
+            // figures and their equality.
+            "tool_result_bytes": 32_768,
             "page_limit_default": 25,
             "page_limit_max": 100,
         })
@@ -1046,20 +1061,25 @@ async fn the_definition_catalogue_is_listed_read_and_described() {
     assert_eq!(
         Root::page_names(&page.body),
         SHIPPED_HARNESSES,
-        "the shipped catalogue, in `presets.ts:391-397` order"
+        "the shipped catalogue, in `presets.ts:529-538` order"
     );
-    // Five rows on one page, and `limit` echoes the EFFECTIVE size (`api-paging.ts:142-153`).
-    assert_eq!(page.body["limit"], 5);
+    // Eight rows on one page, and `limit` echoes the EFFECTIVE size - the served count, not
+    // the requested cap (`api-paging.ts:142-153`).
+    assert_eq!(page.body["limit"], 8);
     assert_eq!(page.body["next_cursor"], Value::Null);
     assert!(page.body["observed_at"].is_u64());
 
     // The filter is a case-insensitive substring over `name title description` joined with single
     // spaces (`api.ts:1494-1499`), and `?q=` is absent, not empty (`paramOf`).
     for (query, expected) in [
-        ("q=research", vec!["research", "planner"]),
-        ("q=REVIEW", vec!["reviewer", "planner"]),
-        ("q=Coder", vec!["workspace", "planner"]),
-        ("q=Skeptical", vec!["reviewer"]),
+        ("q=research", vec!["instruct", "research", "planner"]),
+        ("q=REVIEW", vec!["instruct", "reviewer", "planner"]),
+        ("q=Explore", vec!["research"]),
+        ("q=Analyst", vec!["workspace"]),
+        // The retired visible title and the old Rust prose are gone: nothing in the shipped
+        // eight says "Coder" or "Skeptical" any more.
+        ("q=Coder", Vec::<&str>::new()),
+        ("q=Skeptical", Vec::<&str>::new()),
         // `summarizer` is a MEMBER of every live harness but appears in none of the three
         // fields the filter reads, which is what proves the field set (`api.ts:1497-1499`).
         ("q=summarizer", Vec::<&str>::new()),
@@ -1093,26 +1113,38 @@ async fn the_definition_catalogue_is_listed_read_and_described() {
 
     assert_eq!(harness["name"], "instruct");
     assert_eq!(harness["title"], "Instruct");
-    assert_eq!(harness["primary"], "instruct");
+    assert_eq!(harness["entry"], "instruct");
     assert_eq!(harness["builtin"], true);
     assert_eq!(harness["requires_endpoint"], true);
     assert_eq!(harness["definition_revision"], 0);
-    assert_eq!(
-        harness["subagents"],
-        json!(["research", "workspace", "reviewer", "planner", "summarizer"]),
-        "`team_of(primary)` is the other roles, then the summarizer (`presets.rs:118-125`)"
-    );
+    // The roster is DECLARATION order - the subject, then the other specialists WITHOUT the
+    // Manager (only the Manager card may delegate to the Manager), then `summarizer`
+    // (`presets.ts:232-260`).
     assert_eq!(
         harness["agents"],
         json!([
             "instruct",
+            "general",
             "research",
             "workspace",
             "reviewer",
-            "planner",
+            "debugger",
             "summarizer"
         ]),
-        "`agents` is `[primary, ...subagents]`"
+        "the shipped roster"
+    );
+    assert_eq!(
+        harness["ranks"],
+        json!({
+            "instruct": "A",
+            "general": "B",
+            "research": "B",
+            "workspace": "B",
+            "reviewer": "B",
+            "debugger": "B",
+            "summarizer": "B"
+        }),
+        "the entry is Rank A and every delegate is Rank B (`presets.ts` `ENTRY_RANK`/`TEAM_RANK`)"
     );
     assert!(harness["core_tools"].is_array());
     assert!(
@@ -1124,13 +1156,18 @@ async fn the_definition_catalogue_is_listed_read_and_described() {
             .as_array()
             .expect("rows")
             .len(),
-        6
+        // One row per roster member of the shipped `instruct` card (the entry plus its six
+        // delegates), each stamped with the layer its text came from.
+        7
     );
     assert_eq!(harness["instruction_summary"][0]["source"], "catalogue");
     assert_eq!(
         instruct.keys().cloned().collect::<Vec<_>>().len(),
-        12,
-        "a card's ten members, plus the two only a definition read adds"
+        // Ten card members, plus the three only a DEFINITION read adds: `agent_models`,
+        // `agent_instructions`, and the preset-history map `agent_prefixes` - the field this build
+        // moved onto the definition so a read can tell a seeded band from an operator band.
+        13,
+        "a card's ten members, plus the three only a definition read adds"
     );
 
     // The instruction index and one member's text (`api.ts:1646-1678`).
@@ -1148,10 +1185,20 @@ async fn the_definition_catalogue_is_listed_read_and_described() {
     assert_eq!(index.status, StatusCode::OK);
     assert_contract_headers(&index, None);
     assert_eq!(index.body["harness_name"], "instruct");
-    assert_eq!(index.body["total"], 6);
+    // One row per ROSTER member, in ROSTER ORDER (`api.ts:1646-1678` projects the definition's
+    // own list, it does not re-sort it): the shipped `instruct` card's seven members.
+    assert_eq!(index.body["total"], 7);
     assert_eq!(
         Root::page_field(&index.body, "agent"),
-        SHIPPED_AGENTS,
+        [
+            "instruct",
+            "general",
+            "research",
+            "workspace",
+            "reviewer",
+            "debugger",
+            "summarizer",
+        ],
         "an instruction index row is keyed `agent`, not `name`"
     );
     assert_eq!(
@@ -1173,12 +1220,23 @@ async fn the_definition_catalogue_is_listed_read_and_described() {
         "one row per member, with provenance and LENGTH - never the text"
     );
     assert_eq!(
+        // The second row is the card's first delegate. R2 ported the `general` profile, so this row
+        // is no longer an empty placeholder: it resolves the shipped identity text like every other
+        // member (`presets.ts` names `general` on the `instruct` card's roster).
         index.body["items"][1],
         json!({
-            "agent": "research",
+            "agent": "general",
             "source": "catalogue",
             "overridden": false,
-            "chars": research_chars,
+            "chars": u64::try_from(
+                catalogue
+                    .effective("general")
+                    .expect("the ported general profile")
+                    .instruction
+                    .chars()
+                    .count()
+            )
+            .unwrap(),
         })
     );
 
@@ -1227,8 +1285,8 @@ async fn a_harness_write_round_trips_persists_and_deletes() {
                 "name": "t5a-suite",
                 "title": "T5a Suite",
                 "description": "A harness this test owns.",
-                "primary": "planner",
-                "subagents": ["research"],
+                "agents": ["planner", "research"],
+                "entry": "planner",
                 "agent_models": { "research": "provider/model-y" },
                 "agent_instructions": { "research": "Suite-specific prose." },
                 // T7b: the third map of the same shape (`api.ts:1523`, `harness-api.ts:484`). The
@@ -1243,11 +1301,16 @@ async fn a_harness_write_round_trips_persists_and_deletes() {
     assert_contract_headers(&created, Some(1));
     assert_eq!(created.body["harness"]["name"], "t5a-suite");
     assert_eq!(created.body["harness"]["builtin"], false);
-    assert_eq!(created.body["harness"]["primary"], "planner");
+    assert_eq!(created.body["harness"]["entry"], "planner");
+    assert_eq!(
+        created.body["harness"]["ranks"],
+        json!({ "planner": "A", "research": "B" }),
+        "an omitted `ranks` fills the entry at A and every other member at B (`toolbox.ts resolveRosterRanks`)"
+    );
     assert_eq!(
         created.body["harness"]["agents"],
         json!(["planner", "research"]),
-        "the created membership is `[primary, ...subagents]`"
+        "the roster is the DECLARATION order the body stated, not a derived set"
     );
     assert_eq!(
         created.body["harness"]["agent_models"],
@@ -1290,65 +1353,69 @@ async fn a_harness_write_round_trips_persists_and_deletes() {
     let duplicate = Reply::send(
         client()
             .post(server.url("/v1/harness/harnesses"))
-            .json(&json!({ "name": "t5a-suite", "primary": "planner" })),
+            .json(&json!({ "name": "t5a-suite", "agents": ["planner"] })),
     )
     .await;
 
     assert_eq!(duplicate.status, StatusCode::CONFLICT);
     assert_eq!(duplicate.message(), "Harness \"t5a-suite\" already exists.");
 
-    // An unknown primary is a 400 that lists the known names: the registry's selectability gate.
+    // An unknown roster member is a 400 that lists the known names: the registry's selectability
+    // gate (`registry.ts:329-353`), and the field it names is the field that carried the id.
     let unknown_primary = Reply::send(
         client()
             .post(server.url("/v1/harness/harnesses"))
-            .json(&json!({ "name": "t5a-ghost", "primary": "ghost" })),
+            .json(&json!({ "name": "t5a-ghost", "agents": ["ghost"] })),
     )
     .await;
 
     assert_eq!(unknown_primary.status, StatusCode::BAD_REQUEST);
     assert_eq!(
         unknown_primary.message(),
-        "`primary` names unknown agent \"ghost\". Known agents: instruct, research, workspace, reviewer, planner, summarizer."
+        "`agents` names unknown agent \"ghost\". Known agents: general, instruct, research, workspace, reviewer, planner, debugger, summarizer."
     );
 
     // The refusals this ROUTE owns, all before any typed decode (`api.ts:1515-1532`).
     for (body, message) in [
         (
-            json!({ "primary": "planner" }),
+            json!({ "agents": ["planner"] }),
             "A harness definition requires a \"name\".",
         ),
         (
-            json!({ "name": "t5a-no-primary" }),
-            "A harness definition requires a \"primary\" agent.",
+            // The retired "requires a primary" sentence is gone with the field: an omitted roster
+            // is the roster's own refusal, which is what `normalizeRoster` answers for a body
+            // that never named an agent (`registry.ts:517-552`).
+            json!({ "name": "t5a-no-agents" }),
+            "`agents` must be a non-empty array of agent names.",
         ),
         (
-            json!({ "name": "t5a bad!", "primary": "planner" }),
+            json!({ "name": "t5a bad!", "agents": ["planner"] }),
             "`name` must start with a letter and contain only letters, digits, \"_\" or \"-\", at most 64 characters.",
         ),
         (
-            json!({ "name": "x", "primary": "planner", "color": "red" }),
-            // T7b: `agent_colors` joined the accepted set (`api.ts:1523`), so the sentence the
-            // unknown key names lists eight fields, not seven.
-            "Unknown field \"color\". Allowed fields: name, title, description, primary, subagents, agent_models, agent_instructions, agent_colors.",
+            json!({ "name": "x", "agents": ["planner"], "color": "red" }),
+            // The accepted set is the contract's ten create fields IN DECLARATION ORDER, because
+            // the sentence prints them as declared (`api.ts` postHarness + `requireBodyFields`).
+            "Unknown field \"color\". Allowed fields: name, title, description, agents, entry, ranks, agent_models, agent_instructions, agent_prefixes, agent_colors.",
         ),
         (
-            json!({"name": "t5a-color", "primary": "planner", "agent_colors": {"ghost": "#fff"}}),
+            json!({"name": "t5a-color", "agents": ["planner"], "agent_colors": {"ghost": "#fff"}}),
             "`agentColors` names \"ghost\", which is not a member of this harness. Members: planner.",
         ),
         (
-            json!({"name": "t5a-color", "primary": "planner", "agent_colors": {"planner": "reddish"}}),
+            json!({"name": "t5a-color", "agents": ["planner"], "agent_colors": {"planner": "reddish"}}),
             "`agentColors.planner` must be a CSS hex color (#rgb, #rgba, #rrggbb or #rrggbbaa). Received \"reddish\".",
         ),
         (
-            json!({"name": "t5a-color", "primary": "planner", "agent_colors": {"planner": "   "}}),
+            json!({"name": "t5a-color", "agents": ["planner"], "agent_colors": {"planner": "   "}}),
             "`agentColors.planner` cannot be empty. Omit the key to leave this agent uncolored.",
         ),
         (
-            json!({"name": "t5a-color", "primary": "planner", "agent_colors": {"planner": "#ab"}}),
+            json!({"name": "t5a-color", "agents": ["planner"], "agent_colors": {"planner": "#ab"}}),
             "`agentColors.planner` must be a CSS hex color (#rgb, #rgba, #rrggbb or #rrggbbaa). Received \"#ab\".",
         ),
         (
-            json!({"name": "t5a-color", "primary": "planner", "agent_colors": {"planner": "0xff0000"}}),
+            json!({"name": "t5a-color", "agents": ["planner"], "agent_colors": {"planner": "0xff0000"}}),
             "`agentColors.planner` must be a CSS hex color (#rgb, #rgba, #rrggbb or #rrggbbaa). Received \"0xff0000\".",
         ),
         (json!([]), "The request body must be a JSON object."),
@@ -1462,11 +1529,14 @@ async fn a_harness_write_round_trips_persists_and_deletes() {
     assert_eq!(
         root.saved_registry_names(),
         [
+            "general".to_string(),
             "instruct".to_string(),
             "research".to_string(),
             "workspace".to_string(),
             "reviewer".to_string(),
             "planner".to_string(),
+            "debugger".to_string(),
+            "chat".to_string(),
             "t5a-suite".to_string(),
         ],
         "a created entry joins the durable list in creation order"
@@ -1484,7 +1554,7 @@ async fn a_harness_write_round_trips_persists_and_deletes() {
     assert_eq!(saved["agentColors"], json!({ "planner": "#ff0000" }));
     assert_eq!(saved["builtin"], false);
     assert_eq!(saved["editable"], true);
-    assert_eq!(saved["primary"], "planner");
+    assert_eq!(saved["entry"], "planner");
     assert_eq!(saved["agents"], json!(["planner", "research"]));
     assert!(
         state.get("deleted").is_none(),
@@ -1569,7 +1639,15 @@ async fn a_harness_write_round_trips_persists_and_deletes() {
 
     assert_eq!(
         Root::page_names(&still_gone.body),
-        ["instruct", "research", "workspace", "reviewer"],
+        [
+            "general",
+            "instruct",
+            "research",
+            "workspace",
+            "reviewer",
+            "debugger",
+            "chat",
+        ],
         "the tombstone is durable, so a restart does NOT re-ship the removed card"
     );
 
@@ -1595,7 +1673,7 @@ async fn the_agent_surface_lists_reads_persists_and_retires() {
         SHIPPED_AGENTS,
         "the SELECTABLE profiles, in catalogue order (`api-reads.ts` `registry.agents()`)"
     );
-    assert_eq!(page.body["limit"], 6);
+    assert_eq!(page.body["limit"], 8);
     assert_eq!(page.body["next_cursor"], Value::Null);
 
     for row in page.body["items"].as_array().expect("items") {
@@ -1633,7 +1711,14 @@ async fn the_agent_surface_lists_reads_persists_and_retires() {
     assert_eq!(profile["revision"], 0);
     assert_eq!(
         profile["referenced_by"],
-        json!(["instruct", "research", "workspace", "reviewer", "planner"]),
+        json!([
+            "instruct",
+            "research",
+            "workspace",
+            "reviewer",
+            "planner",
+            "debugger"
+        ]),
         "only the harness registry knows which definitions select this profile"
     );
 
@@ -1660,12 +1745,15 @@ async fn the_agent_surface_lists_reads_persists_and_retires() {
             "guidelines": json!(shipped.guidelines),
             "instruction_source": "global",
             "overridden_fields": ["instruction"],
+            // Every delegating card selects the `instruct` profile; `general` and `chat` run it
+            // as their only member, and `chat` runs the `general` profile instead.
             "referenced_by": [
                 "instruct",
                 "research",
                 "workspace",
                 "reviewer",
-                "planner"
+                "planner",
+                "debugger"
             ],
             "revision": 2,
         })
@@ -1786,8 +1874,17 @@ async fn the_agent_surface_lists_reads_persists_and_retires() {
 
     assert_eq!(
         Root::page_names(&listed.body),
-        ["instruct", "research", "workspace", "reviewer", "planner"],
-        "a retired profile leaves the selectable page while the harness that selects it survives"
+        [
+            "general",
+            "instruct",
+            "research",
+            "workspace",
+            "reviewer",
+            "planner",
+            "debugger"
+        ],
+        "a retired profile leaves the selectable page while the harness that selects it survives \
+         (the eight shipped profiles minus `summarizer`, in `shipped_profiles()` order)"
     );
 
     let repeat = Reply::send(client().delete(server.url("/v1/harness/agents/summarizer"))).await;
@@ -1800,9 +1897,9 @@ async fn the_agent_surface_lists_reads_persists_and_retires() {
 
     assert_eq!(harness_still.status, StatusCode::OK);
     assert_eq!(
-        harness_still.body["harness"]["subagents"]
+        harness_still.body["harness"]["agents"]
             .as_array()
-            .expect("subagents")
+            .expect("agents")
             .last(),
         Some(&json!("summarizer")),
         "an existing definition keeps a member whose profile was retired"
@@ -2897,24 +2994,31 @@ async fn the_paging_parameters_are_strict_and_the_limit_echoes_the_page() {
     // T7b: every spelling `Number()` can coerce into the bounds is ACCEPTED (`api-paging.ts:101`),
     // which is the part the earlier digit parser refused: a sign, a trailing dot, an exponent, a
     // radix, and surrounding whitespace.
-    for query in [
-        "limit=+5",
-        "limit=5.0",
-        "limit=5.",
-        "limit=0x5",
-        "limit=0b101",
-        "limit=0o5",
-        "limit=1e1",
-        "limit=5e0",
-        "limit=%205%20",
+    for (query, served) in [
+        ("limit=+5", 5),
+        ("limit=5.0", 5),
+        ("limit=5.", 5),
+        ("limit=0x5", 5),
+        ("limit=0b101", 5),
+        ("limit=0o5", 5),
+        // `1e1` coerces to TEN, which is inside the 1..=100 bounds but ABOVE the eight-card
+        // collection, so this page serves all eight (`api-paging.ts:142-153`).
+        ("limit=1e1", 8),
+        ("limit=5e0", 5),
+        ("limit=%205%20", 5),
     ] {
         let reply =
             Reply::send(client().get(server.url(&format!("/v1/harness/harnesses?{query}")))).await;
 
         assert_eq!(reply.status, StatusCode::OK, "`{query}` resolves");
         assert_eq!(
-            reply.body["limit"], 5,
-            "`{query}` is a page of five, the whole collection"
+            reply.body["limit"], served,
+            "`{query}` echoes the page it served"
+        );
+        assert_eq!(
+            reply.body["items"].as_array().expect("items").len(),
+            served,
+            "`{query}` serves exactly that many cards"
         );
     }
 
@@ -2925,8 +3029,8 @@ async fn the_paging_parameters_are_strict_and_the_limit_echoes_the_page() {
     assert_eq!(first.body["limit"], 2);
     assert_eq!(
         Root::page_names(&first.body),
-        ["instruct", "research"],
-        "a page of 2 out of 5 carries the first two and a cursor"
+        ["general", "instruct"],
+        "a page of 2 out of 8 carries the first two and a cursor"
     );
 
     let cursor = first.body["next_cursor"].as_str().expect("a next page");
@@ -2935,7 +3039,7 @@ async fn the_paging_parameters_are_strict_and_the_limit_echoes_the_page() {
     )
     .await;
 
-    assert_eq!(Root::page_names(&second.body), ["workspace", "reviewer"]);
+    assert_eq!(Root::page_names(&second.body), ["research", "workspace"]);
 
     let third_cursor = second.body["next_cursor"].as_str().expect("a third page");
     let third = Reply::send(client().get(server.url(&format!(
@@ -2943,12 +3047,20 @@ async fn the_paging_parameters_are_strict_and_the_limit_echoes_the_page() {
     ))))
     .await;
 
-    assert_eq!(Root::page_names(&third.body), ["planner"]);
-    assert_eq!(third.body["limit"], 1);
+    assert_eq!(Root::page_names(&third.body), ["reviewer", "planner"]);
+    assert_eq!(third.body["limit"], 2);
+    let fourth_cursor = third.body["next_cursor"].as_str().expect("a fourth page");
+    let fourth = Reply::send(client().get(server.url(&format!(
+        "/v1/harness/harnesses?limit=2&cursor={fourth_cursor}"
+    ))))
+    .await;
+
+    assert_eq!(Root::page_names(&fourth.body), ["debugger", "chat"]);
+    assert_eq!(fourth.body["limit"], 2);
     assert_eq!(
-        third.body["next_cursor"],
+        fourth.body["next_cursor"],
         Value::Null,
-        "the collection ended, so no cursor to an empty page is advertised"
+        "an EXACTLY FULL last page still ends the collection, because the route declared the total"
     );
 
     server.stop().await;
