@@ -1302,7 +1302,7 @@ fn environment_file_loads_without_overriding_the_process() {
     environment::clear_harness_environment_cache();
 
     // The default path is the package-root `.env`, and the dump root is the shared
-    // `temporary/dump` sibling of the repo root (`package-root.ts`, `service/server.ts:43`).
+    // `temporary/dump` sibling of the repo root (`package-root.ts`, `service/server.ts:25`).
     assert_eq!(
         package_root::package_path(&[".env"]),
         package_root::package_root().join(".env")

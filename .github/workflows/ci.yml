@@ -16,9 +16,23 @@
 # CHECKOUT LAYOUT: the crate expects the monorepo position
 # `<repo>/packages/<scope>/<name>`. The tests resolve their scratch root both
 # through `package_root::repo_root()` (src/package_root.rs: nearest ancestor
-# whose package.json declares `workspaces`, else four parents) and through
+# whose package.json declares `workspaces`, else three parents) and through
 # literal `../../../Temp` paths, so the checkout is placed at
 # `packages/typecrate/harness` - the depth both spellings were written for.
+#
+# REFERENCE CHECKOUT: `tests/routes.rs` pins the route table by reading the
+# TypeScript contract authorities,
+# `packages/underload/harness/src/engine/shared/harness-api.ts` and
+# `.../src/server/api.ts`, through `repo_root()`. That authority is not part of
+# this repository: `underloadjs/harness` is a separate public repository whose
+# root IS that package directory, so it is checked out at the monorepo-relative
+# path `packages/underload/harness` and `repo_root().join(...)` resolves exactly
+# as it does inside noobscript. It is public, so the default GITHUB_TOKEN can
+# read it. It tracks `main` UNPINNED (house convention: no `ref:` anywhere in
+# this workflow), so an upstream contract change that this build has not mounted
+# yet is expected to redden CI; and because a monorepo checkout reads its OWN
+# nested reference tree, CI can be red while the same commit is green locally
+# until that nested tree is refreshed.
 #
 # TOOLCHAIN: noobscript pins 1.99.1 in its root rust-toolchain.toml, which a
 # standalone checkout does not carry (this repository IS the package), so the
@@ -44,6 +58,12 @@ jobs:
               uses: actions/checkout@v5
               with:
                   path: packages/typecrate/harness
+
+            - name: Checkout reference (tests/routes.rs contract authority)
+              uses: actions/checkout@v5
+              with:
+                  repository: underloadjs/harness
+                  path: packages/underload/harness
 
             - name: Setup Node
               uses: actions/setup-node@v5

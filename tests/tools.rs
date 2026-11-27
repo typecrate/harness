@@ -39,12 +39,14 @@ impl Fixture {
     fn new(name: &str) -> Self {
         let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
 
-        // FIXED-WIDTH name components, on purpose. One pin in this file asserts a refusal that
-        // quotes the BYTE LENGTH of a tool result whose JSON embeds this directory's absolute path
-        // (`an_oversized_json_read_result_is_refused_rather_than_truncated`), so an unpadded pid or
-        // sequence shifted that count by a byte whenever either gained a digit — the pin passed in
-        // isolation and failed under a full `cargo test`, where pids are longer and threads take the
-        // counter in a different order. Padding both keeps the path length constant per checkout.
+        // FIXED-WIDTH `pid` and `sequence` ONLY, on purpose: padding them (`:55`) stops a parallel
+        // `cargo test` handing two tests the same directory when either gains a digit, which is the
+        // collision this guards and nothing else. `-{name}` is unpadded and the `repo_root()` prefix
+        // is whatever this checkout is, so a fixture path's TOTAL length is not constant across
+        // tests or machines — the 120 characters this checkout measures belong to the
+        // `Fixture::new("result-budget")` fixture alone. The byte-count pin that used to be hostage
+        // to all this (`an_oversized_json_read_result_is_refused_rather_than_truncated`) now computes
+        // its own path term at runtime, so it depends on neither the padding nor the checkout root.
         let directory = typecrate_harness::package_root::repo_root()
             .join("Temp")
             .join("typecrate-harness")
@@ -1301,8 +1303,8 @@ async fn an_oversized_json_read_result_is_refused_rather_than_truncated() {
     let budget = typecrate_harness::contract::MODEL_TOOL_RESULT_BUDGET_BYTES;
 
     // One line per 2 KiB, 200 lines: `read` caps its OWN content at 64 KiB and says so with
-    // `truncated`, so the document arrives ABOVE the model-facing budget (the exact byte count is in
-    // the refusal literal below).
+    // `truncated`, so the document arrives ABOVE the model-facing budget (its exact byte count is
+    // derived from the document's own shape in the note below).
     // The reference's file tools cap their content at the same 64 KiB
     // (`engine/tools/files/files.tool.ts:408 FILES_CONTENT_BUDGET`), so the reference can produce
     // the same oversize document, and its cutter answers that document with a REFUSAL: an
@@ -1329,11 +1331,75 @@ async fn an_oversized_json_read_result_is_refused_rather_than_truncated() {
     // same outcome `failed` when the bounded result carries `rejected`
     // (`engine/harness.ts:11181 outcome = delivered.rejected ? 'failed' : 'completed'`), while the
     // text it records is the refusal sentence itself (`engine/harness.ts:10842-10845`).
-    // The count is the byte length of the read tool's own JSON document, which embeds the fixture's
-    // absolute path, so it is constant for a checkout as long as `Fixture::new` keeps its name widths
-    // fixed (see the note there). 65,859 was the number for the unpadded layout, and it moved whenever
-    // a pid or the counter gained a digit.
-    let refusal = "Tool result too large to deliver: 65864 bytes against a 32768-byte budget. The result was discarded, not truncated: no part of it reached this transcript. Re-run the tool call with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it. If this call could have written anything, that write may already be applied — re-read before retrying.";
+    // THE COUNT IS DERIVED, NOT FROZEN.
+    //
+    // `original_bytes` in the refusal is the UTF-8 length of the read tool's OWN JSON document
+    // (`src/tools/result.rs:996-1001` `serialize_value` feeds `:544` `original_bytes`, and
+    // `:566-589` refuses it), and that document embeds this fixture's absolute path exactly once,
+    // in platform-native spelling (`src/tools/files.rs:473` `"path": display_path(&target.path)`,
+    // spelled by `:208-212` and resolved by `:163-179`). The count is therefore a STRUCTURAL
+    // constant plus the JSON-escaped length of one path: stable across checkouts only once the path
+    // term is computed, which is why the frozen `65864` this pin used to carry was never
+    // machine-independent — it was simply this checkout's root length, and any other root (a CI
+    // checkout, a different drive letter, a deeper clone path) moved it.
+    //
+    // The structural half, i.e. everything the document serializes EXCEPT the path string:
+    //   * 65,536 = the content window `read` returns. `READ_CONTENT_BUDGET` is 64 KiB
+    //              (`src/tools/files.rs:57`) and the fixture's lines are exactly 2,048 bytes each,
+    //              so the allowance is spent on exactly 32 whole lines (32 x 2,048 = 65,536 with no
+    //              remainder) and `window_of` (`src/tools/files.rs:563-586`) returns them with
+    //              `truncated: true` on the next line's `fits` failure, cutting nothing mid-line;
+    //   +    32  = JSON escaping of the content: each of the 32 newlines serializes as the two-byte
+    //              `\n` escape, one extra byte per line;
+    //   +   176  = the rest of the compact document — the `files` array wrapper, the one
+    //              entry's key/quote/colon/brace bytes for `path`, `content`, `startLine`,
+    //              `endLine`, `truncated`, `nextLine`, `nextColumn` and `bytes`
+    //              (`src/tools/files.rs:472-481`), and the document-level `files`, `truncated`,
+    //              `bytes` and `contentBudget` keys (`:492-497`). Those keys come out in INSERTION
+    //              order, never sorted: `Cargo.toml:83-86` switches serde_json's `preserve_order`
+    //              on deliberately, so `:492-497` writes `files`, `truncated`, `bytes`,
+    //              `contentBudget` exactly as written and `:472-481` writes its eight keys in
+    //              theirs. Order moves no bytes here; it is just the spelling the 176 is counted
+    //              from, so do not re-derive it against a sorted map.
+    // Three preconditions hold this constant, and this test owns all of them. ONE read target: a
+    // second splits the 64 KiB allowance across targets (`src/tools/files.rs:421` seeds the budget,
+    // `:455-460` divides it by the count of readable ones), which halves BOTH windows and embeds a
+    // second path this formula never counts. `maxLines: 5000`, which must stay above the 32 lines
+    // the byte allowance closes — otherwise `window_of` stops on its line-count guard (`:550`)
+    // instead of the `!fits` byte cut (`:563-586`) and the content term is no longer 65,536. And
+    // the 64 KiB budget plus the fixture's 2,048-byte lines, which together keep `bytes` and
+    // `contentBudget` at 5 digits (65536) and `endLine`/`nextLine` at 2 (32, 33). Re-derive on any
+    // change to those.
+    const DOCUMENT_BYTES_WITHOUT_PATH: usize = 65_744;
+
+    // The path half: the very spelling the tool writes into the document (`cwd` joined with the
+    // target; `repo_root()` output is already absolute and free of `.`/`..`, so the crate's lexical
+    // `normalize_absolute` is the identity here) measured through the SAME escaping the product
+    // serializes with. `serialize_value` hands a TOP-LEVEL `Value::String` back raw
+    // (`src/tools/result.rs:813-818`), so it cannot show escaping on its own; one level of nesting
+    // does, and `serde_json::to_string` on a `String` is the identical compact serializer
+    // `Value::to_string()` reaches at `:817`. The `- 2` strips the wrapper's quote pair, leaving the
+    // exact byte count this string occupies inside the document — backslashes included, because
+    // JSON escapes every Windows separator and that is why the term is counted, not assumed equal to
+    // `displayed_path.len()`.
+    let displayed_path = fixture.directory.join("big.txt").display().to_string();
+    let escaped_path_bytes = serde_json::to_string(&displayed_path)
+        .expect("a path serializes as a JSON string")
+        .len()
+        - 2;
+    let expected_bytes = DOCUMENT_BYTES_WITHOUT_PATH + escaped_path_bytes;
+
+    // The sentence itself is pinned verbatim (`src/tools/result.rs:333-369` `refusal_message`,
+    // handle-free arm, plus the write-safety clause it always appends); only the two numbers are
+    // interpolated — the byte count from the derivation above, and the budget from the contract
+    // value already read at the top of this test.
+    let refusal = format!(
+        "Tool result too large to deliver: {expected_bytes} bytes against a {budget}-byte budget. \
+         The result was discarded, not truncated: no part of it reached this transcript. Re-run the \
+         tool call with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it. \
+         If this call could have written anything, that write may already be applied — re-read \
+         before retrying."
+    );
 
     assert!(
         !outcome.ok,
@@ -1341,7 +1407,7 @@ async fn an_oversized_json_read_result_is_refused_rather_than_truncated() {
     );
     assert_eq!(
         outcome.error.as_deref(),
-        Some(refusal),
+        Some(refusal.as_str()),
         "the refusal is the reference's sentence, byte for byte"
     );
     assert_eq!(outcome.content, refusal);

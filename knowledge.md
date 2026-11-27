@@ -278,10 +278,21 @@ type, so a later stage cannot send a misspelled field on those paths.
   answer to the same problem `package-root.ts` solves by walking to `package.json`: no bundle
   layout can disagree, and nothing depends on the cwd.
 - `repo_root()` walks up to the nearest `package.json` that declares `"workspaces"` (the monorepo
-  marker; a workspace member manifest does not have one) and falls back to four parents.
+  marker; a workspace member manifest does not have one) and falls back to three parents.
+  *Corrected 2026-11-27:* the fallback said FOUR parents, which is wrong arithmetic - the package sits
+  at `<repo>/packages/<scope>/<name>`, only three segments below the root, so four pops lands one level
+  ABOVE it. Authority for three: the TS reference at the same depth, `packages/underload/service/server.ts:13`
+  (`ROOT = path.join(__dirname, '..', '..', '..')`), and the sibling crate, which states the arithmetic
+  out loud - `packages/typecrate/services/src/server/mod.rs:130-131` ("the repo root is `../../../` from
+  the manifest and the data root is one level further up"), implemented `:141-143` and asserted `:636-638`.
+  The count only matters when the walk-up finds nothing, which is exactly what CI does: the standalone
+  `typecrate/harness` checkout has no ancestor declaring `workspaces`, so the fallback is the answer that
+  runs, and four pops put `Temp/` scratch outside the checkout and read `tests/routes.rs` above
+  `$GITHUB_WORKSPACE`. `default_database_root()` is untouched - it still joins one more `..`, so the dump
+  root stays one above the repo root (four pops total, as `README.md:69` and the next bullet already say).
 - `default_database_root()` = `<repo-root>/../temporary/dump` lexically normalized, i.e.
   `D:\Projects\typescript\temporary\dump` on this machine, matching
-  `packages/underload/service/server.ts:43` and `default_database_root()` in `packages/typecrate/services/src/server/mod.rs` (decl `:119`).
+  `packages/underload/service/server.ts:25` and `default_database_root()` in `packages/typecrate/services/src/server/mod.rs` (decl `:119`).
   The directory is not created here.
   *Re-verified 2026-11-27:* the rule itself still matches - `packages/underload/service/server.ts:25`
   joins `('..', 'temporary', 'dump')`, and `provider-server.ts:80-84` repeats it behind
@@ -1966,7 +1977,7 @@ documentation that had drifted. No architecture changed.
 | 3 | The standalone executable refuses an unusable deployment BEFORE binding: `startup_support_check()` (config load + support gate) runs in `main` after `--help`, prints `typecrate-harness-server: <refusal>` on stderr, and exits 1 with no banner. `HELP` gained the RUNTIME EXECUTION section. | `start.ts` - the TS start throws on a bad runtime configuration, and node reports an uncaught startup failure as exit 1 | `src/bin/server.rs::the_default_deployment_passes_the_startup_support_gate`, `a_worker_deployment_is_refused_before_the_bind`, `help_states_that_a_worker_deployment_is_refused_before_the_bind`; end-to-end: `tests/runtime_execution.rs::the_standalone_executable_refuses_a_worker_thread_lane_before_binding`, `the_standalone_executable_refuses_a_worker_io_lane_before_binding`, `the_standalone_executable_starts_the_default_inline_deployment` |
 | 4 | The gateway answer for a worker deployment is the refusal's own status: the runtime is resolved at dispatcher step 2, so EVERY mounted route (and even an unknown path) answers 400 until the environment is fixed. | `service.ts:515-528`, `:553-556` ("a rejected runtime creation should answer before any body work") | `tests/worker_execution_http.rs::a_worker_deployment_answers_every_mounted_request_with_400` |
 | 5 | `tests/routes.rs` - the route table pinned against `shared/harness-api.ts:54-100` and `api.ts:3925-3974`. | the contract's own tables | 6 tests; see "The dispatcher order is the contract" in T5a for what each one pins |
-| 6 | Documentation corrected: the services test count (71-with-one-expected-failure -> **96 passed, 0 failed**, `tests/harness_gateway.rs` pinning **31 LISTED** rows), the wasm claim (the harness lib is **excluded** from the wasm32 build - `cargo tree --target wasm32-unknown-unknown` resolves zero `typecrate-harness` packages - not "linked into" it), the standalone flags (`--host`/`-h`/`--port`/`--database-root`; `--addr` is the services gateway's spelling and THIS binary rejects it with exit 2), the default database root (`<repo>/../temporary/dump`, i.e. four levels up to the repo root and then one above it), the route-table owner (`tests/routes.rs`, not `tests/foundation.rs`), the tool counts (31 listed / 35 catalogue / 21 executable arms = 19 catalogue tools + `task` + `actionRequest`), the stream vocabulary (**18** display-op kinds, `harness-stream.ts:142` - not 64), the banner description (this bin has no LAN probe - that is the services banner), the shared-default-data-root warning, and `src/lib.rs`'s "STILL TO PORT" list (the `*-route.rs` wiring shipped with T6). `package.json`'s `#rust` note now describes a real listener. | - | the numbers in "Verification" below |
+| 6 | Documentation corrected: the services test count (71-with-one-expected-failure -> **96 passed, 0 failed**, `tests/harness_gateway.rs` pinning **31 LISTED** rows), the wasm claim (the harness lib is **excluded** from the wasm32 build - `cargo tree --target wasm32-unknown-unknown` resolves zero `typecrate-harness` packages - not "linked into" it), the standalone flags (`--host`/`-h`/`--port`/`--database-root`; `--addr` is the services gateway's spelling and THIS binary rejects it with exit 2), the default database root (`<repo>/../temporary/dump`, i.e. three levels up to the repo root and then one above it), the route-table owner (`tests/routes.rs`, not `tests/foundation.rs`), the tool counts (31 listed / 35 catalogue / 21 executable arms = 19 catalogue tools + `task` + `actionRequest`), the stream vocabulary (**18** display-op kinds, `harness-stream.ts:142` - not 64), the banner description (this bin has no LAN probe - that is the services banner), the shared-default-data-root warning, and `src/lib.rs`'s "STILL TO PORT" list (the `*-route.rs` wiring shipped with T6). `package.json`'s `#rust` note now describes a real listener. | - | the numbers in "Verification" below |
 
 ### Why the gate is NOT in `load_server_config`
 

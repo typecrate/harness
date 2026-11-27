@@ -545,8 +545,12 @@ fn the_seventy_four_operation_names_are_the_ones_the_contract_describes() {
 fn reference_text(relative: &str) -> String {
     let path = typecrate_harness::package_root::repo_root().join(relative);
 
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("`{relative}` is the authority for this pin: {error}"))
+    std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "`{relative}` is the authority for this pin: {error} \
+             (check out the reference repository at `packages/underload/harness`)"
+        )
+    })
 }
 
 /// The `(route id, template)` pairs of `HARNESS_PATH_TEMPLATES`

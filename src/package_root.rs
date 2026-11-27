@@ -1,7 +1,7 @@
 //! The package root and the paths derived from it.
 //!
 //! TypeScript origin: `packages/underload/harness/src/server/package-root.ts`, plus the dump
-//! root of `packages/underload/service/server.ts:43`.
+//! root of `packages/underload/service/server.ts:25`.
 //!
 //! WHY the root is discovered rather than computed from a module-relative depth
 //! (`package-root.ts:3-20`): Vite's asset plugin statically rewrites
@@ -45,7 +45,7 @@ pub fn package_path(segments: &[&str]) -> PathBuf {
 /// The package root itself has a `package.json` (that is what makes it the package root), so
 /// the walk looks for the ONE marker the TS root has: this repo's
 /// `package.json` carries a `workspaces` array (`package.json:9-26`), while a workspace member's
-/// does not. Falling back to four parents keeps the answer stable when the tree is copied
+/// does not. Falling back to three parents keeps the answer stable when the tree is copied
 /// without the root manifest - the same "bounded, cannot loop or throw" policy as
 /// `package-root.ts:32-44`.
 #[must_use]
@@ -61,9 +61,13 @@ pub fn repo_root() -> PathBuf {
         directory = candidate;
     }
 
-    // Four levels up == the repo root of `packages/<scope>/<name>`; kept as the documented
+    // Three levels up == the repo root of `packages/<scope>/<name>`; kept as the documented
     // fallback so a partial checkout still resolves a usable path instead of the filesystem root.
-    let fallback = manifest.join("../../../../");
+    // The count comes from the position itself, not from a guess: the TS reference sits at the same
+    // depth and joins three parents for the same answer (`packages/underload/service/server.ts:13`),
+    // and the sibling crate spells it the same way (`packages/typecrate/services/src/server/mod.rs:130-143`).
+    // Four parents overshoots the root by one level whenever the crate is checked out standalone.
+    let fallback = manifest.join("../../..");
 
     normalize_lexically(&fallback)
 }
@@ -85,7 +89,7 @@ fn declares_workspaces(manifest: &Path) -> bool {
 
 /// The default writable data root: `<repo-root>/../temporary/dump`, lexically normalized.
 ///
-/// `packages/underload/service/server.ts:43` resolves `path.join(<repo-root>, '..',
+/// `packages/underload/service/server.ts:25` resolves `path.join(<repo-root>, '..',
 /// 'temporary', 'dump')`, i.e. a sibling OF the repo root, so on this machine the answer is
 /// `D:\Projects\typescript\temporary\dump`. Both runtimes therefore read and write the SAME
 /// dump directory, which is the point of porting the rule rather than approximating it.
@@ -130,4 +134,44 @@ pub fn normalize_lexically(path: &Path) -> PathBuf {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ancestor count, pinned. Nothing else in the crate constrains it: the existing
+    /// `default_database_root()` checks in `tests/foundation.rs:1310-1313` and
+    /// `src/bin/server.rs:696-699` are self-referential, so they stay true for ANY pop count -
+    /// which is exactly how a four-parent overshoot survived. The sibling crate pins its own
+    /// count as a constant (`build_support/mod.rs:184`, asserted at `tests/discovery.rs:312`);
+    /// this is the same pin, restated against the resolved value.
+    ///
+    /// LAYOUT-INDEPENDENT, so it holds both in noobscript and in a standalone checkout: the crate
+    /// sits at `packages/<scope>/<name>` in both, three levels below the directory that owns the
+    /// `workspaces` manifest. In the monorepo the walk-up wins - no `package.json` exists at
+    /// `packages/` or `packages/typecrate/`, and the walk starts at the manifest's PARENT so the
+    /// crate's own manifest is never examined - landing on the very directory the 3-pop fallback
+    /// computes. In a standalone checkout there is no workspaces manifest at all, so `repo_root()`
+    /// returns that fallback verbatim. Any other count is wrong in at least one layout.
+    #[test]
+    fn the_repo_root_is_three_parents_above_the_manifest() {
+        assert_eq!(
+            repo_root(),
+            normalize_lexically(&package_root().join("../../.."))
+        );
+    }
+
+    /// The dump root is a sibling OF the repo root, i.e. four pops in total, because the TS
+    /// reference joins `ROOT` with `'..'` again: `packages/underload/service/server.ts:13` builds
+    /// `ROOT` from three parents and `:25` builds `DATABASE_ROOT = path.join(ROOT, '..',
+    /// 'temporary', 'dump')`. The Rust port mirrors that shape (`services/src/server/mod.rs:139-143`
+    /// does the same), so both runtimes read and write one dump directory.
+    #[test]
+    fn the_database_root_is_a_sibling_of_the_repo_root() {
+        assert_eq!(
+            default_database_root(),
+            normalize_lexically(&package_root().join("../../../../temporary/dump"))
+        );
+    }
 }
