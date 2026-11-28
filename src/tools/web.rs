@@ -9,10 +9,19 @@
 //!     preference order (`WEBSEARCH_ENVIRONMENT = [EXA_API_KEY, TAVILY_API_KEY,
 //!     LINKUP_API_KEY]`) and `WebSearchResult`
 //!     (`{provider, query, maxResults, results: [{title, url, snippet, published?}]}`);
-//!   * `tools/webdownload/download.tool.ts` - the streamed, byte-capped transfer into
-//!     `<cwd>/.underload/downloads/`, the MIME -> attachment-kind table, and the
-//!     `toolMedia(summary, [attachment])` envelope that keeps the bytes OUT of the text
-//!     the model reads.
+//!   * `tools/webdownload/download.tool.ts` - the streamed, byte-capped transfer, the MIME ->
+//!     attachment-kind table, and the `toolMedia(summary, [attachment])` envelope that keeps the
+//!     bytes OUT of the text the model reads.
+//!
+//! The reference writes into a HOST-supplied session downloads folder
+//! (`webdownload/download.tool.ts:294-311`; it no longer has a `<cwd>/.underload/downloads/`
+//! default), and so does this port: the folder is `<sessions dir>/<session id>/downloads`, supplied
+//! through [`super::Options::downloads_root`] and wired once at `runtime.rs:560` from
+//! [`crate::persistence::sessions_dir`] - the same per-session directory
+//! [`crate::store`] removes on `delete_session`, which is why a session's downloaded bytes cannot
+//! outlive it. With no root (a library embedding, no server session) the tool REFUSES before the
+//! transfer rather than falling back to a folder the caller never named; `tests/web_surface.rs`
+//! pins that both halves hold.
 //!
 //! WHAT THIS PORT DOES NOT RE-IMPLEMENT
 //! ------------------------------------
@@ -31,35 +40,50 @@
 //!     only, so a declared `utf-16`/`windows-1252` body is decoded as UTF-8 rather than
 //!     converted.
 //!   * **The SSRF gate** (`request.ts` `safeFetchUrl` + `resolvePublicHost`): a DNS resolution
-//!     check that refuses private/loopback/link-local targets before connecting. A Rust caller
-//!     gets reqwest's own policy plus the redirect-landing refusal below.
-//!   * **`redirects`**: the reference counts hops. `RequestBuilder` in this reqwest version has
-//!     no per-request redirect policy, so the port follows the default policy and refuses a
-//!     response that lands on a different authority than the endpoint (`network error`
-//!     sentence) instead of reporting a hop count.
+//!     check that refuses private/loopback/link-local targets before connecting. This module
+//!     ports it once, in [`ssrf`], and applies it to DOWNLOAD at every hop (the reference
+//!     restates the same gate in `webdownload/download.tool.ts:1229-1354`; one implementation
+//!     serves both). FETCH is the deliberate exception: its existing coverage — and the
+//!     reference tool's own allow-list — run against loopback origins, so fetch keeps the
+//!     format-only rule (`assertPublicUrlHostFormat`, webfetch/request.ts:373-392) and reqwest's
+//!     own connect policy. A deployment that wants fetch gated should route it through
+//!     [`ssrf::resolve_public_host`] the way download does.
+//!   * **`redirects` for fetch**: the reference counts hops. `RequestBuilder` in this reqwest
+//!     version has no per-request redirect policy, so fetch follows the default policy and
+//!     refuses a response that lands on a different authority than the endpoint (`network error`
+//!     sentence) instead of reporting a hop count. DOWNLOAD does count hops: it builds its own
+//!     client with `Policy::none()` and follows them itself, gated each time.
 //!   * **The hosted providers** (`webfetch/exa.ts`, `webfetch/linkup.ts`). `fetch` answers with
 //!     `available = ["native"]`, so asking for `exa`/`linkup` gets the published refusal rather
 //!     than a silently different renderer.
 //!
 //! `search` calls a real provider and normalizes its rows to the shared match shape, and
-//! `download` streams a byte-capped transfer into `.underload/downloads/`. Both state their own
-//! `provider` field, so a caller is never told a richer pipeline ran than did.
+//! `download` streams a byte-capped transfer into the session's own downloads folder. Both state
+//! their own `provider` field, so a caller is never told a richer pipeline ran than did.
+
+use std::collections::BTreeMap;
+use std::io::ErrorKind;
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use reqwest::redirect::Policy;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::contract::{AttachmentKind, HarnessAttachment};
+use crate::payload;
 use crate::tools::result::TOOL_MEDIA_BRAND;
+use crate::tools::ssrf;
 
-/// `MAX_URL_CHARS` (`webdownload/download.tool.ts:299`): a URL longer than this is refused
-/// before it reaches the network.
-pub const MAX_URL_CHARS: usize = 4_096;
+/// `MAX_URL_CHARS` (`webdownload/download.tool.ts:182`, and the same 2 048 in
+/// `webfetch/request.ts:105` / `websearch/request.ts:76`): a URL longer than this is refused
+/// before it reaches the network — never sliced, because a cut URL is a different resource.
+pub const MAX_URL_CHARS: usize = 2_048;
 /// `MAX_DOWNLOAD_ATTACHMENT_BYTES` (`shared/attachments.ts:88`): 20 MiB decoded.
 pub const MAX_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
-/// The default destination folder (`download.tool.ts`'s `.underload/downloads/`).
-pub const DOWNLOAD_FOLDER: &str = ".underload/downloads";
 /// The provider key set, in the documented preference order
 /// (`harnesses/websearch.ts:33` `WEBSEARCH_ENVIRONMENT`).
 pub const SEARCH_ENVIRONMENT: [&str; 3] = ["EXA_API_KEY", "TAVILY_API_KEY", "LINKUP_API_KEY"];
@@ -80,6 +104,18 @@ pub struct WebKeys {
     /// (and this crate's tests) points the same seam at a proxy or a stub server, which is why
     /// it rides on the keys rather than on a process-global environment read at call time.
     pub endpoint_base: Option<String>,
+    /// Resolution answers the **download** SSRF gate consults instead of the system resolver,
+    /// keyed by host name — the mirror of the reference tool's injectable `lookup`
+    /// (webdownload/download.tool.ts:1303, 1322). It is a TEST seam, because the gate has to be
+    /// provable against a host name that resolves to a private address without depending on
+    /// public DNS; entries are consulted before the system resolver, so leaving the map empty
+    /// (production) changes nothing. Download only: `fetch` and `search` never resolve.
+    pub dns_answers: BTreeMap<String, Vec<IpAddr>>,
+    /// Host names reqwest must connect to an explicit address, used to point a PUBLIC host name
+    /// at a loopback stub so the real HTTP leg stays testable behind the gate
+    /// (`ClientBuilder::resolve_to_addrs`). Absent entries resolve normally, and like
+    /// `dns_answers` this serves download only.
+    pub connect_to: BTreeMap<String, Vec<SocketAddr>>,
 }
 
 impl WebKeys {
@@ -98,6 +134,9 @@ impl WebKeys {
             tavily: read("TAVILY_API_KEY"),
             linkup: read("LINKUP_API_KEY"),
             endpoint_base: read("TYPECRATE_WEB_ENDPOINT_BASE"),
+            // Both download seams are process-local overrides: production always runs with the
+            // real resolver and no pinned addresses.
+            ..Self::default()
         }
     }
 
@@ -154,36 +193,6 @@ pub fn validated_url(raw: &str) -> Result<String, String> {
     }
 
     Ok(trimmed.to_owned())
-}
-
-/// Performs one GET, racing the caller's cancellation token so an abort closes the
-/// response stream instead of waiting for the body.
-///
-/// # Errors
-///
-/// The status sentence for a non-2xx response, or the transport failure text.
-async fn get(
-    client: &reqwest::Client,
-    url: &str,
-    signal: &CancellationToken,
-) -> Result<reqwest::Response, String> {
-    let request = client
-        .get(url)
-        .header(
-            "user-agent",
-            "typecrate-harness/1.0 (+https://github.com/noobscript)",
-        )
-        .send();
-
-    tokio::select! {
-        biased;
-        () = signal.cancelled() => Err("the request was cancelled.".to_owned()),
-        outcome = request => match outcome {
-            Ok(response) if response.status().is_success() => Ok(response),
-            Ok(response) => Err(status_sentence(response.status().as_u16())),
-            Err(error) => Err(format!("request to {url} failed: {error}")),
-        },
-    }
 }
 
 /// The sanitized status sentences `webfetch/request.ts:147-154` states per class.
@@ -248,13 +257,22 @@ pub const FETCH_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// `webfetch/request.ts:75` `MAX_CONTENT_CHARS` — 240 000 characters of a page, measured on
 /// the converted text.
 pub const MAX_CONTENT_CHARS: usize = 240_000;
-/// `webfetch/request.ts:85` `MAX_RESULT_BYTES` and `:91` `RESULT_OVERHEAD_BYTES`: the room a
-/// fetch result's own keys cost, measured rather than guessed.
-pub const FETCH_MAX_RESULT_BYTES: usize = 64 * 1024;
-/// `webfetch/request.ts:91`.
+/// `webfetch/request.ts:107` `MAX_RESULT_BYTES` = `MODEL_TOOL_RESULT_BUDGET_BYTES`
+/// (underload/agent/src/protocol.ts:512), restated at `:85` as `MAX_RESULT_BYTES`. It is the
+/// HARNESS budget for one model-facing tool result — 32 KiB — and it is the ceiling the
+/// REFUSED-result rule has to fit inside, so it is the same number
+/// [`crate::tools::result::MODEL_TOOL_RESULT_BUDGET_BYTES`] names. Keeping them as one
+/// published constant is what stops a fetch result growing past the point where the envelope
+/// would replace the tool's own keys.
+pub const FETCH_MAX_RESULT_BYTES: usize = 32 * 1024;
+/// `webfetch/request.ts:118` `RESULT_OVERHEAD_BYTES`: the room a fetch result's OWN keys cost,
+/// measured by `measureResultOverheadBytes` (`:122`) over a 12-key skeleton rather than guessed.
 pub const FETCH_RESULT_OVERHEAD_BYTES: usize = 2_048;
-/// `webfetch/request.ts:99` `MAX_RESULT_CONTENT_BYTES` = 65 536 − 2 048 = 63 488 bytes of
-/// `content` per result.
+/// `webfetch/request.ts:136` `RESULT_FIT_SAFETY_BYTES`: room for the escape growth the fitter
+/// cannot model — it prices strings through the UTF-8 currency and a clipped string may still
+/// need no escaping, but the reverse (needing MORE than measured) is what the margin covers.
+pub const FETCH_RESULT_FIT_SAFETY_BYTES: usize = 64;
+/// `webfetch/request.ts:141` `MAX_RESULT_CONTENT_BYTES`.
 pub const FETCH_MAX_RESULT_CONTENT_BYTES: usize =
     FETCH_MAX_RESULT_BYTES - FETCH_RESULT_OVERHEAD_BYTES;
 /// `webfetch/request.ts:102` `MAX_TITLE_CHARS`.
@@ -281,6 +299,22 @@ pub const FETCH_HONEST_USER_AGENT: &str = "underload-harness";
 pub const FETCH_FLAT_DOCUMENT_SECTIONS: usize = 2;
 /// `webfetch/sections.ts:56` `PROXIMITY_WINDOW_CHARS`.
 pub const FETCH_PROXIMITY_WINDOW_CHARS: usize = 6_000;
+/// `webfetch/sections.ts:219` `PROXIMITY_LINE_SNAP_CHARS`: how far a proximity window's edge may
+/// walk to reach a line boundary. The window's LENGTH is a bound, not an intention — the snap that
+/// rounds the edges may add AT MOST `2 * PROXIMITY_LINE_SNAP_CHARS` to `window_chars` (F3). Both
+/// edges used to snap without limit, and on a newline-free page the close edge fell through to the
+/// end of the document, which turned the "window" back into the whole rest of the page — the exact
+/// cost this mode exists to avoid.
+pub const FETCH_PROXIMITY_LINE_SNAP_CHARS: usize = 200;
+/// `webfetch/index.ts:511` `PROXIMITY_NOTE_CUT` — the sentence a proximity answer carries when the
+/// budget cut the window and a `nextOffset` exists to resume from. It names the argument that has
+/// to GO AWAY, because `offset` is ignored while `query` is set: the unconditional sentence this
+/// replaced told every headingless caller to "use offset", which the tool cannot honour and the
+/// model paid a turn discovering.
+pub const PROXIMITY_NOTE_CUT: &str = "This page has no heading structure, so \"query\" returned a text window around the first match instead of a section; the window was cut by the result size limit. Re-fetch WITHOUT \"query\" and pass the reported \"nextOffset\" as \"offset\" to read on — \"offset\" does nothing while \"query\" is set.";
+/// `webfetch/index.ts:514` `PROXIMITY_NOTE_WHOLE` — the same answer when NOTHING was cut: the
+/// remedy above does not exist, so the sentence says so and offers the two that do.
+pub const PROXIMITY_NOTE_WHOLE: &str = "This page has no heading structure, so \"query\" returned a text window around the first match instead of a section. No \"nextOffset\" is reported, so there is nothing to resume: to read other parts of the page, ask a different \"query\" phrase, or re-fetch without \"query\" and page with \"offset\".";
 /// `webfetch/request.ts:483` `TEXT_IMAGE_MIME` — the one image that IS text.
 const FETCH_TEXT_IMAGE_MIME: &str = "image/svg+xml";
 /// `webfetch/request.ts:475` `IMAGE_MIMES`.
@@ -489,16 +523,26 @@ pub fn select_proximity_with_window(content: &str, query: &str, window_chars: us
     let start = (at as i64 - (i64::try_from(window_chars / 2).unwrap_or(i64::MAX))).max(0) as usize;
     let end = (start + window_chars).min(haystack.len());
 
-    // Snap to line boundaries. A page with no newlines at all has nothing to snap to, so the
-    // raw window is used rather than collapsing to an empty block.
+    // Snap to line boundaries so a window never opens or closes mid-word — but ONLY where the
+    // boundary is CLOSE (`sections.ts:244-262`, F3). An unbounded snap is the defect this bounds:
+    // the open edge used to walk back to the start of its line however long that line was, and the
+    // close edge fell through to the end of the document whenever no newline followed `end`, which
+    // on a newline-free page (one giant line: minified HTML, a pasted log, a CSV with the CRLF
+    // converted away) made the "window" the whole rest of the document.
+    //
+    // Bounded on BOTH edges, the window can never exceed `window_chars + 2 * snap`, and the match
+    // stays inside it: the open edge only moves back from `start`, the close edge only forward from
+    // `end`, and both stop at the bound.
     let from = haystack[..start]
         .iter()
         .rposition(|character| *character == '\n')
+        .filter(|line| start - line <= FETCH_PROXIMITY_LINE_SNAP_CHARS)
         .map_or(start, |line| line + 1);
     let to = haystack[end..]
         .iter()
         .position(|character| *character == '\n')
-        .map_or(haystack.len(), |line| end + line);
+        .filter(|line| *line <= FETCH_PROXIMITY_LINE_SNAP_CHARS)
+        .map_or(end, |line| end + line);
 
     let line = haystack[..at]
         .iter()
@@ -528,23 +572,225 @@ pub fn select_proximity_with_window(content: &str, query: &str, window_chars: us
     }
 }
 
-/// `webfetch/index.ts:282` `fitResult`: shrink the string until its JSON-serialized form fits
-/// the harness's model-facing budget, leaving room for the rest of the result object. The
-/// harness WOULD do this itself, but its envelope replaces the whole result and would drop the
-/// `url`/`title`/`nextOffset` a model needs to resume.
+/// The one place the fetch fit learns what a delivered document costs on the wire: the SAME
+/// currency [`crate::payload`] defines for the harness's model-facing cap, reached through the
+/// crate's own helper rather than a restatement. The reference keeps a private copy of this
+/// measure (`webfetch/index.ts:346` `escapedBytes` + `jsonTextBytes`) and its colocated test
+/// pins it against `core/modelPayloadBytes` precisely because a silent drift between the two
+/// is the F1 defect — a fit that believes it fits.
+///
+/// `document_wire_bytes` prices a whole JSON document, quotes and braces included, counting
+/// every escape the serializer has to write; that is exactly "the raw JSON text of the
+/// serialized result", which is what the envelope in [`fit_result`] has to be measured in.
 #[must_use]
-pub fn fit_result(content: &str) -> String {
-    if content.len() <= FETCH_MAX_RESULT_CONTENT_BYTES {
+fn json_text_bytes(value: &Value) -> usize {
+    payload::document_wire_bytes(value)
+}
+
+/// Measure (2) of the reference (`webfetch/index.ts:417` `resultStringBytes`): what a string
+/// costs when it sits INSIDE the serialized document, i.e. escaped once and then escaped again
+/// by the enclosing string. The tables differ from [`payload::model_payload_bytes`] by exactly
+/// the extra backslash layer, and both are needed: the content pays the nested currency, the
+/// rest of the object pays the raw one, and the two are disjoint by construction.
+///
+/// A lone surrogate cannot exist in a Rust `String`, so the arms that price one
+/// (`webfetch/index.ts:394-403`) have no input here; every other code point costs its UTF-8
+/// width, which is the 4 the reference charges a well-formed surrogate pair.
+#[must_use]
+fn result_string_bytes(value: &str) -> usize {
+    value.chars().map(result_char_bytes).sum()
+}
+
+/// One character in the nested currency (`webfetch/index.ts:346-406`, `nested: true`).
+#[must_use]
+fn result_char_bytes(character: char) -> usize {
+    match character {
+        // Both characters of the `\"` / `\\` pair get escaped again by the enclosing string,
+        // so 2 + 2.
+        '"' | '\\' => 4,
+        // The five controls with a one-character escape: the backslash (2 once escaped) plus
+        // the letter (1).
+        '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 3,
+        // `\u00XX` is six characters of JSON text, only the backslash of which the second
+        // escaping charges again.
+        other if u32::from(other) < 0x20 => 7,
+        // Everything else is written literally by BOTH escaping passes.
+        other => other.len_utf8(),
+    }
+}
+
+/// The heavier of two sentences in the currency the fit spends (`index.ts:522-525`). Used for
+/// the skeleton of a proximity answer, where WHICH sentence ships depends on a `nextOffset` the
+/// fit itself decides — so the skeleton has to cost the worse case, and "worse" is measured,
+/// not guessed from character counts, because a sentence made of quotation marks costs more
+/// than its length.
+#[must_use]
+fn heavier<'a>(first: &'a str, second: &'a str) -> &'a str {
+    if result_string_bytes(first) >= result_string_bytes(second) {
+        first
+    } else {
+        second
+    }
+}
+
+/// Where a cut `query` answer should be resumed from — `index.ts:558` `resumeOffsetForCut`, ported
+/// block by block.
+///
+/// `fit_result` cuts the JOINED answer, and a caller can only page the PAGE, so the cut position
+/// has to be translated back into an offset in the converted document. Every block
+/// `select_sections`/`select_proximity` hands back is a verbatim substring of `content` (both
+/// trim, neither rewrites), so locating it from its own starting line gives an exact anchor: the
+/// offset returned here is the character immediately AFTER the last character the answer
+/// delivered, which is what makes the resume lossless — nothing is skipped, and at most the
+/// synthetic `[line N]` header can overlap with what was already shown.
+///
+/// Returns `None` when no block contains the cut (the answer was not cut) or when a block cannot be
+/// found in the page at all — defensively, a caller then gets no `nextOffset` rather than a wrong
+/// one. Every figure is in CODE UNITS, the unit `offset`, `nextOffset` and `pageCharacters` are all
+/// reported in; bytes are only the intermediate walk.
+#[must_use]
+fn resume_offset_for_cut(content: &str, matches: &[SectionMatch], kept: usize) -> Option<usize> {
+    // Byte offsets of the page's line starts, so a block can be searched for from where it came
+    // from rather than from the top of the document (`lineStartOffset`'s job, in bytes).
+    let line_starts = |line: usize| -> usize {
+        let mut byte = 0_usize;
+
+        for _ in 0..line {
+            let Some(next) = content[byte..].find('\n') else {
+                return content.len();
+            };
+
+            byte += next + 1;
+        }
+
+        byte
+    };
+
+    // Code units before a byte offset: the unit figure the caller pages with.
+    let units_before = |byte: usize| -> usize {
+        content
+            .get(..byte)
+            .unwrap_or(content)
+            .chars()
+            .map(char::len_utf16)
+            .sum()
+    };
+
+    let mut cursor = 0_usize;
+
+    for matched in matches {
+        // The header the answer actually shows, and therefore the offset within the JOINED answer
+        // where this block's text begins (`sectionHeader` + `SECTION_SEPARATOR`, `index.ts:496-499`
+        // — the layout has to be reproduced exactly or `nextOffset` points at the wrong character).
+        let header = section_header(matched);
+        let text_start = cursor + code_units(&header);
+        let block_end = text_start + code_units(&matched.text);
+
+        if kept < block_end {
+            // The block came from `matched.line`, so search from there; the whole document is the
+            // fallback for a block that trimmed away its own line start.
+            let hint = line_starts(matched.line);
+            let found = content
+                .get(hint..)
+                .and_then(|rest| rest.find(&matched.text))
+                .map(|at| hint + at)
+                .or_else(|| content.find(&matched.text))?;
+
+            // A cut that lands in the header or the separator resumes at the block's first real
+            // character, and the answer can never point past the end of the page.
+            let resume_units = if kept <= text_start {
+                units_before(found)
+            } else {
+                units_before(found) + (kept - text_start)
+            };
+
+            return Some(resume_units.min(code_units(content)));
+        }
+
+        cursor = block_end + code_units(SECTION_SEPARATOR);
+    }
+
+    None
+}
+
+/// How a `query` answer is assembled: the label each returned section carries and the blank line
+/// between blocks (`index.ts:494-499`). Named because the resume-offset mapping in
+/// [`resume_offset_for_cut`] has to reproduce this layout EXACTLY to turn a cut position back into
+/// a page offset — if the two drift, `nextOffset` silently points at the wrong character.
+pub const SECTION_SEPARATOR: &str = "\n\n";
+
+/// The one-line label a selected section is shown under (`index.ts:497` `sectionHeader`). A
+/// heading-less section gets a literal placeholder so the block stays self-describing.
+#[must_use]
+fn section_header(matched: &SectionMatch) -> String {
+    format!(
+        "## {} [line {}]\n",
+        if matched.heading.is_empty() {
+            "(no heading)"
+        } else {
+            &matched.heading
+        },
+        matched.line + 1
+    )
+}
+
+/// `webfetch/index.ts:451` `fitResult`: shrink one content string so the WHOLE result object fits
+/// the harness's model-facing cap.
+///
+/// The harness WOULD bound an oversized result itself, but for a JSON DOCUMENT it does not bound
+/// it at all — it refuses the whole value and the delivery site reports the call as FAILED, which
+/// drops the url, title, contentType and nextOffset a model needs in order to resume. Doing the
+/// cutting here, in the cap's own currency, is what keeps the tool's shape AND keeps the call
+/// successful.
+///
+/// `frame` is the result object as it will be serialized; `content` is added as the empty string.
+/// The overhead is MEASURED from it rather than assumed, because the fields around `content` are
+/// not fixed: `url` may be 2,048 characters, `title` 300, `contentType` 200, and a clamp or
+/// proximity `note` may ride along. `FETCH_RESULT_OVERHEAD_BYTES` still decides where the shrink
+/// STARTS (a short-url, no-title result delivers the whole content ceiling), but it can no longer
+/// decide whether the result DELIVERS.
+#[must_use]
+pub fn fit_result(content: &str, frame: &Value) -> String {
+    // The envelope, priced in the cap's currency: every key, every value, the braces, AND the 4
+    // bytes that delimit `content` — because the skeleton carries `content: ""` and each of those
+    // two quotes serializes as `\"`. Measuring them here is what makes the budget below honest;
+    // subtracting them a second time is the defect that made every budget 4 bytes too wide
+    // (`index.ts:437` `CONTENT_QUOTES_BYTES`).
+    let mut skeleton = frame.clone();
+
+    if let Value::Object(map) = &mut skeleton {
+        map.insert("content".to_owned(), json!(""));
+    }
+
+    let envelope = json_text_bytes(&skeleton);
+
+    // Two limits decide the content budget, and the SMALLER one binds: the per-result content
+    // ceiling, and whatever room the envelope leaves under the harness cap. `FETCH_RESULT_FIT_SAFETY_BYTES`
+    // is the room for escape growth this function cannot model.
+    let budget = FETCH_MAX_RESULT_CONTENT_BYTES.min(
+        FETCH_MAX_RESULT_BYTES
+            .saturating_sub(envelope)
+            .saturating_sub(FETCH_RESULT_FIT_SAFETY_BYTES),
+    );
+
+    if result_string_bytes(content) <= budget {
         return content.to_owned();
     }
 
-    // A code-unit slice is an upper bound on a byte-fitting slice; the step is
-    // `Math.max(1, Math.floor(keep * 0.05))`, i.e. one twentieth, never zero.
-    let mut keep = code_units(content).min(FETCH_MAX_RESULT_CONTENT_BYTES);
+    // A code-unit slice is an UPPER BOUND on a byte-fitting slice (one code unit is never fewer
+    // than one byte in either currency), then step back 5% at a time until the escaped form fits.
+    // Bounded by the budget itself, so this terminates.
+    //
+    // The reference trims a trailing lone high half inside the loop; a Rust `String` cannot hold a
+    // surrogate half at all, and `slice_units` cuts on character boundaries, so no candidate can
+    // end on half of a pair and the repair has nothing to do here.
+    let mut keep = code_units(content).min(budget);
     let mut candidate = slice_units(content, keep).to_owned();
 
-    while keep > 0 && candidate.len() > FETCH_MAX_RESULT_CONTENT_BYTES {
-        keep = keep.saturating_sub(keep.max(1) / 20);
+    while keep > 0 && result_string_bytes(&candidate) > budget {
+        // `Math.max(1, Math.floor(keep * 0.05))`: five percent, never zero, so the loop always
+        // moves.
+        keep = keep.saturating_sub((keep / 20).max(1));
         candidate = slice_units(content, keep).to_owned();
     }
 
@@ -1048,8 +1294,13 @@ pub(crate) async fn fetch(
     // received the full text would pay the context cost and not know it.
     if let Some(query) = &invocation.query {
         let sectioned = select_sections(&safe_content, query, FETCH_MAX_QUERY_BLOCKS);
+        // `totalMatches` is the COUNT FROM SELECTION, not from whatever mode answered
+        // (`index.ts:999`): in proximity mode the answer is one window while this figure counts
+        // OCCURRENCES, and that asymmetry is what `capCut` is measured against. Read before the
+        // fallback below can take `sectioned` away.
+        let total_matches = sectioned.total_matches;
         let flat = sectioned.total_sections <= FETCH_FLAT_DOCUMENT_SECTIONS;
-        let answered = if flat && sectioned.total_matches > 0 {
+        let answered = if flat && total_matches > 0 {
             select_proximity(&safe_content, query)
         } else {
             sectioned
@@ -1061,25 +1312,92 @@ pub(crate) async fn fetch(
             ));
         }
 
+        // The blocks are joined through `section_header`/`SECTION_SEPARATOR` rather than an inline
+        // format string, because the resume mapping below reconstructs this exact layout to turn a
+        // cut position back into a page offset.
         let joined = answered
             .matches
             .iter()
-            .map(|matched| {
-                format!(
-                    "## {} [line {}]\n{}",
-                    if matched.heading.is_empty() {
-                        "(no heading)"
-                    } else {
-                        &matched.heading
-                    },
-                    matched.line + 1,
-                    matched.text
-                )
-            })
+            .map(|matched| format!("{}{}", section_header(matched), matched.text))
             .collect::<Vec<_>>()
-            .join("\n\n");
+            .join(SECTION_SEPARATOR);
 
-        let bounded_sections = fit_result(&joined);
+        // Everything a query answer carries that does NOT depend on the fit, named because the
+        // measurement below and the delivered object must agree key for key — a key in one and
+        // not the other is how a result sized to its ceiling arrives over the cap
+        // (`index.ts:991-1013`). Note there is NO `offset` echo in this branch: selection ignores
+        // `offset`, and echoing a number would read as "your offset was applied".
+        let safe_title = title
+            .as_deref()
+            .map(|text| safe_title(&redactor, text))
+            .filter(|text| !text.is_empty());
+        let mut frame = json!({
+            "provider": invocation.provider,
+            "url": page.url,
+            "contentType": slice_units(&redactor.redact(&page.content_type), FETCH_MAX_CONTENT_TYPE_CHARS),
+            "format": invocation.format,
+            "query": query,
+            "matches": answered.matches.len(),
+            "totalSections": answered.total_sections,
+            // The COUNT FROM SELECTION, not from whatever mode answered (`index.ts:999`): in
+            // proximity mode `matches` is one window and `totalMatches` is the number of
+            // OCCURRENCES in the page, and that asymmetry is what makes `capCut` provable.
+            "totalMatches": total_matches,
+            "matchMode": answered.match_mode,
+            "pageCharacters": page_characters,
+            "characters": FETCH_MAX_RESULT_CONTENT_BYTES,
+            "truncated": false,
+            "stopReason": "contentBudget",
+            "nextOffset": page_characters,
+        });
+
+        // A proximity answer is costed with whichever of its two sentences is HEAVIER, because
+        // which one ships depends on the `nextOffset` the fit itself decides
+        // (`index.ts:522-525`, `PROXIMITY_NOTE_SKELETON`).
+        if answered.match_mode == "proximity" {
+            frame["note"] = json!(heavier(PROXIMITY_NOTE_CUT, PROXIMITY_NOTE_WHOLE));
+        }
+
+        if let Some(text) = &safe_title {
+            frame["title"] = json!(text);
+        }
+
+        let bounded_sections = fit_result(&joined, &frame);
+        let bounded_length = code_units(&bounded_sections);
+
+        // Two different limits share the one `truncated` flag and need OPPOSITE responses
+        // (`index.ts:1043-1076`):
+        //   - the result BYTE BUDGET cut the text: more of the already-selected sections exists,
+        //     and paging the page from where the cut landed is the remedy, so `nextOffset` ships;
+        //   - MAX_QUERY_BLOCKS capped the SECTION LIST: the withheld sections are not one page
+        //     away — selection runs on the whole document — so paging cannot reach them and the
+        //     caller has to narrow the query.
+        // `stopReason` names which one closed the answer; when both do, the budget wins the name
+        // because the budget is the one that ships a resume pointer.
+        let budget_cut = bounded_length < code_units(&joined);
+        // The block cap is a HEADING-mode limit, so it is compared against the constant that
+        // imposes it — NOT `totalMatches > matches.length`, which in proximity mode counts phrase
+        // occurrences against a one-window answer and reports `resultCap` while withholding
+        // nothing (`index.ts:1053-1064`).
+        let cap_cut = answered.match_mode == "heading" && total_matches > FETCH_MAX_QUERY_BLOCKS;
+        let stop_reason = if budget_cut {
+            "contentBudget"
+        } else if cap_cut {
+            "resultCap"
+        } else {
+            ""
+        };
+
+        // Where a budget-cut answer resumes: an offset into the converted PAGE, to be passed back
+        // as `offset` WITHOUT `query`. Absent when the cap rather than the budget caused the
+        // truncation, because there is no page position that reaches the withheld sections
+        // (`index.ts:1070-1072`).
+        let next_offset = if budget_cut {
+            resume_offset_for_cut(&safe_content, &answered.matches, bounded_length)
+        } else {
+            None
+        };
+
         let mut result = Map::new();
 
         for (key, value) in [
@@ -1096,38 +1414,48 @@ pub(crate) async fn fetch(
                 ),
             ),
             ("format", json!(invocation.format)),
-            ("characters", json!(code_units(&bounded_sections))),
-            (
-                "truncated",
-                json!(
-                    code_units(&bounded_sections) < code_units(&joined)
-                        || answered.total_matches > answered.matches.len()
-                ),
-            ),
-            ("content", json!(bounded_sections)),
             ("query", json!(query)),
             ("matches", json!(answered.matches.len())),
             ("totalSections", json!(answered.total_sections)),
-            ("totalMatches", json!(answered.total_matches)),
+            ("totalMatches", json!(total_matches)),
             ("matchMode", json!(answered.match_mode)),
+            ("pageCharacters", json!(page_characters)),
         ] {
             result.insert(key.to_owned(), value);
         }
 
-        // A proximity hit is an EXCERPT, not a section, and the two are not equally
-        // authoritative — so the mode that ran is spelled out.
-        if answered.match_mode == "proximity" {
-            result.insert("note".to_owned(), json!("This page has no heading structure, so \"query\" returned a text window around the first match instead of a section. Use \"offset\" to read further."));
+        if let Some(text) = safe_title {
+            result.insert("title".to_owned(), Value::String(text));
         }
 
-        result.insert("pageCharacters".to_owned(), json!(page_characters));
+        result.insert("characters".to_owned(), json!(bounded_length));
+        // True when the returned sections were cut, or when matching sections were dropped by the
+        // block cap — either way, more exists. Which kind it is comes from `stopReason`, because
+        // the two have different remedies and one flag alone sent the caller paging for content
+        // paging cannot reach.
+        result.insert("truncated".to_owned(), json!(budget_cut || cap_cut));
+        result.insert("content".to_owned(), json!(bounded_sections));
 
-        if let Some(text) = title
-            .as_deref()
-            .map(|text| safe_title(&redactor, text))
-            .filter(|text| !text.is_empty())
-        {
-            result.insert("title".to_owned(), Value::String(text));
+        if !stop_reason.is_empty() {
+            result.insert("stopReason".to_owned(), json!(stop_reason));
+        }
+
+        // A proximity hit is an EXCERPT, not a section, and the two are not equally authoritative
+        // — so the mode that ran is spelled out. The sentence is chosen from the resume pointer
+        // itself: the remedy it names ("use offset") only exists when the pointer does
+        // (`index.ts:1077-1086`).
+        if answered.match_mode == "proximity" {
+            result.insert(
+                "note".to_owned(),
+                json!(match next_offset {
+                    None => PROXIMITY_NOTE_WHOLE,
+                    Some(_) => PROXIMITY_NOTE_CUT,
+                }),
+            );
+        }
+
+        if let Some(offset) = next_offset {
+            result.insert("nextOffset".to_owned(), json!(offset));
         }
 
         return Ok(Value::Object(result));
@@ -1135,13 +1463,71 @@ pub(crate) async fn fetch(
 
     // The character bound and the RESULT bound are two different limits: MAX_CONTENT_CHARS is
     // what a page may yield across all of its pages, and `fit_result` then keeps ONE result
-    // inside the model-facing cap.
+    // inside the model-facing cap, measured in that cap's own escaped-byte currency, so the
+    // result is never REFUSED by the harness's result-budget envelope — a refused document loses
+    // the url, the `truncated` flag and the `nextOffset` a model needs in order to resume
+    // (`index.ts:1120-1131`).
     let window = slice_units(window, MAX_CONTENT_CHARS);
-    let output = fit_result(window);
+
+    // Which disclosure this window ships, decided BEFORE the fit because the sentence has to be
+    // costed in the skeleton (`index.ts:1141-1152`). The clamp outranks every other note: a caller
+    // that overshot needs to know which window it actually received.
+    let note = if offset_clamped {
+        format!(
+            "Requested offset {} is past the end of this {page_characters}-character page; showing what remains from {start_offset}. The page is fully read once \"content\" is empty.",
+            invocation.offset
+        )
+    } else {
+        String::new()
+    };
+
+    // A title is part of the RESULT, so it has to be in the skeleton the content fit measures
+    // (`index.ts:916-924`): it used to be computed after the fit, in the object literal, which is
+    // one of the ways a result sized exactly to its ceiling arrived over the harness cap — the 300
+    // characters of title and the key that carries them were never budgeted.
+    let safe_title = title
+        .as_deref()
+        .map(|text| safe_title(&redactor, text))
+        .filter(|text| !text.is_empty());
+
+    // The fields that do NOT depend on the fit are costed here and delivered below, and every
+    // fit-dependent figure is placed at its WIDEST possible value, so the overhead can only be
+    // over-counted: `characters` can never exceed the content ceiling, `nextOffset` can never pass
+    // the end of the page, and an optional key is present when it may be absent (`index.ts:1154-1179`).
+    let mut frame = json!({
+        "provider": invocation.provider,
+        "url": page.url,
+        "contentType": slice_units(&redactor.redact(&page.content_type), FETCH_MAX_CONTENT_TYPE_CHARS),
+        "format": invocation.format,
+        "pageCharacters": page_characters,
+        // The offset this window ACTUALLY started at, echoed so a caller paging through a document
+        // always knows where it is, even when its own offset was out of range.
+        "offset": start_offset,
+        "characters": FETCH_MAX_RESULT_CONTENT_BYTES,
+        // `false` is the WIDER spelling of this boolean ("true" is shorter), and the true case adds
+        // only the `nextOffset` key the skeleton already costs.
+        "truncated": false,
+        "nextOffset": page_characters,
+    });
+
+    if offset_clamped {
+        frame["offsetClamped"] = json!(true);
+    }
+
+    if !note.is_empty() {
+        frame["note"] = json!(note.clone());
+    }
+
+    if let Some(text) = &safe_title {
+        frame["title"] = json!(text);
+    }
+
+    let output = fit_result(window, &frame);
     let output_length = code_units(&output);
 
-    // True only when bytes exist BEYOND what is returned here: the end of the last window is
-    // not truncation.
+    // True only when bytes exist BEYOND what is returned here: the end of the last window is not
+    // truncation. `truncated` is computed from the SOURCE length, which is what fixes the
+    // off-by-one where a page cut exactly at the budget claimed to be whole.
     let truncated = start_offset + output_length < page_characters;
 
     let mut result = Map::new();
@@ -1160,37 +1546,33 @@ pub(crate) async fn fetch(
             ),
         ),
         ("format", json!(invocation.format)),
-        ("characters", json!(output_length)),
-        ("truncated", json!(truncated)),
-        ("content", json!(output)),
         ("pageCharacters", json!(page_characters)),
         ("offset", json!(start_offset)),
     ] {
         result.insert(key.to_owned(), value);
     }
 
-    // Where the NEXT window starts, present only when more exists. Every other content tool in
-    // the harness pages; fetch used to be the one that silently lost the rest.
-    if truncated {
-        result.insert("nextOffset".to_owned(), json!(start_offset + output_length));
+    if !note.is_empty() {
+        result.insert("note".to_owned(), json!(note));
     }
 
     if offset_clamped {
         result.insert("offsetClamped".to_owned(), json!(true));
-        result.insert(
-            "note".to_owned(),
-            json!(format!(
-                "Requested offset {} is past the end of this {page_characters}-character page; showing what remains from {start_offset}. The page is fully read once \"content\" is empty.",
-                invocation.offset
-            )),
-        );
     }
 
-    if let Some(text) = title
-        .as_deref()
-        .map(|text| safe_title(&redactor, text))
-        .filter(|text| !text.is_empty())
-    {
+    result.insert("characters".to_owned(), json!(output_length));
+    result.insert("truncated".to_owned(), json!(truncated));
+    result.insert("content".to_owned(), json!(output));
+
+    // Where the NEXT window starts, present only when more exists. Every other content tool in
+    // the harness pages; fetch used to be the one that silently lost the rest. This branch keeps
+    // the plain `startOffset + content.length` pointer: with no `query` there is no section list
+    // to snap against, and the byte cut lands wherever the budget ended.
+    if truncated {
+        result.insert("nextOffset".to_owned(), json!(start_offset + output_length));
+    }
+
+    if let Some(text) = safe_title {
         result.insert("title".to_owned(), Value::String(text));
     }
 
@@ -1312,8 +1694,16 @@ pub const SEARCH_MAX_RESULTS_LIMIT: usize = 20;
 /// `websearch/request.ts:60` `SEARCH_TIMEOUT_MS`. No retry: a timeout is reported once.
 pub const SEARCH_TIMEOUT_MS: u64 = 15_000;
 /// `websearch/request.ts:65` `MAX_RESPONSE_BYTES` (512 KiB), checked on `content-length`
-/// AND while streaming.
+/// AND while streaming. This is what the PROVIDER may send; it is 16x the number the model
+/// ever sees, because the transport cap and the delivery cap answer different questions —
+/// the first is "may I read this body", the second is "may I put this in a prompt".
 pub const SEARCH_MAX_RESPONSE_BYTES: usize = 512 * 1024;
+/// `websearch/request.ts:127` `MAX_SEARCH_RESULT_BYTES`, kept EQUAL to the harness's
+/// `MODEL_TOOL_RESULT_BUDGET_BYTES` (`src/tools/result.rs`) for the same reason the reference
+/// keeps it equal to `MAX_MODEL_TOOL_RESULT_BYTES`: this is the figure the delivery fit spends,
+/// and a tool that spends a different number than the transport charges is a tool whose results
+/// get JSON-refused.
+pub const SEARCH_MAX_RESULT_BYTES: usize = 32 * 1024;
 /// `websearch/request.ts:67` `MAX_TITLE_CHARS`.
 pub const SEARCH_MAX_TITLE_CHARS: usize = 300;
 /// `websearch/request.ts:68` `MAX_SNIPPET_CHARS`.
@@ -1559,15 +1949,26 @@ fn normalize_matches(
     max_results: usize,
     redactor: &Redactor,
     reader: RowReader,
-) -> Vec<Value> {
+) -> (Vec<Value>, usize) {
     let mut matches: Vec<Value> = Vec::new();
+    let mut dropped = 0_usize;
 
-    for row in rows.iter().take(max_results) {
-        let Value::Object(row) = row else { continue };
+    for row in rows {
+        // Stop on the VALID count, never on the row index: the caller's quota is what this
+        // loop spends, and a provider that pads its answer with junk must not spend it.
+        if matches.len() >= max_results {
+            break;
+        }
+
+        let Value::Object(row) = row else {
+            dropped += 1;
+            continue;
+        };
 
         let fields = reader.read(row);
 
         let Some(url) = valid_url(fields.url.as_deref()) else {
+            dropped += 1;
             continue;
         };
 
@@ -1576,6 +1977,7 @@ fn normalize_matches(
         let safe_url = redactor.redact(&url);
 
         if code_units(&safe_url) > SEARCH_MAX_URL_CHARS {
+            dropped += 1;
             continue;
         }
 
@@ -1615,7 +2017,7 @@ fn normalize_matches(
         matches.push(Value::Object(entry));
     }
 
-    matches
+    (matches, dropped)
 }
 
 /// The display form of an argument inside a refusal sentence, matching JS `String(value)`
@@ -1838,15 +2240,61 @@ fn read_invocation(
         return Err("search \"until\" must not be earlier than \"since\".".to_owned());
     }
 
+    // Every remaining field is read here, in the order the reference evaluates them (maxResults,
+    // provider, includeDomains, excludeDomains, category, speed): a caller that passes both a bad
+    // field AND a bad combination still gets the precise FIELD error first, which is the
+    // precedence the existing filter tests pin.
+    let max_results = read_max_results(input.get("maxResults"))?;
+    let provider = read_provider(input.get("provider"), configured)?;
+    let include_domains = read_domains(input.get("includeDomains"), "includeDomains")?;
+    let exclude_domains = read_domains(input.get("excludeDomains"), "excludeDomains")?;
+    let category = read_category(input.get("category"))?;
+    let speed = read_speed(input.get("speed"))?;
+
+    // The combination rules the model-facing description states, enforced HERE so a caller that
+    // read the warning does not pay a provider round trip for `Exa search failed (HTTP 400).` — a
+    // message naming NO field, because provider bodies are deliberately never surfaced. Same policy
+    // as the domain grammar and the ISO date check above.
+    //
+    // F11 — these are EXA's rules, so they are gated on the RESOLVED provider. They used to run
+    // before dispatch, against every provider, and only Exa receives `category` at all: Tavily maps
+    // the dates to `start_date`/`end_date` and simply has no category field, so the call was refused
+    // for a provider that was never going to answer 400. A refusal the resolved provider cannot
+    // justify is not a guard, it is a lost query. Only the combinations verified against the live
+    // provider are refused — `company` + excludeDomains and `news` + date filters both work
+    // remotely and must not be over-rejected.
+    let dated = since.is_some() || until.is_some();
+
+    if provider == "exa" && category.as_deref() == Some("people") && dated {
+        return Err(
+            "search category \"people\" does not support date filters. Drop \"since\"/\"until\", or use another category."
+                .to_owned(),
+        );
+    }
+
+    if provider == "exa" && category.as_deref() == Some("company") && dated {
+        return Err(
+            "search category \"company\" does not support date filters. Drop \"since\"/\"until\", or use another category."
+                .to_owned(),
+        );
+    }
+
+    if provider == "exa" && category.as_deref() == Some("people") && exclude_domains.is_some() {
+        return Err(
+            "search category \"people\" does not support \"excludeDomains\". Drop the category or the domain filter."
+                .to_owned(),
+        );
+    }
+
     Ok(SearchInvocation {
-        max_results: read_max_results(input.get("maxResults"))?,
-        provider: read_provider(input.get("provider"), configured)?,
-        include_domains: read_domains(input.get("includeDomains"), "includeDomains")?,
-        exclude_domains: read_domains(input.get("excludeDomains"), "excludeDomains")?,
+        max_results,
+        provider,
+        include_domains,
+        exclude_domains,
         since,
         until,
-        category: read_category(input.get("category"))?,
-        speed: read_speed(input.get("speed"))?,
+        category,
+        speed,
         query,
     })
 }
@@ -2028,7 +2476,7 @@ async fn exa_search(
     base: Option<&str>,
     redactor: &Redactor,
     signal: &CancellationToken,
-) -> Result<Vec<Value>, String> {
+) -> Result<(Vec<Value>, usize), String> {
     const LABEL: &str = "Exa";
 
     // `lite` is the documented low-latency mode that answers from Exa's index; `auto` is Exa's
@@ -2096,7 +2544,7 @@ async fn tavily_search(
     base: Option<&str>,
     redactor: &Redactor,
     signal: &CancellationToken,
-) -> Result<Vec<Value>, String> {
+) -> Result<(Vec<Value>, usize), String> {
     const LABEL: &str = "Tavily";
 
     let mut body = json!({
@@ -2156,7 +2604,7 @@ async fn linkup_search(
     base: Option<&str>,
     redactor: &Redactor,
     signal: &CancellationToken,
-) -> Result<Vec<Value>, String> {
+) -> Result<(Vec<Value>, usize), String> {
     const LABEL: &str = "Linkup";
 
     let payload = request_search(
@@ -2187,6 +2635,221 @@ fn attach(body: &mut Value, key: &str, value: Option<Value>) {
     if let Some(value) = value {
         body[key] = value;
     }
+}
+
+/// `websearch/index.ts:447` `unusableRowsNote`: the F5 sentence, and the only place the
+/// reference blames the PROVIDER rather than the query. `%s` is the provider label.
+#[must_use]
+pub fn unusable_rows_note(provider: &str, dropped: usize) -> String {
+    format!(
+        "{label} returned {dropped} result {} with no usable http(s) URL, so none of them could be shown. The provider did answer: the query is not necessarily at fault.",
+        if dropped == 1 { "row" } else { "rows" },
+        label = search_label(provider),
+    )
+}
+
+/// `websearch/index.ts:453` `sizeNote`: which rows went, and the two levers that bring detail
+/// back. Naming `maxResults` and "narrow the query" matters, because the model is the one
+/// holding both knobs — a truncation it cannot attribute is a truncation it cannot work around.
+#[must_use]
+pub fn size_note(omitted: usize, total: usize, clipped: bool) -> String {
+    let budget = format!("the {SEARCH_MAX_RESULT_BYTES}-byte result budget");
+    let rows = format!(
+        "{omitted} of {total} result {}",
+        if total == 1 { "row" } else { "rows" }
+    );
+
+    if omitted == 0 {
+        // Only the clip step can reach here: every row is present, just with a shorter
+        // excerpt than the provider sent.
+        return format!(
+            "The single result was too large for {budget}: its excerpt was shortened. Narrow the query or lower maxResults for more per-row detail."
+        );
+    }
+
+    if omitted == total {
+        return format!(
+            "All {total} result {} too large to deliver within {budget}, so none are shown. Lower maxResults or narrow the query.",
+            if total == 1 { "row was" } else { "rows were" }
+        );
+    }
+
+    format!(
+        "{rows} {} omitted to fit {budget}{}. Narrow the query or lower maxResults for more per-row detail.",
+        if total == 1 { "was" } else { "were" },
+        if clipped {
+            ", and the excerpt that remains was shortened"
+        } else {
+            ""
+        }
+    )
+}
+
+/// The provider label used in failure and note sentences (`websearch/index.ts:104` `LABELS`).
+#[must_use]
+fn search_label(provider: &str) -> &'static str {
+    match provider {
+        "tavily" => "Tavily",
+        "linkup" => "Linkup",
+        _ => "Exa",
+    }
+}
+
+/// `websearch/request.ts:425` `fitRowsToResultBudget`: drop TRAILING rows until the delivered
+/// document fits (the provider's order IS its ranking, so a prefix keeps what the caller was
+/// most likely to cite), then clip the single remaining row's excerpt by bisection.
+///
+/// `measure` is supplied by the caller because the number that matters is the WHOLE result —
+/// rows plus echoed filters plus the `resultsTruncated`/`note` this function makes the caller
+/// add. A fit that priced the rows alone lands back over the cap once the explanation is
+/// attached, which is the exact failure this replaced.
+///
+/// INVARIANT: the returned rows satisfy `measure(rows) <= budget`, or the rows are empty.
+fn fit_rows_to_result_budget(
+    rows: &[Value],
+    budget: usize,
+    measure: &dyn Fn(&[Value]) -> usize,
+) -> (Vec<Value>, bool, bool) {
+    let mut fitted = rows.to_vec();
+
+    // The common path, and the shape every default call takes: an untouched search costs one
+    // measurement and adds no flag and no note.
+    if fitted.is_empty() || measure(&fitted) <= budget {
+        return (fitted, false, false);
+    }
+
+    // Drop from the END, keeping at least one row for the clip step below.
+    while fitted.len() > 1 && measure(&fitted) > budget {
+        fitted.pop();
+    }
+
+    let mut clipped = false;
+
+    // One row still over the budget is CLIPPED rather than thrown away: a short excerpt with a
+    // real URL beats "no results".
+    if fitted.len() == 1 && measure(&fitted) > budget {
+        let original = fitted[0].clone();
+        let snippet = original
+            .get("snippet")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let units = code_units(&snippet);
+
+        // The clip is a row, not a string: `snippetTruncated` claims "this excerpt does not
+        // reach the source's own end", and that flag is PAYLOAD too. Bisecting without it
+        // lands ~23 bytes over the cap and the row then gets dropped for nothing.
+        let clip_to = |kept: usize| -> Value {
+            let mut row = original.clone();
+
+            if kept == 0 {
+                row["snippet"] = json!("");
+                row.as_object_mut()
+                    .expect("an object row")
+                    .remove("snippetTruncated");
+            } else {
+                row["snippet"] = json!(slice_units(&snippet, kept));
+                row["snippetTruncated"] = json!(true);
+            }
+
+            row
+        };
+
+        // Escaping is per character, so `measure` is monotone in the snippet and the largest
+        // fitting prefix falls out of a bisection over code units (at most ~10 measures for a
+        // 1 000-character excerpt). Guessing a character count instead would be wrong by the
+        // escaped width of every quote and non-ASCII letter in the row.
+        let mut low = 0_usize;
+        let mut high = units;
+
+        while low < high {
+            // Upper midpoint: `mid` is always > `low`, so the loop cannot stall when the
+            // answer is `low + 1`.
+            let mid = (low + high).div_ceil(2);
+
+            if measure(&[clip_to(mid)]) <= budget {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+
+        fitted[0] = clip_to(low);
+        clipped = true;
+
+        // A row whose TITLE and URL alone exceed the budget cannot be rescued by clipping its
+        // excerpt; dropping it still beats a result the harness refuses.
+        if measure(&fitted) > budget {
+            fitted.clear();
+        }
+    }
+
+    (fitted, true, clipped)
+}
+
+/// `websearch/index.ts:475` `fitToDeliveryBudget`: hand back a result the harness cannot
+/// refuse. `render` is the ONE place the delivered object is built once trimming starts, so a
+/// measurement can never price a shape other than the one actually returned.
+fn fit_to_delivery_budget(result: Value) -> Value {
+    let rows = result
+        .get("results")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    // Measured exactly as it will be delivered, so an untouched result costs one stringify.
+    if payload::document_wire_bytes(&result) <= SEARCH_MAX_RESULT_BYTES {
+        return result;
+    }
+
+    let total = rows.len();
+    let original_note = result
+        .get("note")
+        .and_then(Value::as_str)
+        .filter(|note| !note.is_empty())
+        .map(str::to_owned);
+
+    let render = |candidate: &[Value], clipped: bool| -> Value {
+        let omitted = total - candidate.len();
+        let mut notes: Vec<String> = Vec::new();
+
+        if let Some(note) = &original_note {
+            notes.push(note.clone());
+        }
+
+        if omitted > 0 || clipped {
+            notes.push(size_note(omitted, total, clipped));
+        }
+
+        let mut rendered = result.clone();
+        rendered["results"] = Value::Array(candidate.to_vec());
+        rendered["resultsTruncated"] = json!(true);
+
+        if !notes.is_empty() {
+            rendered["note"] = json!(notes.join(" "));
+        } else {
+            rendered
+                .as_object_mut()
+                .expect("an object result")
+                .remove("note");
+        }
+
+        rendered
+    };
+
+    let (fitted, truncated, clipped) =
+        fit_rows_to_result_budget(&rows, SEARCH_MAX_RESULT_BYTES, &|candidate| {
+            // `clipped` is unknown while rows are still being dropped, and passing `true` is
+            // the conservative direction: it can only cost the note a few bytes, and the final
+            // render below is the one the caller sees.
+            payload::document_wire_bytes(&render(candidate, true))
+        });
+
+    if !truncated {
+        return result;
+    }
+
+    render(&fitted, clipped)
 }
 
 /// `websearch/index.ts:487` `createWebSearchTool().execute`.
@@ -2234,7 +2897,7 @@ pub(crate) async fn search(
     );
 
     let base = keys.endpoint_base.as_deref();
-    let results = if invocation.provider == "exa" {
+    let (results, dropped) = if invocation.provider == "exa" {
         exa_search(client, &invocation, &api_key, base, &redactor, signal).await?
     } else if invocation.provider == "tavily" {
         tavily_search(client, &invocation, &api_key, base, &redactor, signal).await?
@@ -2252,6 +2915,19 @@ pub(crate) async fn search(
         "maxResults": invocation.max_results,
         "results": results,
     });
+
+    // F5 — the count of provider rows this call could not use, surfaced ONLY when non-zero so
+    // the common result keeps its exact previous shape, and the sentence for the case where
+    // that cost the caller everything: `results: []` from a provider that answered is a
+    // different situation from an empty index, and the model can only act on the difference if
+    // the result states it.
+    if dropped > 0 {
+        result["droppedResults"] = json!(dropped);
+    }
+
+    if results.is_empty() && dropped > 0 {
+        result["note"] = json!(unusable_rows_note(invocation.provider, dropped));
+    }
 
     attach(
         &mut result,
@@ -2275,7 +2951,10 @@ pub(crate) async fn search(
         result["speed"] = json!(invocation.speed);
     }
 
-    Ok(result)
+    // F2 — the LAST thing that touches the result: it runs after redaction (rows leave whole,
+    // so a credential can never be cut at a fit boundary) and after every filter echo (so
+    // those bytes are counted too).
+    Ok(fit_to_delivery_budget(result))
 }
 
 // ---------------------------------------------------------------------------
@@ -2307,176 +2986,985 @@ pub fn kind_for_mime(mime: &str) -> AttachmentKind {
     AttachmentKind::File
 }
 
-/// A plain file name out of an untrusted string: no path, no separators, no control
-/// characters, at most 120 characters (`download.tool.ts`'s sanitizer).
+/// The `filename*` parameter pattern (`EXTENDED_NAME`, `download.tool.ts:976`).
+static DISPOSITION_EXTENDED: OnceLock<regex::Regex> = OnceLock::new();
+/// The `filename` parameter pattern (`PLAIN_NAME`, `download.tool.ts:977`).
+static DISPOSITION_PLAIN: OnceLock<regex::Regex> = OnceLock::new();
+/// The `UTF-8''` prefix of an RFC 5987 value (`:985`).
+static EXTENDED_PREFIX: OnceLock<regex::Regex> = OnceLock::new();
+/// The drive-colon form a `path` argument may not use (`:332`).
+static DRIVE_PREFIX: OnceLock<regex::Regex> = OnceLock::new();
+
+/// `download.tool.ts:172` `DOWNLOAD_TIMEOUT_MS`: 60 s for the WHOLE transfer, because a 20 MiB
+/// file over an ordinary link is a legitimate minute. A slow start, a slow body, and a slow DNS
+/// answer all spend from this one budget; the resolve watchdog inside it is
+/// [`ssrf::RESOLVE_TIMEOUT_MS`].
+pub const DOWNLOAD_TIMEOUT_MS: u64 = 60_000;
+/// `download.tool.ts:178` `MAX_REDIRECT_HOPS`, the same cap `webfetch/request.ts` puts on fetch:
+/// a redirect loop must not pin the session. Five hops are FOLLOWED; the sixth is refused.
+pub const MAX_REDIRECT_HOPS: usize = 5;
+/// `download.tool.ts:190` `MAX_NAME_CHARS`.
+pub const DOWNLOAD_MAX_NAME_CHARS: usize = 200;
+/// `download.tool.ts:265` `MAX_PATH_CHARS`: a `path` argument is bounded like every other
+/// model-supplied string here.
+pub const DOWNLOAD_MAX_PATH_CHARS: usize = 512;
+/// `download.tool.ts:281` `GREP_MAX_FILE_BYTES`, restated as a literal because the `searchable`
+/// flag CLAIMS what `grep` will do with the file, and a claim about a sibling tool has to name
+/// that tool's own bound.
+pub const DOWNLOAD_GREP_MAX_FILE_BYTES: u64 = 1024 * 1024;
+/// `download.tool.ts:386` — the `-1`, `-2`, … suffix budget before the unique-name refusal.
+pub const DOWNLOAD_UNIQUE_ATTEMPTS: usize = 50;
+/// `download.tool.ts:259` `FALLBACK_MIME`: a missing content type is a real MIME, never the empty
+/// string (the attachment validator requires one).
+pub const DOWNLOAD_FALLBACK_MIME: &str = "application/octet-stream";
+/// The per-session subfolder inside the session directory. The TypeScript host composes the same
+/// path in `harnessSessionDownloadsDirectoryOf`; here the session directory is
+/// `persistence::sessions_dir(root)/<session_id>` (`src/journal.rs:354`), which is the directory
+/// `delete_session` removes (`src/store/session.rs:483`) — and that is the whole point: a session
+/// owns its bytes, so removing the session removes the downloads with it.
+pub const HARNESS_SESSION_DOWNLOADS_DIRECTORY: &str = "downloads";
+/// The fail-closed sentence (`download.tool.ts:302-304`). A folder chosen by the TOOL is a folder
+/// nobody owns, so with no session folder there is no owner and the call refuses BEFORE a byte is
+/// transferred, rather than writing somewhere the caller never named.
+pub const DOWNLOAD_SESSION_REQUIRED: &str = "download needs a session: this harness has no session downloads folder, so there is nowhere to save the file. Run it inside a server session, or build the harness with `downloadsDirectory`.";
+/// The URL shape refusal (`download.tool.ts:1291`).
+pub const DOWNLOAD_URL_INVALID: &str =
+    "download requires an absolute http(s) URL without credentials.";
+/// `download.tool.ts:1370` — the one network sentence. The platform's own error text is never
+/// echoed: a signed URL's query may carry a token, and the message must not repeat it.
+pub const DOWNLOAD_UNREACHABLE: &str = "download could not be reached (network error).";
+/// `download.tool.ts:1044` `oversize`.
 #[must_use]
-pub fn sanitize_name(raw: &str) -> Option<String> {
-    let cleaned: String = raw
-        .chars()
-        .filter(|character| !character.is_control() && !matches!(character, '/' | '\\' | ':' | '?'))
-        .collect();
+pub fn download_oversize() -> String {
+    format!("download rejects files larger than {MAX_DOWNLOAD_BYTES} bytes (20 MiB).")
+}
 
-    let cleaned = cleaned.trim().replace(' ', "-");
+/// `download.tool.ts:1031-1039` `statusFailure`: one fixed sentence per status class, and the
+/// response BODY is never echoed (an error page is HTML noise).
+#[must_use]
+pub fn download_status_failure(status: u16) -> String {
+    match status {
+        404 => "download could not find the file (HTTP 404).".to_owned(),
+        401 | 403 => format!("download was denied access to the file (HTTP {status})."),
+        429 => "download is rate limited by the host (HTTP 429). Try again later.".to_owned(),
+        other => format!("download failed (HTTP {other})."),
+    }
+}
 
-    if cleaned.is_empty() {
+/// `download.tool.ts:847` `refusedUrl`. `detail` is the host or address gate 2 blamed, and it is
+/// carried because "the URL you gave me" and "the address that name answered" are different facts.
+#[must_use]
+pub fn refused_url(detail: Option<&str>) -> String {
+    format!(
+        "download refuses this URL: it is not a public absolute http(s) address (loopback and private addresses are not downloaded){}.",
+        match detail {
+            None => String::new(),
+            Some(value) => format!(" — {value} resolves to a non-public address"),
+        }
+    )
+}
+
+/// `download.tool.ts:857` `refusedHop`: its own sentence, because the model's argument and a
+/// third-party host's redirect behaviour are things the caller can act on separately.
+#[must_use]
+pub fn refused_hop(status: u16, address: Option<&str>) -> String {
+    format!(
+        "download refused a redirect to a non-public address (HTTP {status}){}.",
+        match address {
+            None => String::new(),
+            Some(value) => format!(" — {value}"),
+        }
+    )
+}
+
+/// Gates 1 and 2 on one URL (`safeDownloadUrl` + `resolvePublicHost`, `download.tool.ts:736-745`
+/// and `:749`), reported with the caller's own sentence.
+///
+/// GATE 1 RUNS FIRST AND IS UNCONDITIONAL: it costs nothing, needs no resolver, and it is the only
+/// gate that can see an address LITERAL (gate 2 has no verdict when no resolver answers — see the
+/// fail-open rule in [`ssrf`]).
+async fn gate_download_url(url: &str, resolver: &ssrf::Resolver) -> Result<(), Option<String>> {
+    let host = ssrf::hostname_of(url).ok_or(None)?;
+
+    if ssrf::is_private_host(&host) {
+        return Err(None);
+    }
+
+    let verdict = ssrf::resolve_public_host(&host, resolver).await;
+
+    if verdict.blocked {
+        // The address LIST the resolver answered with, not the hostname: `refusedUrl` is passed
+        // `firstHop.address ?? hostname` (download.tool.ts:1347), because the actionable fact is
+        // what the name pointed at.
+        return Err(Some(verdict.address.unwrap_or(host)));
+    }
+
+    Ok(())
+}
+
+/// A `Location` header resolved against the URL that produced it (`redirectLocation`,
+/// `download.tool.ts:865-873`). A relative `Location` is legal and common, so it is RESOLVED rather
+/// than rejected; the result still has to pass both gates before anything is asked for it.
+#[must_use]
+fn redirect_location(location: Option<&str>, from: &str) -> Option<String> {
+    let location = location?.trim();
+
+    if location.is_empty() {
         return None;
     }
 
-    Some(cleaned.chars().take(120).collect())
+    reqwest::Url::parse(from)
+        .ok()?
+        .join(location)
+        .ok()
+        .map(|target| target.to_string())
 }
 
-/// The name a download takes when the caller did not supply one: the URL's last path
-/// segment, or a fixed fallback.
-fn name_from_url(url: &str) -> String {
-    let tail = url
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(url)
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_owned();
+/// The client for one download. `Policy::none()` is not a style choice
+/// (`download.tool.ts:1349-1355`): a platform that follows redirects itself resolves `Location` and
+/// connects to the new host BEFORE this function regains control, so one 302 from a public URL into
+/// loopback delivers internal bytes to the model and to disk. Taking the hops here is what keeps
+/// every destination inside the gate.
+///
+/// This is also why `fetch` and `download` cannot share one client: `RequestBuilder` in this reqwest
+/// version has no per-request redirect policy, so the no-follow policy needs a client of its own.
+fn download_client(keys: &WebKeys) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .redirect(Policy::none())
+        .timeout(Duration::from_millis(DOWNLOAD_TIMEOUT_MS))
+        .user_agent(FETCH_BROWSER_USER_AGENT);
 
-    sanitize_name(&tail).unwrap_or_else(|| "download".to_owned())
+    // The test seam: a PUBLIC host name pinned to a stub address, so the HTTP leg stays testable
+    // behind a gate that refuses loopback names. Production leaves the map empty, and an empty
+    // `resolve_to_addrs` list changes nothing.
+    for (host, addresses) in &keys.connect_to {
+        if !addresses.is_empty() {
+            builder = builder.resolve_to_addrs(host, addresses);
+        }
+    }
+
+    builder.build().map_err(|_| DOWNLOAD_UNREACHABLE.to_owned())
+}
+
+/// `isSearchableText` (`download.tool.ts:269-277`): the content types `grep` can actually open.
+/// Reported so the model is told WHICH affordance it just got — a searchable text file, or an
+/// addressable blob.
+#[must_use]
+pub fn is_searchable_text(mime: &str) -> bool {
+    mime.starts_with("text/")
+        || mime == "application/json"
+        || mime.ends_with("+json")
+        || mime == "application/xml"
+        || mime.ends_with("+xml")
+        || mime == "image/svg+xml"
+        || mime == "application/javascript"
+        || mime == "application/x-javascript"
+}
+
+/// `noteFor` (`download.tool.ts:1057-1071`), decided by exactly two facts: whether the bytes
+/// reached the disk, and whether `grep` can search what is there.
+///
+/// WHY IT EXISTS: the file lives in the harness SESSION's folder, which is usually NOT under the
+/// working directory the file tools default to, so "there is a file at X" is not enough — a model
+/// that runs `glob` from the working directory gets an empty answer and concludes the download
+/// failed. What makes it reachable is NAMING the absolute path explicitly: `glob` and `grep` read
+/// `.gitignore` at or below the root they are GIVEN, and both treat an explicitly named root as
+/// walked even when an enclosing ignore file would skip it.
+#[must_use]
+pub fn note_for(saved: bool, searchable: bool, save_error: Option<&str>) -> String {
+    if !saved {
+        return format!(
+            "Nothing was written to disk{}: these bytes exist only in this message, so no file tool can reach them.",
+            match save_error {
+                None => String::new(),
+                Some(reason) => format!(" ({reason})"),
+            }
+        );
+    }
+
+    if searchable {
+        return "Saved in this session's downloads folder. Point read, grep or glob at the absolute `path` above: a path you name explicitly is searched even when a .gitignore above it ignores that folder, and this file is text under 1 MiB so grep can search it.".to_owned();
+    }
+
+    "Saved in this session's downloads folder. Point read or glob at the absolute `path` above: a path you name explicitly is searched even when a .gitignore above it ignores that folder. grep skips this file (it opens only text files under 1 MiB), so use the bytes in this message or read the file.".to_owned()
+}
+
+/// `MIME_EXTENSIONS` (`download.tool.ts:232-256`). Providers key document handling off the file
+/// EXTENSION, so `report` served as `application/pdf` has to arrive as `report.pdf`.
+#[must_use]
+fn mime_extension(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/png" => Some(".png"),
+        "image/jpeg" | "image/jpg" => Some(".jpg"),
+        "image/webp" => Some(".webp"),
+        "image/gif" => Some(".gif"),
+        "image/svg+xml" => Some(".svg"),
+        "application/pdf" => Some(".pdf"),
+        "audio/mpeg" | "audio/mp3" => Some(".mp3"),
+        "audio/wav" | "audio/x-wav" | "audio/wave" => Some(".wav"),
+        "audio/ogg" => Some(".ogg"),
+        "video/mp4" => Some(".mp4"),
+        "video/webm" => Some(".webm"),
+        "video/quicktime" => Some(".mov"),
+        "video/ogg" => Some(".ogg"),
+        "text/plain" => Some(".txt"),
+        "text/markdown" => Some(".md"),
+        "text/csv" => Some(".csv"),
+        "text/html" => Some(".html"),
+        "application/json" => Some(".json"),
+        "application/zip" => Some(".zip"),
+        "application/octet-stream" => Some(".bin"),
+        _ => None,
+    }
+}
+
+/// `unquote` (`download.tool.ts:963`): the `\"` and `\\` a quoted-string may contain (RFC 7230
+/// §3.2.6). Every OTHER backslash survives to [`sanitize_name`], which strips the characters a
+/// label cannot hold anyway.
+#[must_use]
+fn unquote(value: &str) -> String {
+    let characters: Vec<char> = value.chars().collect();
+    let mut name = String::with_capacity(value.len());
+    let mut index = 0_usize;
+
+    while index < characters.len() {
+        if characters[index] == '\\'
+            && index + 1 < characters.len()
+            && (characters[index + 1] == '"' || characters[index + 1] == '\\')
+        {
+            name.push(characters[index + 1]);
+            index += 2;
+            continue;
+        }
+
+        name.push(characters[index]);
+        index += 1;
+    }
+
+    name
+}
+
+/// `decodeURIComponent` for a percent-escaped `filename*` value. `None` means "malformed escape",
+/// which is the reference's `catch` branch: a broken `%zz` is not fatal, and the raw header value
+/// is used instead.
+#[must_use]
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0_usize;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(index + 1..index + 3)?).ok()?;
+
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+            continue;
+        }
+
+        out.push(bytes[index]);
+        index += 1;
+    }
+
+    String::from_utf8(out).ok()
+}
+
+/// A plain file name out of an untrusted string (`download.tool.ts:900-926` `sanitizeName`):
+/// percent-decoded, BASENAME only on either separator, stripped of every character a plain file
+/// label cannot hold, never a dot-only label, and at most [`DOWNLOAD_MAX_NAME_CHARS`] characters.
+///
+/// This is the blast-radius bound for the whole name pipeline: the disposition capture below is
+/// deliberately generous, and what keeps a hostile header from naming something surprising is that
+/// separators, the drive colon and control characters are removed HERE.
+#[must_use]
+pub fn sanitize_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // A header value may percent-encode the name (RFC 5987 `filename*`). The quotes are dropped
+    // BEFORE decoding, because a `"` inside a captured value is a delimiter the header grammar
+    // already removed, and leaving it would make `%22` and a literal quote behave differently.
+    let stripped: String = trimmed
+        .chars()
+        .filter(|character| *character != '"' && *character != '\'')
+        .collect();
+    let candidate = match percent_decode(&stripped) {
+        Some(decoded) if !decoded.is_empty() => decoded,
+        // A malformed escape is not fatal: the RAW value is used, minus the characters the label
+        // grammar forbids anyway (which the filter below does).
+        _ => trimmed.to_owned(),
+    };
+
+    // Basename only, on either separator, then remove every character a plain file name cannot
+    // hold. The list is the reference's: NUL..0x1f, DEL, and `< > : " / \ | ? *`.
+    let leaf_raw = candidate.rsplit(['/', '\\']).next().unwrap_or_default();
+    let leaf: String = leaf_raw
+        .chars()
+        .filter(|character| {
+            let code = u32::from(*character);
+
+            code > 0x1f
+                && code != 0x7f
+                && !matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+        })
+        .collect();
+
+    let leaf = leaf.trim();
+
+    // A label that collapses to a dot-prefix or nothing is not a name: `..` would climb out of the
+    // session folder, and `.` names the folder itself.
+    if leaf.is_empty() || leaf.chars().all(|character| character == '.') {
+        return None;
+    }
+
+    Some(leaf.chars().take(DOWNLOAD_MAX_NAME_CHARS).collect())
+}
+
+/// The `filename` / `filename*` parameter of a `content-disposition` header
+/// (`download.tool.ts:975-995`). `filename*` wins because it carries the charset explicitly.
+///
+/// QUOTE-AWARE, and that is the whole fix (F12). The pattern this entry used to carry —
+/// `/filename\s*=\s*([^;]+)/i` — cut the value at the FIRST `;` even inside quotes, so the common
+/// honest header `attachment; filename="report; final.png"` produced `report.png`: the tail the
+/// user sees in a browser was silently gone, and the file on disk was named after a different
+/// document. RFC 6266 permits `;` inside a quoted-string, so a quoted value is read as a
+/// quoted-string (with the `\"` escape RFC 7230 §3.2.6 defines) and only an UNQUOTED value may run
+/// to the next parameter separator.
+///
+/// The alternatives are ordered quoted-double, quoted-single, bare, and the scan is leftmost-first,
+/// so the FIRST parameter wins: `filename="a; filename=b.png"` names `a; filename=b.png` (the inner
+/// words are part of the name), and `filename="b.png"; filename="a.png"` names `b.png` — which is
+/// also what a browser does. An UNTERMINATED quote falls through to the bare branch, i.e. the
+/// pre-fix behaviour, so a malformed header cannot lose the name it did yield before.
+fn disposition_name(header: Option<&str>) -> Option<String> {
+    let header = header?.trim();
+
+    if header.is_empty() {
+        return None;
+    }
+
+    if let Some(captures) = pattern(
+        &DISPOSITION_EXTENDED,
+        r#"(?i)filename\*\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^;]*))"#,
+    )
+    .captures(header)
+    {
+        // `UTF-8''name` — drop the charset/language prefix, keep the value.
+        let value = captures
+            .get(1)
+            .or(captures.get(2))
+            .map_or("", |matched| matched.as_str())
+            .trim();
+        let value = pattern(&EXTENDED_PREFIX, r"^[A-Za-z0-9-]*''")
+            .replace(value, "")
+            .to_string();
+
+        let name = sanitize_name(&unquote(&value));
+
+        if name.is_some() {
+            return name;
+        }
+    }
+
+    if let Some(captures) = pattern(
+        &DISPOSITION_PLAIN,
+        r#"(?i)filename\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)'|([^;]*))"#,
+    )
+    .captures(header)
+    {
+        let value = captures
+            .get(1)
+            .or(captures.get(2))
+            .or(captures.get(3))
+            .map_or("", |matched| matched.as_str())
+            .trim();
+
+        return sanitize_name(&unquote(value));
+    }
+
+    None
+}
+
+/// The URL's own basename (`urlName`, `download.tool.ts:981-989`), used when the host named
+/// nothing. The PATHNAME only: a query string's `?file=x` is not a name, and neither is a fragment.
+fn url_name(url: &str) -> Option<String> {
+    let pathname = reqwest::Url::parse(url).ok()?.path().to_owned();
+
+    pathname
+        .split('/')
+        .rfind(|segment| !segment.is_empty())
+        .and_then(sanitize_name)
+}
+
+/// Final name: sanitized name + a MIME-derived extension when the name does not already carry one
+/// (`resolveName`, `download.tool.ts:992-1009`). The 200-character budget is kept by SHORTENING THE
+/// BASE, never the extension — a truncated `.pd` is a file nothing will open.
+#[must_use]
+pub fn resolve_name(
+    requested: Option<&str>,
+    url: &str,
+    mime: &str,
+    header: Option<&str>,
+) -> String {
+    let chosen = requested
+        .and_then(sanitize_name)
+        .or_else(|| disposition_name(header))
+        .or_else(|| url_name(url))
+        .unwrap_or_else(|| "download".to_owned());
+    let extension = mime_extension(mime).unwrap_or("");
+
+    if extension.is_empty() || chosen.to_lowercase().ends_with(extension) {
+        return chosen;
+    }
+
+    let extension_length = extension.chars().count();
+    let base_max = DOWNLOAD_MAX_NAME_CHARS.saturating_sub(extension_length);
+    let base: String = if chosen.chars().count() > base_max {
+        chosen.chars().take(base_max.max(1)).collect()
+    } else {
+        chosen.clone()
+    };
+
+    format!("{base}{extension}")
+}
+
+/// The `path` argument, checked BEFORE the transfer is paid for (`pathArgument`,
+/// `download.tool.ts:322-339`).
+///
+/// A bad destination is an ARGUMENT error: degrading it into `saved: false` would let a model
+/// believe it chose a location and got the default folder, and paying 20 MiB of transfer to
+/// discover the argument was wrong wastes the very budget this tool exists to protect. Absolute
+/// paths, a drive colon and any `..` segment are REFUSED rather than normalized, because the tool
+/// documents a session folder and silently writing to `/etc` because a model guessed an absolute
+/// path is worse than an error.
+fn path_argument(requested: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    let candidate = raw.replace('\\', "/");
+
+    if candidate.chars().count() > DOWNLOAD_MAX_PATH_CHARS {
+        return Err(format!(
+            "download path must be at most {DOWNLOAD_MAX_PATH_CHARS} characters."
+        ));
+    }
+
+    let escapes = candidate.starts_with('/')
+        || pattern(&DRIVE_PREFIX, r"^[A-Za-z]:").is_match(&candidate)
+        || candidate.split('/').any(|segment| segment == "..");
+
+    if escapes {
+        return Err(
+            "download path must be relative to the session downloads folder, without \"..\"."
+                .to_owned(),
+        );
+    }
+
+    Ok(Some(candidate))
+}
+
+/// The per-session downloads directory: `<sessions_dir>/<session_id>/downloads`.
+///
+/// This is the crate's shape of the reference's host-supplied `downloadsDirectory`, and it is the
+/// SAME directory the journal writes into (`src/journal.rs:354`), so `delete_session` — which
+/// removes that directory (`src/store/session.rs:483`) — removes the downloads with it. That
+/// coupling is the property F7 asked for: a model reading `saved: true` can trust that the path it
+/// was given is inside something it can delete.
+#[must_use]
+pub fn session_downloads_directory(sessions_root: &Path, session_id: &str) -> PathBuf {
+    sessions_root
+        .join(session_id)
+        .join(HARNESS_SESSION_DOWNLOADS_DIRECTORY)
+}
+
+/// The folder this call may write into, fail closed (`downloadsDirectoryOf`,
+/// `download.tool.ts:294-311`). RESOLVED once here: every later containment test compares against
+/// this value, and a relative host-supplied root would otherwise be resolved against a working
+/// directory the caller does not control.
+fn downloads_directory_of(
+    sessions_root: Option<&Path>,
+    session_id: Option<&str>,
+) -> Result<PathBuf, String> {
+    let id = session_id.unwrap_or("").trim();
+
+    let root = sessions_root.filter(|root| !root.as_os_str().is_empty());
+
+    if root.is_none() || id.is_empty() {
+        return Err(DOWNLOAD_SESSION_REQUIRED.to_owned());
+    }
+
+    Ok(lexical_normalize(&session_downloads_directory(
+        root.expect("checked above"),
+        id,
+    )))
+}
+
+/// `path.resolve`'s LEXICAL half, without touching the filesystem: `.` segments dropped and `..`
+/// segments popped.
+///
+/// WHY IT IS NEEDED: the reference resolves the folder and compares STRINGS against the resolved
+/// value; a Rust `Path::join` keeps `..` literally, which would let `a/../../etc` pass a
+/// `starts_with` test while naming something outside the folder. Popping lexically is what makes
+/// the containment check mean what it says. (Symlinks are the one thing no lexical check can see,
+/// and the reference cannot see them either.)
+#[must_use]
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(path)
+    };
+
+    let mut resolved = PathBuf::new();
+
+    for segment in absolute.components() {
+        match segment {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            other => {
+                resolved.push(other.as_os_str());
+            }
+        }
+    }
+
+    resolved
+}
+
+/// The destination: the validated `path` inside the session folder, or the sanitized name directly
+/// under it (`destinationOf`, `download.tool.ts:345-355`).
+///
+/// The name is already separator-free (see [`sanitize_name`]), so joining it cannot escape; the
+/// `path` guard refuses `..`, and the containment test here is DEFENCE IN DEPTH against a separator
+/// a platform spells differently — the write must stay inside the folder that is deleted with the
+/// session.
+fn destination_of(
+    directory: &Path,
+    name: &str,
+    candidate: Option<&str>,
+) -> Result<PathBuf, String> {
+    let target = lexical_normalize(&directory.join(candidate.unwrap_or(name)));
+
+    if target != directory && !target.starts_with(directory) {
+        return Err("download path must stay inside the session downloads folder.".to_owned());
+    }
+
+    Ok(target)
+}
+
+/// The one-word reason the summary reports (`error.code` in the reference: `ENOENT`, `EEXIST`, …).
+/// A stack trace and an absolute path are host noise the model has no use for; what it needs is
+/// that the file is not on disk.
+#[must_use]
+fn io_error_code(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::NotFound => "ENOENT",
+        ErrorKind::AlreadyExists => "EEXIST",
+        ErrorKind::PermissionDenied => "EACCES",
+        ErrorKind::NotADirectory => "ENOTDIR",
+        ErrorKind::IsADirectory => "EISDIR",
+        ErrorKind::StorageFull => "ENOSPC",
+        ErrorKind::TimedOut => "ETIMEDOUT",
+        _ => "write failed",
+    }
+}
+
+/// Write the bytes WITHOUT CLOBBERING (`writeUnique`, `download.tool.ts:370-401`). Two downloads of
+/// the same name would otherwise silently replace each other, and the model would read the wrong
+/// bytes believing they were fresh.
+///
+/// `create_new(true)` is the existence check AND the reservation in one call, so there is no window
+/// between testing and writing, and the real bytes are written once (a separate probe write would
+/// leave an empty file behind if the payload write then failed).
+///
+/// The folder created is the destination's OWN directory, not merely the session folder: a `path`
+/// argument may carry a subpath (`raw/report.csv`), and creating the leaf's parent is what makes
+/// that subpath exist instead of failing after the whole transfer was paid for.
+///
+/// Returns the ABSOLUTE path written (the suffixing loop may have moved it): a relative path was
+/// only ever meaningful inside the working directory this process happened to start in, and the
+/// session folder is usually outside it.
+async fn write_unique(absolute: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    use tokio::io::AsyncWriteExt;
+
+    let parent = absolute.parent().unwrap_or(Path::new("."));
+
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|error| io_error_code(error.kind()).to_owned())?;
+
+    // The suffix is derived from the ORIGINAL LEAF name, never from the previous attempt and never
+    // from the whole path: compounding produced `pixel-1-2-3.png` after a few downloads of the same
+    // URL, which is unreadable and makes the name depend on run order. The LEAF matters now the base
+    // is absolute — a dot in the SESSION path (`~/.local/…`) would otherwise read as the start of
+    // the extension.
+    let leaf = absolute
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".to_owned());
+    let dot = leaf.rfind('.');
+    let (stem, extension) = match dot {
+        Some(at) if at > 0 => (leaf[..at].to_owned(), leaf[at..].to_owned()),
+        _ => (leaf.clone(), String::new()),
+    };
+
+    for attempt in 0..=DOWNLOAD_UNIQUE_ATTEMPTS {
+        let target = if attempt == 0 {
+            absolute.to_path_buf()
+        } else {
+            parent.join(format!("{stem}-{attempt}{extension}"))
+        };
+
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .await
+        {
+            Ok(mut file) => {
+                // `write_all` then `flush`: a partial write has to be an error, not a short file
+                // the summary reports as saved.
+                if let Err(error) = file.write_all(bytes).await {
+                    return Err(io_error_code(error.kind()).to_owned());
+                }
+
+                if let Err(error) = file.flush().await {
+                    return Err(io_error_code(error.kind()).to_owned());
+                }
+
+                return Ok(target);
+            }
+            // The one error this loop is waiting for: try the next suffix.
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(io_error_code(error.kind()).to_owned()),
+        }
+    }
+
+    // DEVIATION, stated: the reference swallows this sentence and reports the bare `write failed`
+    // code, because its catch reads `error.code` and a HarnessError has none. The reason survives
+    // here instead — same `saved: false`, more to act on.
+    Err("download could not reserve a unique file name in the session downloads folder.".to_owned())
+}
+
+/// One download attempt's outcome, after the redirect chain and the byte cap.
+struct DownloadTransfer {
+    /// The URL the FINAL response answers for — the last hop, never the original.
+    final_url: String,
+    /// The MIME alone, with any `; charset=` parameter dropped.
+    mime: String,
+    /// The raw `content-disposition` value, kept verbatim because the name rule is a parsing rule.
+    disposition: Option<String>,
+    /// What the host DECLARED, reported so a caller can tell a lie about the size from an honest
+    /// answer about a big file. `None` when the header was absent or not a number.
+    declared: Option<u64>,
+    bytes: Vec<u8>,
+}
+
+/// The header read, with the same rule the fetch pipeline uses: a value that is not valid UTF-8 is
+/// absent, never guessed.
+fn header_text(response: &reqwest::Response, name: reqwest::header::HeaderName) -> Option<String> {
+    response
+        .headers()
+        .get(name)?
+        .to_str()
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// The transfer, redirects followed BY HAND (gate 3). Every hop passes gates 1 and 2 BEFORE the
+/// request is made, the status classes get their own sentences, the declared size is checked before
+/// the body is read, and the cap is enforced while streaming — so an oversized or internal body
+/// never reaches disk.
+async fn download_transfer(
+    url: &str,
+    keys: &WebKeys,
+    signal: &CancellationToken,
+) -> Result<DownloadTransfer, String> {
+    let client = download_client(keys)?;
+    // The gate's resolver: injected answers first (the test seam, and a deployment in front of a
+    // private DNS view), then the system resolver. `system: true` is the production state.
+    let resolver = ssrf::Resolver {
+        answers: keys.dns_answers.clone(),
+        system: true,
+    };
+
+    // GATE 1 + GATE 2 on the first hop. Gate 2's refusal NAMES the address it resolved to
+    // (`refusedUrl(firstHop.address ?? hostname)`, `download.tool.ts:1347`): "not public" without
+    // the address cannot be acted on, since the caller already believes the name is public.
+    if let Err(detail) = gate_download_url(url, &resolver).await {
+        return Err(refused_url(detail.as_deref()));
+    }
+
+    let mut target = url.to_owned();
+    let mut redirects = 0_usize;
+
+    loop {
+        let response = tokio::select! {
+            biased;
+            () = signal.cancelled() => return Err(CANCELLED_SENTENCE.to_owned()),
+            outcome = client.get(&target).send() => outcome
+                .map_err(|_| DOWNLOAD_UNREACHABLE.to_owned())?,
+        };
+
+        let status = response.status().as_u16();
+
+        // A 3xx is a HOP, not an answer: `Location` is resolved, then gated, then asked for.
+        if (300..400).contains(&status) {
+            let location = header_text(&response, reqwest::header::LOCATION);
+            let Some(next) = redirect_location(location.as_deref(), &target) else {
+                return Err(refused_hop(status, None));
+            };
+
+            // Gate 1 + gate 2 on the NEW address: a public host may redirect into loopback, and the
+            // address the first hop answered for says nothing about this one. The hop sentence
+            // carries the address the same way the first-hop one does (`refusedHop(response.status,
+            // hop.address)`, `download.tool.ts:1397`).
+            if let Err(detail) = gate_download_url(&next, &resolver).await {
+                return Err(refused_hop(status, detail.as_deref()));
+            }
+
+            redirects += 1;
+
+            if redirects > MAX_REDIRECT_HOPS {
+                return Err(format!(
+                    "download stopped after {MAX_REDIRECT_HOPS} redirects."
+                ));
+            }
+
+            target = next;
+            continue;
+        }
+
+        if !(200..300).contains(&status) {
+            return Err(download_status_failure(status));
+        }
+
+        let declared = header_text(&response, reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.parse::<u64>().ok());
+
+        // The DECLARED size is checked before the body is read, so a host that announces 4 GiB does
+        // not get to stream it at us. It is a header a hostile host can lie about, so it is a
+        // PRE-CHECK and never the bound — the streaming loop below is the bound.
+        if declared.is_some_and(|at| at > MAX_DOWNLOAD_BYTES) {
+            return Err(download_oversize());
+        }
+
+        let mime = header_text(&response, reqwest::header::CONTENT_TYPE)
+            .map(|value| value.split(';').next().unwrap_or("").trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DOWNLOAD_FALLBACK_MIME.to_owned());
+        let disposition = header_text(&response, reqwest::header::CONTENT_DISPOSITION);
+        let final_url = response.url().to_string();
+
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut response = response;
+
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                () = signal.cancelled() => return Err(CANCELLED_SENTENCE.to_owned()),
+                outcome = response.chunk() => outcome
+                    .map_err(|_| DOWNLOAD_UNREACHABLE.to_owned())?,
+            };
+
+            let Some(chunk) = chunk else {
+                break;
+            };
+
+            // The bound is a `u64` byte count; the running total is a `usize` buffer length, so the
+            // sum is WIDENED rather than the limit narrowed (a 32-bit host cannot overflow past the
+            // limit unnoticed this way).
+            if u64::try_from(bytes.len() + chunk.len()).unwrap_or(u64::MAX) > MAX_DOWNLOAD_BYTES {
+                // Dropping the response body here cancels the stream, so the socket is not left
+                // draining a payload nobody will read.
+                return Err(download_oversize());
+            }
+
+            bytes.extend_from_slice(&chunk);
+        }
+
+        return Ok(DownloadTransfer {
+            final_url,
+            mime,
+            disposition,
+            declared,
+            bytes,
+        });
+    }
+}
+
+/// Where one download may write, and who supplied that place.
+///
+/// `sessions_root` is the crate's sessions directory and `session_id` comes from the call, so the
+/// folder is the session's OWN directory — the one `delete_session` removes — which is the property
+/// the reference's F7 asked for. Both are `Option`s because the tool can be reached from a global
+/// catalogue call with no session, and that case refuses BEFORE a byte is transferred
+/// ([`DOWNLOAD_SESSION_REQUIRED`]).
+pub struct DownloadContext<'a> {
+    pub keys: &'a WebKeys,
+    pub sessions_root: Option<&'a Path>,
+    pub session_id: Option<&'a str>,
 }
 
 /// `download`: `{url, name?, path?}` -> the `toolMedia(summary, [attachment])` envelope.
 ///
-/// The bytes travel ONCE, on the attachment; the model reads only the summary, and the
-/// event carries descriptors. The cap is enforced against the streamed body, so an
-/// oversized page never lands on disk.
+/// The bytes travel ONCE, on the attachment; the model reads only the summary, and the event carries
+/// descriptors. The cap is enforced against the STREAMED body, so an oversized page never lands on
+/// disk, and the destination is proven before the transfer is paid for.
 ///
 /// # Errors
 ///
-/// A bad URL, a status sentence, the size refusal, or a write failure.
+/// A bad URL, the session/`path` argument refusals, an SSRF refusal on any hop, a status sentence,
+/// the size refusal, or the timeout. A failed WRITE is not an error: it is `saved: false` plus
+/// `saveError`, because the bytes still reached the model.
 pub(crate) async fn download(
-    client: &reqwest::Client,
     arguments: &Value,
-    cwd: &std::path::Path,
+    context: &DownloadContext<'_>,
     signal: &CancellationToken,
 ) -> Result<Value, String> {
+    // ---- proven BEFORE the transfer -------------------------------------------------
     let requested = super::result::required_text(arguments, "url", "download")?;
-    let url = validated_url(&requested)?;
+    let url = validated_url(&requested).map_err(|_| DOWNLOAD_URL_INVALID.to_owned())?;
 
-    let mut response = get(client, &url, signal).await?;
-    let final_url = response.url().to_string();
-    let mime = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .split(';')
-        .next()
-        .unwrap_or("application/octet-stream")
-        .trim()
-        .to_owned();
+    // The destination is proven before the transfer is paid for. A harness with no session folder,
+    // or a `path` that would escape it, is a configuration/argument error: refusing after 20 MiB has
+    // arrived wastes the very budget this tool exists to protect, and writing somewhere the caller
+    // never named is the defect that rule closed.
+    let directory = downloads_directory_of(context.sessions_root, context.session_id)?;
+    let subpath = path_argument(
+        super::result::optional_text(arguments, "path")
+            .as_deref()
+            .map(str::to_owned)
+            .as_deref(),
+    )?;
 
-    // The cap is applied while reading: `content_length()` alone would trust a header a
-    // hostile host can lie about.
-    let mut bytes: Vec<u8> = Vec::new();
+    // ---- the transfer, gated and capped ---------------------------------------------
+    // The controller's own budget: 60 s for the whole call, so a slow start, a slow body and a slow
+    // resolve all spend from one figure. A caller cancellation wins over the deadline (the `select!`
+    // inside the transfer reports the cancellation as a cancellation, never as a timeout).
+    let transfer = tokio::time::timeout(
+        Duration::from_millis(DOWNLOAD_TIMEOUT_MS),
+        download_transfer(&url, context.keys, signal),
+    )
+    .await
+    .map_err(|_| format!("download timed out after {DOWNLOAD_TIMEOUT_MS} ms."))??;
 
-    loop {
-        let chunk = tokio::select! {
-            biased;
-            () = signal.cancelled() => return Err("the download was cancelled.".to_owned()),
-            outcome = response.chunk() => outcome
-                .map_err(|error| format!("download could not read the response body: {error}"))?,
-        };
-
-        let Some(chunk) = chunk else {
-            break;
-        };
-
-        // The bound is a `u64` byte count; the running total is a `usize` buffer length, so the
-        // sum is widened rather than the limit narrowed (a 32-bit host cannot overflow past the
-        // limit unnoticed this way).
-        if u64::try_from(bytes.len() + chunk.len()).unwrap_or(u64::MAX) > MAX_DOWNLOAD_BYTES {
-            return Err(format!(
-                "download refused the response: it is larger than the {}-byte limit.",
-                MAX_DOWNLOAD_BYTES
-            ));
-        }
-
-        bytes.extend_from_slice(&chunk);
-    }
-
-    let name = super::result::optional_text(arguments, "name")
-        .as_deref()
-        .and_then(sanitize_name)
-        .unwrap_or_else(|| name_from_url(&final_url));
-
-    let folder = match super::result::optional_text(arguments, "path") {
-        Some(raw) if !raw.is_empty() => {
-            if raw.contains("..") || raw.contains('\0') {
-                return Err("download path must be a destination relative to the working directory without \"..\".".to_owned());
-            }
-
-            cwd.join(raw)
-        }
-        _ => cwd.join(DOWNLOAD_FOLDER),
+    // `response.url` after a hand-followed chain is the LAST hop, which is the honest answer for
+    // where the bytes came from. An empty one (a minimal runtime, a hand-built response) falls back
+    // to the last URL we asked for — never the original.
+    let final_url = if transfer.final_url.is_empty() {
+        url.clone()
+    } else {
+        transfer.final_url.clone()
     };
-
-    tokio::fs::create_dir_all(&folder).await.map_err(|error| {
-        format!(
-            "download could not create \"{}\": {error}",
-            folder.display()
-        )
-    })?;
-
-    let destination = folder.join(&name);
-
-    tokio::fs::write(&destination, &bytes)
-        .await
-        .map_err(|error| {
-            format!(
-                "download could not write \"{}\": {error}",
-                destination.display()
-            )
-        })?;
-
+    let mime = transfer.mime.clone();
     let kind = kind_for_mime(&mime);
-    let relative = destination
-        .strip_prefix(cwd)
-        .unwrap_or(&destination)
-        .to_string_lossy()
-        .replace('\\', "/");
-
-    // `[Image 1]`-style markers come from the attachment kind, the same rule the composer
-    // uses (`shared/attachments.ts` `attachmentMarker`).
-    let marker = format!(
-        "[{} 1]",
-        match kind {
-            AttachmentKind::Image => "Image",
-            AttachmentKind::Video => "Video",
-            AttachmentKind::Audio => "Audio",
-            AttachmentKind::Pdf => "PDF",
-            AttachmentKind::File => "File",
-        }
+    let name = resolve_name(
+        super::result::optional_text(arguments, "name")
+            .as_deref()
+            .map(str::to_owned)
+            .as_deref(),
+        &final_url,
+        &mime,
+        transfer.disposition.as_deref(),
     );
+    let size = u64::try_from(transfer.bytes.len()).unwrap_or(u64::MAX);
 
+    // `[Image 1]`-style markers come from the attachment kind, the same rule the composer uses
+    // (`shared/attachments.ts` `attachmentMarker`). `dl-1` is deterministic: one attachment per
+    // call, and the transport re-suffixes the id only when one block aggregates several downloads.
     let attachment = HarnessAttachment {
         id: "dl-1".to_owned(),
         kind,
-        marker,
+        marker: format!(
+            "[{} 1]",
+            match kind {
+                AttachmentKind::Image => "Image",
+                AttachmentKind::Video => "Video",
+                AttachmentKind::Audio => "Audio",
+                AttachmentKind::Pdf => "PDF",
+                AttachmentKind::File => "File",
+            }
+        ),
         name: name.clone(),
         mime: mime.clone(),
-        size: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-        data: BASE64.encode(&bytes),
+        size,
+        data: BASE64.encode(&transfer.bytes),
     };
 
-    let summary = json!({
-        "name": name,
-        "path": relative,
-        "mime": mime,
-        "kind": kind,
-        "size": bytes.len(),
-        "url": final_url,
-        "saved": true,
-    });
+    // ---- the on-disk copy, deliberately AFTER the attachment and never fatal ---------
+    // A host with no writable filesystem still gets its bytes, and says so. Only the I/O may fail
+    // softly: a bad `path` SHAPE was refused above, and the containment check below is loud too,
+    // because degrading it into `saved: false` would let a model believe it chose a location and got
+    // the default folder.
+    let wanted = destination_of(&directory, &name, subpath.as_deref())?;
+    let (saved, saved_path, save_error) = match write_unique(&wanted, &transfer.bytes).await {
+        Ok(path) => (true, Some(path), None),
+        Err(reason) => (false, None, Some(reason)),
+    };
 
+    // Honest affordance: `grep` skips binaries and files over 1 MiB, so a saved JPEG is addressable
+    // but NOT searchable, and telling the model which one it has saves a wasted grep turn.
+    let searchable = is_searchable_text(&mime) && size <= DOWNLOAD_GREP_MAX_FILE_BYTES;
+    // `noteFor` (`download.tool.ts:1105-1131`) runs BEFORE the summary is assembled, so the one
+    // sentence the model reads is derived from the same three facts the summary reports.
+    let note = note_for(saved, searchable, save_error.as_deref());
+
+    let mut summary = Map::new();
+
+    for (key, value) in [
+        ("url", json!(url)),
+        ("finalUrl", json!(final_url)),
+        ("contentType", json!(mime)),
+        ("kind", json!(kind)),
+        ("name", json!(name)),
+        ("bytes", json!(transfer.bytes.len())),
+        (
+            "declaredBytes",
+            transfer.declared.map_or(Value::Null, |at| json!(at)),
+        ),
+        ("media", json!("attached")),
+        ("mediaId", json!(attachment.id)),
+        ("saved", json!(saved)),
+        (
+            "path",
+            saved_path.map_or(Value::Null, |path| json!(path.to_string_lossy())),
+        ),
+        (
+            "saveError",
+            save_error
+                .as_ref()
+                .map_or(Value::Null, |reason| json!(reason)),
+        ),
+        ("searchable", json!(searchable)),
+        ("note", json!(note)),
+    ] {
+        // A key whose value is `Null` here is an ABSENT key in the published shape
+        // (`...(condition ? { key: value } : {})` in the reference), and the difference matters:
+        // `path: null` would read as "there is a path and it is empty".
+        if value.is_null() {
+            continue;
+        }
+
+        summary.insert(key.to_owned(), value);
+    }
+
+    // The envelope is what makes the bytes model input: the transport validates against the 20 MiB
+    // download profile and the harness stores the result on this call's tool message.
     Ok(json!({
         TOOL_MEDIA_BRAND: [attachment],
-        "content": summary,
+        "content": Value::Object(summary),
     }))
 }
 
@@ -2509,18 +3997,32 @@ mod tests {
 
     #[test]
     fn a_file_name_is_stripped_of_path_and_control_text() {
-        assert_eq!(sanitize_name("a/b\\c:d?").as_deref(), Some("abcd"));
+        // Basename FIRST (either separator), then the characters a file label cannot hold. The
+        // old port deleted the separators and kept `c:d?`; the reference keeps only the last
+        // segment and drops `:`, `?`, `<`, `>`, `|` and `*` from it.
+        assert_eq!(sanitize_name("a/b\\c:d?").as_deref(), Some("cd"));
+        // A space is legal in a label, so it survives — the reference only trims the ends.
+        assert_eq!(
+            sanitize_name("  report final.pdf  ").as_deref(),
+            Some("report final.pdf")
+        );
+        // A name that is only dots is not a name, and a control character is not a character.
+        assert!(sanitize_name("...").is_none());
+        assert_eq!(sanitize_name("a\u{0}b.txt").as_deref(), Some("ab.txt"));
         assert!(
             sanitize_name("  ").is_none(),
             "a name that is only whitespace is no name at all"
         );
+
+        // `decodeURIComponent` runs BEFORE sanitizing (`:1006`), so a percent-escape is a
+        // path separator first and a slash-separated name has only its LEAF kept.
         assert_eq!(
-            sanitize_name("two words.png").as_deref(),
-            Some("two-words.png")
+            url_name("https://h/a/b/shot%2Epng?v=1").as_deref(),
+            Some("shot.png")
         );
         assert_eq!(
-            name_from_url("https://h/a/b/shot.PNG?v=1"),
-            "shot.PNG".to_owned()
+            url_name("https://h/a/b/shot.png?v=1").as_deref(),
+            Some("shot.png")
         );
     }
 
@@ -2707,7 +4209,10 @@ mod tests {
                 "totalSections": 1,
                 "totalMatches": 1,
                 "matchMode": "proximity",
-                "note": "This page has no heading structure, so \"query\" returned a text window around the first match instead of a section. Use \"offset\" to read further.",
+                // The window was NOT cut by the size limit, so this is `PROXIMITY_NOTE_WHOLE`:
+                // no `nextOffset` is reported, and the sentence says so instead of sending the
+                // model to an `offset` that `query` ignores.
+                "note": "This page has no heading structure, so \"query\" returned a text window around the first match instead of a section. No \"nextOffset\" is reported, so there is nothing to resume: to read other parts of the page, ask a different \"query\" phrase, or re-fetch without \"query\" and page with \"offset\".",
                 "pageCharacters": 42,
             })
         );
@@ -2766,10 +4271,20 @@ mod tests {
         assert_eq!(first["pageCharacters"], json!(70_000));
         assert!(first.get("offsetClamped").is_none());
 
-        // Paging from `nextOffset` returns the rest, and a window that ends exactly at the
-        // end of the document is NOT truncation: `truncated` is computed from the source
-        // length, which is what fixes the off-by-one where a page cut exactly at the budget
-        // claimed to be whole.
+        // The delivery ceiling is the point of this test, so it is asserted rather than
+        // implied: the WHOLE document — every key, not just `content` — stays inside the cap the
+        // harness refuses above, which is the number `bound_tool_result` charges.
+        assert!(
+            payload::document_wire_bytes(&first) <= FETCH_MAX_RESULT_BYTES,
+            "a fetch result must never be JSON-refused by the delivery cap"
+        );
+
+        // Paging from `nextOffset` returns the NEXT window, not the rest of the document: at
+        // 30 720 bytes of content a 70 000-character page takes THREE calls, and the middle one
+        // is truncated too. The figures below are exact because the body is ASCII, where one
+        // character is one byte; `offset` and `nextOffset` count code units, while the budget the
+        // content was cut against counts escaped bytes, and only a non-ASCII page can separate
+        // them (see the two-byte case further down).
         let second = fetch(
             &client,
             &json!({"url": format!("{base}/long"), "offset": FETCH_MAX_RESULT_CONTENT_BYTES}),
@@ -2778,13 +4293,61 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            second["characters"],
-            json!(70_000 - FETCH_MAX_RESULT_CONTENT_BYTES)
-        );
-        assert_eq!(second["truncated"], json!(false));
+        assert_eq!(second["characters"], json!(FETCH_MAX_RESULT_CONTENT_BYTES));
+        assert_eq!(second["truncated"], json!(true));
         assert_eq!(second["offset"], json!(FETCH_MAX_RESULT_CONTENT_BYTES));
-        assert!(second.get("nextOffset").is_none());
+        assert_eq!(
+            second["nextOffset"],
+            json!(2 * FETCH_MAX_RESULT_CONTENT_BYTES)
+        );
+
+        // The last window ends EXACTLY at the end of the document, and that is NOT truncation:
+        // `truncated` is computed from the source length, which is what fixes the off-by-one
+        // where a page cut exactly at the budget claimed to be whole.
+        let third = fetch(
+            &client,
+            &json!({"url": format!("{base}/long"), "offset": 2 * FETCH_MAX_RESULT_CONTENT_BYTES}),
+            &keys,
+            &signal,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            third["characters"],
+            json!(70_000 - (2 * FETCH_MAX_RESULT_CONTENT_BYTES))
+        );
+        assert_eq!(third["truncated"], json!(false));
+        assert_eq!(third["offset"], json!(2 * FETCH_MAX_RESULT_CONTENT_BYTES));
+        assert!(third.get("nextOffset").is_none());
+
+        // A page of two-byte characters is where the two currencies separate: the budget spends
+        // BYTES, `characters` reports code units, and the two must not be confused. 40 000 bytes
+        // of `é` is 20 000 characters, and the first window costs 30 720 bytes — 15 360
+        // characters — while `pageCharacters` still counts characters.
+        let accents = "\u{e9}".repeat(20_000);
+        let (wide_base, _wide_seen, wide_server) =
+            fetch_server(&[fetch_reply("text/plain", &accents)]).await;
+        let wide = fetch(
+            &client,
+            &json!({"url": format!("{wide_base}/wide")}),
+            &fetch_keys(&wide_base),
+            &signal,
+        )
+        .await
+        .unwrap();
+
+        // The fit steps back in 5% of `keep`, so the landing point is exact arithmetic, not an
+        // approximation: 20 000 -> 19 000 -> 18 050 -> 17 148 -> 16 291 -> 15 477 -> 14 704, and
+        // 15 477 characters is 30 954 bytes, one step too many over the 30 720-byte budget.
+        assert_eq!(wide["pageCharacters"], json!(20_000));
+        assert_eq!(wide["characters"], json!(14_704));
+        assert_eq!(wide["content"].as_str().expect("text").len(), 29_408);
+        assert_eq!(wide["truncated"], json!(true));
+        assert!(
+            payload::document_wire_bytes(&wide) <= FETCH_MAX_RESULT_BYTES,
+            "a multi-byte page has to fit the same cap as an ASCII one"
+        );
+        wide_server.abort();
 
         // An offset past the end is a model reaching slightly too far: it is clamped, and the
         // clamp is REPORTED, because an empty string with `truncated: false` used to be
@@ -3086,7 +4649,18 @@ mod tests {
 
     /// Starts a stub provider origin that answers exactly one request with `reply` and sends
     /// back the request line, headers and body it received.
-    async fn stub_origin(reply: &str) -> (String, tokio::sync::oneshot::Receiver<String>) {
+    /// One-shot origin: the base URL, the request the stub saw, and its accept TASK. The task is
+    /// part of the return because a dropped handle keeps the listener alive: a test that runs
+    /// several provider calls in one process has to `abort` it, or the next call's connection can
+    /// be accepted by the previous test's stub.
+    #[allow(clippy::type_complexity)]
+    async fn stub_origin(
+        reply: &str,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<String>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -3097,7 +4671,7 @@ mod tests {
 
         let (sender, receiver) = tokio::sync::oneshot::channel();
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("one connection");
             let mut seen: Vec<u8> = Vec::new();
             let mut prefix = [0_u8; 4_096];
@@ -3136,7 +4710,10 @@ mod tests {
             let _ = sender.send(String::from_utf8_lossy(&seen).into_owned());
         });
 
-        (format!("http://{address}"), receiver)
+        // The accept task is returned so a test that runs SEVERAL provider calls in one process
+        // does not leave each listener accepting forever: `abort` closes the socket, and a
+        // dangling accept task would hold the next call's connection.
+        (format!("http://{address}"), receiver, task)
     }
 
     /// The published 200 for a provider answer.
@@ -3154,6 +4731,8 @@ mod tests {
             tavily: (provider == "tavily").then(|| key.to_owned()),
             linkup: (provider == "linkup").then(|| key.to_owned()),
             endpoint_base: Some(base.to_owned()),
+            // Search never resolves, so the download-only SSRF seams stay empty here.
+            ..WebKeys::default()
         }
     }
 
@@ -3164,7 +4743,7 @@ mod tests {
         payload: &str,
         arguments: Value,
     ) -> (Value, String) {
-        let (base, receiver) = stub_origin(&reply_with(payload)).await;
+        let (base, receiver, _server) = stub_origin(&reply_with(payload)).await;
         let client = reqwest::Client::new();
         let keys = stubbed_keys(provider, key, &base);
 
@@ -3286,7 +4865,7 @@ mod tests {
     /// of a provider this call never touched.
     #[tokio::test]
     async fn every_configured_key_is_redacted_not_only_the_one_being_called() {
-        let (base, receiver) = stub_origin(&reply_with(
+        let (base, receiver, _server) = stub_origin(&reply_with(
             r#"{"results":[{"title":"leak exa-secret-key","url":"https://example.com/exa-secret-key","highlights":["body exa-secret-key and tavily-secret-key"],"publishedDate":"2026-01-02"}]}"#,
         ))
         .await;
@@ -3296,6 +4875,7 @@ mod tests {
             tavily: Some("tavily-secret-key".to_owned()),
             linkup: None,
             endpoint_base: Some(base),
+            ..WebKeys::default()
         };
 
         let outcome = search(
@@ -3326,7 +4906,7 @@ mod tests {
     #[tokio::test]
     async fn a_short_configured_key_is_redacted_rather_than_skipped() {
         // Two-character keys on both providers, redacted in every field.
-        let (base, receiver) = stub_origin(&reply_with(
+        let (base, receiver, _server) = stub_origin(&reply_with(
             r#"{"results":[{"title":"keys k1 and t2","url":"https://example.com/k1?ref=t2","highlights":["k1 then t2"],"publishedDate":"k1"}]}"#,
         ))
         .await;
@@ -3340,6 +4920,7 @@ mod tests {
                 tavily: Some("t2".to_owned()),
                 linkup: None,
                 endpoint_base: Some(base),
+                ..WebKeys::default()
             },
             &tokio_util::sync::CancellationToken::new(),
         )
@@ -3369,8 +4950,9 @@ mod tests {
             json!({ "title": "Long", "url": "https://example.com/long", "highlights": ["x".repeat(1_200)] }),
             json!({ "title": "Short", "url": "https://example.com/short", "highlights": ["exactly a line"] }),
         ];
-        let matches = normalize_matches(&rows, 5, &redactor, RowReader::Exa);
+        let (matches, dropped) = normalize_matches(&rows, 5, &redactor, RowReader::Exa);
 
+        assert_eq!(dropped, 0);
         assert_eq!(matches[0]["snippet"], "x".repeat(1_000));
         assert_eq!(matches[0]["snippetTruncated"], json!(true));
         assert_eq!(
@@ -3398,7 +4980,7 @@ mod tests {
             "publishedDate": "2026-01-02T00:00:00.000Z plus a great deal of commentary that pushes the label past its bound",
         })];
 
-        let matches = normalize_matches(&rows, 5, &redactor, RowReader::Exa);
+        let (matches, _dropped) = normalize_matches(&rows, 5, &redactor, RowReader::Exa);
 
         assert_eq!(
             matches[0]["published"],
@@ -3418,7 +5000,7 @@ mod tests {
         })];
 
         assert_eq!(
-            normalize_matches(&rows, 5, &redactor, RowReader::Exa)[0]["published"],
+            normalize_matches(&rows, 5, &redactor, RowReader::Exa).0[0]["published"],
             "2026-01-02"
         );
     }
@@ -3433,10 +5015,11 @@ mod tests {
             json!({ "title": "Secret", "url": "https://user:pw@example.com/x", "highlights": ["x"] }),
             json!({ "title": "Host only", "url": "https://example.com", "highlights": ["x"] }),
         ];
-        let matches = normalize_matches(&rows, 5, &redactor, RowReader::Exa);
+        let (matches, dropped) = normalize_matches(&rows, 5, &redactor, RowReader::Exa);
 
-        // Only the last row survives, and the URL is NORMALIZED the way `new URL()` does:
-        // a bare origin gains its trailing slash.
+        // Only the last row survives, and BOTH refusals are counted: the count is what tells
+        // the caller the provider answered at all.
+        assert_eq!(dropped, 2);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0]["url"], "https://example.com/");
     }
@@ -3735,7 +5318,7 @@ mod tests {
         ];
 
         for (status, sentence) in cases {
-            let (base, receiver) = stub_origin(&format!(
+            let (base, receiver, _server) = stub_origin(&format!(
                 "HTTP/1.1 {status} No\r\ncontent-length: 9\r\nconnection: close\r\n\r\nnot json"
             ))
             .await;
@@ -3758,7 +5341,7 @@ mod tests {
     /// The two non-JSON shapes: a body that is not JSON at all, and JSON without `results`.
     #[tokio::test]
     async fn json_without_a_results_list_is_named_by_the_field() {
-        let (base, receiver) = stub_origin(&reply_with(r#"{"data":[]}"#)).await;
+        let (base, receiver, _server) = stub_origin(&reply_with(r#"{"data":[]}"#)).await;
         let client = reqwest::Client::new();
 
         let error = search(
@@ -3776,7 +5359,7 @@ mod tests {
         );
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), receiver).await;
 
-        let (base, receiver) = stub_origin(&reply_with("<html>nope</html>")).await;
+        let (base, receiver, _server) = stub_origin(&reply_with("<html>nope</html>")).await;
 
         let error = search(
             &client,
@@ -3795,7 +5378,7 @@ mod tests {
     /// single byte is read.
     #[tokio::test]
     async fn an_oversized_declared_response_is_refused_before_it_is_read() {
-        let (base, receiver) = stub_origin(
+        let (base, receiver, _server) = stub_origin(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 900000\r\nconnection: close\r\n\r\n{}",
         )
         .await;
@@ -3856,5 +5439,911 @@ mod tests {
         .expect_err("a cancelled call does not produce a result");
 
         assert_eq!(error, "the request was cancelled.");
+    }
+
+    // ---- download ------------------------------------------------------------------
+    // The download seam is the pair `dns_answers` + `connect_to`: the URL carries a PUBLIC name
+    // (gate 1 refuses a loopback name before anything else runs), the injected DNS answer is what
+    // gate 2 reads, and `connect_to` is where the socket actually goes. Every figure comes from
+    // the stub's own bound port, so no test depends on a resolver or on a free port.
+
+    /// One reply, with the headers the name, size and redirect rules read. `connection: close` is
+    /// load-bearing for the same reason `fetch_reply` states it: a pooled socket would swallow the
+    /// next hop's reply. `content-length` is passed explicitly because several tests lie about it
+    /// on purpose.
+    fn download_reply(status: u16, reason: &str, headers: &[(&str, &str)], body: &str) -> String {
+        let mut head = format!("HTTP/1.1 {status} {reason}\r\n");
+
+        for (name, value) in headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+
+        head.push_str("connection: close\r\n\r\n");
+        head.push_str(body);
+        head
+    }
+
+    /// The stub origin under a public name. The injected answer is TEST-NET-3 (`203.0.113.7`), a
+    /// documented-public address, so gate 2 says "go" while `connect_to` lands the socket on the
+    /// local stub — which is the only way a gated download can be tested at all.
+    fn download_keys(base: &str) -> WebKeys {
+        let port = base
+            .rsplit(':')
+            .next()
+            .and_then(|tail| tail.parse::<u16>().ok())
+            .unwrap_or(80);
+
+        WebKeys {
+            dns_answers: BTreeMap::from([(
+                "dl.example".to_owned(),
+                vec![IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7))],
+            )]),
+            connect_to: BTreeMap::from([(
+                "dl.example".to_owned(),
+                vec![SocketAddr::from(([127, 0, 0, 1], port))],
+            )]),
+            ..WebKeys::default()
+        }
+    }
+
+    /// The same origin addressed by its public name: `http://127.0.0.1:PORT/x` becomes
+    /// `http://dl.example:PORT/x`.
+    fn public_url(base: &str, path: &str) -> String {
+        format!(
+            "http://dl.example{}{path}",
+            base.strip_prefix("http://127.0.0.1").unwrap_or("")
+        )
+    }
+
+    /// A scratch sessions directory that removes itself, so a test can name the exact folder the
+    /// file landed in without leaving bytes behind.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let directory =
+                std::env::temp_dir().join(format!("r1-download-{}", uuid::Uuid::new_v4()));
+
+            std::fs::create_dir_all(&directory).expect("a scratch directory is creatable");
+            Self(directory)
+        }
+
+        /// The folder one session owns, exactly as `downloads_directory_of` composes it.
+        fn folder(&self) -> std::path::PathBuf {
+            self.0.join("session-1").join("downloads")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_public_download_lands_in_the_session_folder_and_reports_every_fact() {
+        let body = "pixel-bytes";
+        let (base, seen, server) = fetch_server(&[download_reply(
+            200,
+            "OK",
+            &[
+                ("content-type", "image/png"),
+                ("content-disposition", "attachment; filename=\"pixel.png\""),
+                ("content-length", "11"),
+            ],
+            body,
+        )])
+        .await;
+        let keys = download_keys(&base);
+        let scratch = Scratch::new();
+        let url = public_url(&base, "/file");
+
+        let outcome = download(
+            &json!({ "url": url }),
+            &DownloadContext {
+                keys: &keys,
+                sessions_root: Some(&scratch.0),
+                session_id: Some("session-1"),
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("a public host behind the pinned seam must download");
+
+        // The published summary, key for key. There is no `saveError` key, because an optional key
+        // that did not fire is ABSENT rather than null: `path: null` would read as "there is a
+        // path, and it is empty".
+        let path = scratch.folder().join("pixel.png");
+
+        assert_eq!(
+            outcome["content"],
+            json!({
+                "url": url,
+                "finalUrl": url,
+                "contentType": "image/png",
+                "kind": "image",
+                "name": "pixel.png",
+                "bytes": 11,
+                "declaredBytes": 11,
+                "media": "attached",
+                "mediaId": "dl-1",
+                "saved": true,
+                "path": path.to_string_lossy(),
+                "searchable": false,
+                // An image is addressable but NOT searchable: `grep` opens text only, and the note
+                // has to say which affordance the model just got.
+                "note": "Saved in this session's downloads folder. Point read or glob at the absolute `path` above: a path you name explicitly is searched even when a .gitignore above it ignores that folder. grep skips this file (it opens only text files under 1 MiB), so use the bytes in this message or read the file.",
+            })
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("the downloaded bytes are on disk"),
+            body.as_bytes()
+        );
+        // The envelope is what makes the bytes model input: the marker comes from the attachment
+        // kind, and `dl-1` is deterministic because one call carries exactly one download.
+        assert_eq!(
+            outcome[TOOL_MEDIA_BRAND],
+            json!([{
+                "id": "dl-1",
+                "kind": "image",
+                "marker": "[Image 1]",
+                "name": "pixel.png",
+                "mime": "image/png",
+                "size": 11,
+                "data": BASE64.encode(body),
+            }])
+        );
+        assert_eq!(seen.lock().expect("the request log").len(), 1);
+        // The summary is the model-facing half, and it has to fit the delivery cap on its own.
+        assert!(payload::document_wire_bytes(&outcome["content"]) <= FETCH_MAX_RESULT_BYTES);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn every_private_address_form_is_refused_before_the_socket_opens() {
+        let (base, seen, server) = fetch_server(&[download_reply(
+            200,
+            "OK",
+            &[("content-type", "text/plain"), ("content-length", "2")],
+            "hi",
+        )])
+        .await;
+        let keys = download_keys(&base);
+        let scratch = Scratch::new();
+        let port = base.rsplit(':').next().expect("a port").to_owned();
+
+        // Gate 1, in every notation the reference decodes: the dotted quad, the `inet_aton`
+        // shorthands, IPv6 loopback, link-local, the unique-local range, and the v4-in-v6 tunnels.
+        for url in [
+            format!("http://127.0.0.1:{port}/x"),
+            "http://2130706433/x".to_owned(),
+            "http://0x7f000001/x".to_owned(),
+            "http://10.0.0.5/x".to_owned(),
+            "http://192.168.1.1/x".to_owned(),
+            "http://169.254.169.254/x".to_owned(),
+            "http://[::1]/x".to_owned(),
+            "http://[fe80::1]/x".to_owned(),
+            "http://[fc00::1]/x".to_owned(),
+            "http://[::ffff:127.0.0.1]/x".to_owned(),
+            "http://[2002:7f00:1::]/x".to_owned(),
+        ] {
+            assert_eq!(
+                download(
+                    &json!({ "url": url }),
+                    &DownloadContext {
+                        keys: &keys,
+                        sessions_root: Some(&scratch.0),
+                        session_id: Some("session-1"),
+                    },
+                    &CancellationToken::new(),
+                )
+                .await
+                .expect_err("a private destination has to be refused"),
+                "download refuses this URL: it is not a public absolute http(s) address (loopback and private addresses are not downloaded).",
+                "{url} is not a public address"
+            );
+        }
+
+        // Nothing was asked of the origin: the gate is PROVEN by the absence of a request, and no
+        // folder was created for a transfer that never started.
+        assert!(
+            seen.lock().expect("the request log").is_empty(),
+            "a refused URL must not open a socket"
+        );
+        assert!(
+            !scratch.folder().exists(),
+            "a refused download must not create the session folder"
+        );
+        server.abort();
+    }
+
+    /// THE PROOF THAT GATE 2 IS ON THE PATH: the NAME is public, the ANSWER is not, and the
+    /// refusal NAMES the address the resolver found.
+    ///
+    /// The clause is ` — <addresses> resolves to a non-public address` INSIDE the final period:
+    /// `refusedUrl` interpolates it before the closing `.` (`download.tool.ts:847-852`) and the
+    /// call site passes the resolved list, not the hostname
+    /// (`refusedUrl(firstHop.address ?? new URL(target).hostname)`, `:1347`) — the caller already
+    /// knows the name, the actionable fact is what it pointed at.
+    #[tokio::test]
+    async fn a_name_that_answers_with_loopback_is_refused_by_the_resolver() {
+        // No `connect_to` entry is needed: the verdict arrives before any socket is built, and a
+        // real lookup of `internal.example` would otherwise make this test depend on the network.
+        let (base, seen, server) = fetch_server(&[download_reply(
+            200,
+            "OK",
+            &[("content-type", "text/plain"), ("content-length", "2")],
+            "hi",
+        )])
+        .await;
+        let port = base.rsplit(':').next().expect("a port").to_owned();
+        let keys = WebKeys {
+            dns_answers: BTreeMap::from([(
+                "internal.example".to_owned(),
+                vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
+            )]),
+            ..WebKeys::default()
+        };
+        let scratch = Scratch::new();
+
+        assert_eq!(
+            download(
+                &json!({ "url": format!("http://internal.example:{port}/x") }),
+                &DownloadContext {
+                    keys: &keys,
+                    sessions_root: Some(&scratch.0),
+                    session_id: Some("session-1"),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("a name that answers with loopback has to be refused"),
+            "download refuses this URL: it is not a public absolute http(s) address (loopback and \
+             private addresses are not downloaded) — 127.0.0.1 resolves to a non-public address."
+        );
+        assert!(
+            seen.lock().expect("the request log").is_empty(),
+            "a name that resolves into loopback must not open a socket"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_redirect_into_loopback_is_refused_at_the_hop() {
+        // The Location names loopback on port 1 and is never asked for: the gate decides on the
+        // ADDRESS, and a hand-followed hop is the only place that decision can be made before the
+        // connect. A platform that followed redirects itself would have delivered internal bytes.
+        let (base, seen, server) = fetch_server(&[download_reply(
+            302,
+            "Found",
+            &[
+                ("location", "http://127.0.0.1:1/inner"),
+                ("content-length", "0"),
+            ],
+            "",
+        )])
+        .await;
+        let keys = download_keys(&base);
+        let scratch = Scratch::new();
+
+        assert_eq!(
+            download(
+                &json!({ "url": public_url(&base, "/start") }),
+                &DownloadContext {
+                    keys: &keys,
+                    sessions_root: Some(&scratch.0),
+                    session_id: Some("session-1"),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("a public URL may not hand the session an internal page"),
+            "download refused a redirect to a non-public address (HTTP 302)."
+        );
+        assert_eq!(
+            seen.lock().expect("the request log").len(),
+            1,
+            "the hop is refused before it is requested"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_public_redirect_chain_is_followed_five_hops_and_then_stops() {
+        // A relative Location is legal and common, so it is RESOLVED against the hop that sent it
+        // and stays on the public name. The chain cycles through the stub forever; the cap is what
+        // ends it. Five hops are FOLLOWED (requests 1-5 answer 302) and the sixth 302 is the one
+        // the tool refuses — which is why SIX requests are recorded.
+        let (base, seen, server) = fetch_server(&[download_reply(
+            302,
+            "Found",
+            &[("location", "/next"), ("content-length", "0")],
+            "",
+        )])
+        .await;
+        let keys = download_keys(&base);
+        let scratch = Scratch::new();
+
+        assert_eq!(
+            download(
+                &json!({ "url": public_url(&base, "/start") }),
+                &DownloadContext {
+                    keys: &keys,
+                    sessions_root: Some(&scratch.0),
+                    session_id: Some("session-1"),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("a redirect loop must not pin the session"),
+            "download stopped after 5 redirects."
+        );
+        assert_eq!(seen.lock().expect("the request log").len(), 6);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_starred_disposition_name_is_decoded_and_beats_the_plain_one() {
+        let (base, _seen, server) = fetch_server(&[download_reply(
+            200,
+            "OK",
+            &[
+                ("content-type", "image/png"),
+                (
+                    "content-disposition",
+                    "attachment; filename=\"report; plain.png\"; filename*=UTF-8''%E2%82%AC%20euro.png",
+                ),
+                ("content-length", "1"),
+            ],
+            "x",
+        )])
+        .await;
+        let keys = download_keys(&base);
+        let scratch = Scratch::new();
+
+        let outcome = download(
+            &json!({ "url": public_url(&base, "/blob") }),
+            &DownloadContext {
+                keys: &keys,
+                sessions_root: Some(&scratch.0),
+                session_id: Some("session-1"),
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the extended form is parseable");
+
+        // `filename*` outranks `filename` — and a parser that split on `;` would have ended the
+        // plain name at `report` and lost the rest of it anyway.
+        assert_eq!(outcome["content"]["name"], json!("€ euro.png"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_quoted_plain_name_keeps_the_semicolon_inside_it() {
+        let (base, _seen, server) = fetch_server(&[download_reply(
+            200,
+            "OK",
+            &[
+                ("content-type", "image/png"),
+                (
+                    "content-disposition",
+                    "attachment; filename=\"report; final.png\"",
+                ),
+                ("content-length", "1"),
+            ],
+            "x",
+        )])
+        .await;
+        let keys = download_keys(&base);
+        let scratch = Scratch::new();
+
+        let outcome = download(
+            &json!({ "url": public_url(&base, "/blob") }),
+            &DownloadContext {
+                keys: &keys,
+                sessions_root: Some(&scratch.0),
+                session_id: Some("session-1"),
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the plain form is parseable");
+
+        // A naive split on `;` ends the name at `report` and loses the rest of the file's name.
+        assert_eq!(outcome["content"]["name"], json!("report; final.png"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_declared_size_over_the_cap_refuses_before_the_body_arrives() {
+        // 21 MiB declared, two bytes sent: the declaration is what the tool trusts enough to
+        // refuse on, and refusing on it is what keeps 20 MiB from being read for nothing.
+        let (base, seen, server) = fetch_server(&[download_reply(
+            200,
+            "OK",
+            &[
+                ("content-type", "application/octet-stream"),
+                ("content-length", "22020096"),
+            ],
+            "hi",
+        )])
+        .await;
+        let keys = download_keys(&base);
+        let scratch = Scratch::new();
+
+        assert_eq!(
+            download(
+                &json!({ "url": public_url(&base, "/big") }),
+                &DownloadContext {
+                    keys: &keys,
+                    sessions_root: Some(&scratch.0),
+                    session_id: Some("session-1"),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("an oversized declaration is a refusal"),
+            "download rejects files larger than 20971520 bytes (20 MiB)."
+        );
+        assert_eq!(seen.lock().expect("the request log").len(), 1);
+        assert!(
+            !scratch.folder().exists(),
+            "a refused transfer writes nothing"
+        );
+        server.abort();
+    }
+
+    /// WHAT THE TWO SIZE KEYS MEAN, given that a real socket cannot make them disagree.
+    ///
+    /// The reference builds its `Response` by hand, so its test can declare 4 bytes and deliver 10
+    /// (`download.tool.ts:1425` reads the header, `:1444` reads the stream). Over a connection,
+    /// content-length FRAMING decides: the client stops at the declared number, so both keys report
+    /// the same figure and a lie about the size is invisible. What IS reachable — and what the
+    /// reference's summary contract turns on — is a response with NO declaration: `declaredBytes`
+    /// is then ABSENT, never a fabricated 0, because the summary spreads it only when
+    /// `Number.isFinite(declared)` (`:1495`).
+    #[tokio::test]
+    async fn the_declaration_and_the_delivered_bytes_are_reported_separately() {
+        let (base, _seen, server) = fetch_server(&[
+            // A declaration: framing truncates the 10-byte body to 4, and `declaredBytes` carries
+            // the same number the transport honoured.
+            download_reply(
+                200,
+                "OK",
+                &[("content-type", "text/plain"), ("content-length", "4")],
+                "0123456789",
+            ),
+            // No declaration at all: `connection: close` makes the body EOF-delimited, so all 10
+            // bytes are real, and there is nothing to report as declared.
+            download_reply(200, "OK", &[("content-type", "text/plain")], "0123456789"),
+        ])
+        .await;
+        let keys = download_keys(&base);
+        let scratch = Scratch::new();
+        let context = DownloadContext {
+            keys: &keys,
+            sessions_root: Some(&scratch.0),
+            session_id: Some("session-1"),
+        };
+
+        let declared = download(
+            &json!({ "url": public_url(&base, "/declared") }),
+            &context,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("a declared transfer still downloads");
+
+        assert_eq!(declared["content"]["bytes"], json!(4));
+        assert_eq!(declared["content"]["declaredBytes"], json!(4));
+
+        let undeclared = download(
+            &json!({ "url": public_url(&base, "/undeclared") }),
+            &context,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("a transfer with no content-length still downloads");
+
+        assert_eq!(undeclared["content"]["bytes"], json!(10));
+        assert!(
+            undeclared["content"].get("declaredBytes").is_none(),
+            "a missing declaration must stay absent: {}",
+            undeclared["content"]
+        );
+        // The extension still comes from the MIME, and the bytes on disk are the bytes reported.
+        assert_eq!(undeclared["content"]["name"], json!("undeclared.txt"));
+        assert_eq!(
+            std::fs::read(scratch.folder().join("undeclared.txt")).expect("the written file"),
+            b"0123456789"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_sessionless_download_and_an_escaping_path_refuse_before_the_transfer() {
+        let (base, seen, server) = fetch_server(&[download_reply(
+            200,
+            "OK",
+            &[("content-type", "text/plain"), ("content-length", "2")],
+            "hi",
+        )])
+        .await;
+        let keys = download_keys(&base);
+        let scratch = Scratch::new();
+
+        // No folder means no owner for the bytes: the reference refuses BEFORE the transfer rather
+        // than writing somewhere the caller never named.
+        assert_eq!(
+            download(
+                &json!({ "url": public_url(&base, "/x") }),
+                &DownloadContext {
+                    keys: &keys,
+                    sessions_root: None,
+                    session_id: Some("session-1"),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("no folder, no download"),
+            "download needs a session: this harness has no session downloads folder, so there is nowhere to save the file. Run it inside a server session, or build the harness with `downloadsDirectory`."
+        );
+        // A `path` that walks out of the session folder is an ARGUMENT error, proven before the
+        // transfer is paid for.
+        assert_eq!(
+            download(
+                &json!({ "url": public_url(&base, "/x"), "path": "../escape.png" }),
+                &DownloadContext {
+                    keys: &keys,
+                    sessions_root: Some(&scratch.0),
+                    session_id: Some("session-1"),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("an escaping path is refused"),
+            "download path must be relative to the session downloads folder, without \"..\"."
+        );
+        // An absolute path and a drive prefix escape the same way.
+        assert_eq!(
+            download(
+                &json!({ "url": public_url(&base, "/x"), "path": "/etc/passwd" }),
+                &DownloadContext {
+                    keys: &keys,
+                    sessions_root: Some(&scratch.0),
+                    session_id: Some("session-1"),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("an absolute path is refused"),
+            "download path must be relative to the session downloads folder, without \"..\"."
+        );
+        assert!(seen.lock().expect("the request log").is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_path_argument_lands_under_the_folder_and_a_second_copy_is_numbered() {
+        let body = "note";
+        let (base, _seen, server) = fetch_server(&[download_reply(
+            200,
+            "OK",
+            &[
+                ("content-type", "text/plain"),
+                ("content-disposition", "attachment; filename=\"note.txt\""),
+                ("content-length", "4"),
+            ],
+            body,
+        )])
+        .await;
+        let keys = download_keys(&base);
+        let scratch = Scratch::new();
+        let context = DownloadContext {
+            keys: &keys,
+            sessions_root: Some(&scratch.0),
+            session_id: Some("session-1"),
+        };
+        let arguments = json!({ "url": public_url(&base, "/note"), "path": "sub/note.txt" });
+
+        let first = download(&arguments, &context, &CancellationToken::new())
+            .await
+            .expect("a relative path inside the folder is honoured");
+        let first_path = scratch.folder().join("sub").join("note.txt");
+
+        assert_eq!(
+            first["content"]["path"].as_str().expect("a path"),
+            first_path.to_string_lossy()
+        );
+        assert!(first_path.exists());
+
+        // A second call for the same name does not overwrite the first. The suffix goes on the
+        // LEAF, so the name stays readable however often the same file is downloaded.
+        let second = download(&arguments, &context, &CancellationToken::new())
+            .await
+            .expect("the unique name is still a success");
+
+        assert_eq!(
+            second["content"]["path"].as_str().expect("a path"),
+            scratch
+                .folder()
+                .join("sub")
+                .join("note-1.txt")
+                .to_string_lossy()
+        );
+        assert_eq!(
+            std::fs::read(first_path).expect("the first copy survives"),
+            body.as_bytes()
+        );
+        server.abort();
+    }
+
+    // ---- search: the fit report and the delivery cap --------------------------------
+
+    #[tokio::test]
+    async fn provider_rows_that_cannot_be_used_are_counted_and_named() {
+        // Two rows, neither with a usable URL: `results: []` on its own would read as "the index
+        // has nothing", and the caller would retry a query that was fine.
+        let (base, seen, server) = stub_origin(&reply_with(
+            r#"{"results":[{"title":"ftp","url":"ftp://example.com/a"},{"title":"no url","highlights":"x"}]}"#,
+        ))
+        .await;
+        let outcome = search(
+            &reqwest::Client::new(),
+            &json!({ "query": "q" }),
+            &stubbed_keys("exa", "k", &base),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("junk rows are a result, not a failure");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), seen)
+            .await
+            .expect("one request");
+
+        assert_eq!(
+            outcome,
+            json!({
+                "provider": "exa",
+                "query": "q",
+                "maxResults": 5,
+                "results": [],
+                "droppedResults": 2,
+                "note": "Exa returned 2 result rows with no usable http(s) URL, so none of them could be shown. The provider did answer: the query is not necessarily at fault.",
+            })
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn junk_rows_do_not_spend_the_callers_quota() {
+        // `maxResults: 2` behind three junk rows used to answer ZERO results. The scan runs until
+        // two USABLE rows are collected, and the junk is reported as a count instead.
+        let (base, seen, server) = stub_origin(&reply_with(
+            r#"{"results":[
+                {"title":"junk 1","url":"ftp://example.com/1","highlights":"x"},
+                {"title":"junk 2","url":"not a url","highlights":"x"},
+                {"title":"junk 3","url":"mailto:a@b","highlights":"x"},
+                {"title":"Good one","url":"https://example.com/one","highlights":"first"},
+                {"title":"Good two","url":"https://example.com/two","highlights":"second"},
+                {"title":"Never reached","url":"https://example.com/three","highlights":"third"}
+            ]}"#,
+        ))
+        .await;
+        let outcome = search(
+            &reqwest::Client::new(),
+            &json!({ "query": "q", "maxResults": 2 }),
+            &stubbed_keys("exa", "k", &base),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the quota is filled from the usable rows");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), seen)
+            .await
+            .expect("one request");
+
+        let rows = outcome["results"].as_array().expect("rows");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["title"], json!("Good one"));
+        assert_eq!(rows[1]["title"], json!("Good two"));
+        assert_eq!(outcome["droppedResults"], json!(3));
+        assert!(
+            outcome.get("note").is_none(),
+            "a partial answer is not the empty-answer case"
+        );
+        assert!(outcome.get("resultsTruncated").is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_oversized_result_drops_trailing_rows_and_says_so() {
+        // Twenty rows whose excerpt is 1 000 quotation marks. Each quote serializes as `\"`, so one
+        // excerpt alone costs 2 000 payload bytes and the answer cannot be delivered; each row is
+        // the same size, so the count that fits is exact arithmetic, not an observation:
+        //     row   = 58 framing + 2 000 excerpt + 2 closing  = 2 062 wire bytes
+        //     seven = 14 434 + the 6 commas                      = 14 440
+        //     the result document around them, with `resultsTruncated` and the note, lands at
+        //     28 797 while EIGHT rows would land at 30 880+2 185 — past the 32 768-byte cap.
+        let rows: Vec<Value> = (0..20)
+            .map(|index| {
+                json!({
+                    "title": format!("Row {index}"),
+                    "url": format!("https://example.com/{index}"),
+                    "highlights": "\"".repeat(1_000),
+                })
+            })
+            .collect();
+        let (base, seen, server) =
+            stub_origin(&reply_with(&json!({ "results": rows }).to_string())).await;
+        let outcome = search(
+            &reqwest::Client::new(),
+            &json!({ "query": "q", "maxResults": 20 }),
+            &stubbed_keys("exa", "k", &base),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("an oversized answer is trimmed, not refused");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), seen)
+            .await
+            .expect("one request");
+        let kept = outcome["results"].as_array().expect("rows");
+
+        // The ceiling the harness refuses above, asserted on the document that is actually
+        // returned — the fit's own flag and note are inside this figure.
+        assert!(payload::document_wire_bytes(&outcome) <= SEARCH_MAX_RESULT_BYTES);
+        assert_eq!(outcome["resultsTruncated"], json!(true));
+        assert_eq!(kept.len(), 7);
+        assert_eq!(kept[0]["title"], json!("Row 0"));
+        assert_eq!(kept[6]["title"], json!("Row 6"));
+        assert_eq!(
+            outcome["note"],
+            json!(
+                "13 of 20 result rows were omitted to fit the 32768-byte result budget. Narrow the query or lower maxResults for more per-row detail."
+            )
+        );
+        // A row that survives is a row that is WHOLE: redaction and bounding ran before the fit,
+        // so no excerpt was cut at a credential boundary and no surviving row was clipped.
+        assert_eq!(
+            kept[0]["snippet"].as_str().expect("text").chars().count(),
+            1_000
+        );
+        assert!(kept[0].get("snippetTruncated").is_none());
+        server.abort();
+    }
+
+    #[test]
+    fn a_single_row_is_clipped_rather_than_thrown_away() {
+        // `search()` cannot reach the clip step — the per-field caps keep one row near 3 KiB — so
+        // the fit is driven directly, at a budget one row overflows. The clip prices its own
+        // `snippetTruncated` flag: bisecting without it lands over the cap and drops the row.
+        //
+        // The figures are the same currency as above: the row's framing (`title` 18 + `url` 39 +
+        // the `snippet` key 11 + braces/colons) is 70 bytes, and each kept quote costs 2 more, so a
+        // 150-byte budget admits 13 of the 100 quotes and the flag is what makes 14 miss.
+        let rows = vec![json!({
+            "title": "T",
+            "url": "https://example.com/a",
+            "snippet": "\"".repeat(100),
+        })];
+        let budget = 150_usize;
+        let measure =
+            |candidate: &[Value]| payload::document_wire_bytes(&Value::Array(candidate.to_vec()));
+
+        let (fitted, truncated, clipped) = fit_rows_to_result_budget(&rows, budget, &measure);
+
+        assert!(truncated);
+        assert!(clipped);
+        assert_eq!(fitted.len(), 1);
+        assert_eq!(
+            fitted[0]["snippet"].as_str().expect("text").chars().count(),
+            13
+        );
+        assert_eq!(fitted[0]["snippetTruncated"], json!(true));
+        assert!(measure(&fitted) <= budget);
+
+        // A row whose title and URL ALONE overflow the budget cannot be rescued by clipping its
+        // excerpt: the safety net drops it, which still beats a result the harness refuses.
+        let (dropped, truncated, clipped) = fit_rows_to_result_budget(&rows, 40, &measure);
+
+        assert!(truncated);
+        assert!(clipped);
+        assert!(dropped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_category_combination_rules_apply_only_to_the_provider_that_has_them() {
+        // F11: only Exa receives `category`, so a Tavily or Linkup call that Exa would refuse still
+        // runs — a refusal the resolved provider cannot justify is a lost query, not a guard.
+        let body = r#"{"results":[{"title":"T","url":"https://example.com/t","content":"c"}]}"#;
+
+        for (provider, arguments, expected) in [
+            (
+                "tavily",
+                json!({ "query": "harness tools", "category": "people", "since": "2026-01-01" }),
+                None,
+            ),
+            (
+                "linkup",
+                json!({ "query": "harness tools", "category": "company", "until": "2026-02-01" }),
+                None,
+            ),
+            (
+                "exa",
+                json!({ "query": "harness tools", "category": "people", "since": "2026-01-01" }),
+                Some(
+                    "search category \"people\" does not support date filters. Drop \"since\"/\"until\", or use another category.",
+                ),
+            ),
+            (
+                "exa",
+                json!({ "query": "harness tools", "category": "company", "until": "2026-02-01" }),
+                Some(
+                    "search category \"company\" does not support date filters. Drop \"since\"/\"until\", or use another category.",
+                ),
+            ),
+            (
+                "exa",
+                json!({
+                    "query": "harness tools",
+                    "category": "people",
+                    "excludeDomains": ["spam.example"]
+                }),
+                Some(
+                    "search category \"people\" does not support \"excludeDomains\". Drop the category or the domain filter.",
+                ),
+            ),
+            // The combinations verified against the live provider must NOT be over-rejected.
+            (
+                "exa",
+                json!({ "query": "harness tools", "category": "news", "since": "2026-01-01" }),
+                None,
+            ),
+            (
+                "exa",
+                json!({
+                    "query": "harness tools",
+                    "category": "company",
+                    "excludeDomains": ["spam.example"]
+                }),
+                None,
+            ),
+        ] {
+            let (base, seen, server) = stub_origin(&reply_with(body)).await;
+
+            match expected {
+                None => {
+                    search(
+                        &reqwest::Client::new(),
+                        &arguments,
+                        &stubbed_keys(provider, "k", &base),
+                        &CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("{provider} {arguments} must run, got: {error}")
+                    });
+                }
+                Some(sentence) => {
+                    assert_eq!(
+                        search(
+                            &reqwest::Client::new(),
+                            &arguments,
+                            &stubbed_keys(provider, "k", &base),
+                            &CancellationToken::new(),
+                        )
+                        .await
+                        .expect_err("the combination is refused locally"),
+                        sentence,
+                        "{provider} {arguments}"
+                    );
+                    let _ = tokio::time::timeout(std::time::Duration::from_millis(250), seen)
+                        .await
+                        .expect_err("a local refusal must not reach the provider");
+                }
+            }
+
+            server.abort();
+        }
     }
 }

@@ -34,6 +34,7 @@ pub mod catalogue;
 pub mod command;
 pub mod files;
 pub mod result;
+pub mod ssrf;
 pub mod syntax;
 pub mod text;
 pub mod web;
@@ -158,6 +159,15 @@ pub struct Options {
     /// Whether this deployment asked for `fetch` at all (`webfetch: true` in TS). The
     /// native provider needs no key, so the shipped default is enabled.
     pub fetch_enabled: bool,
+    /// The directory whose per-session subfolder a `download` may write into — pass
+    /// [`crate::persistence::sessions_dir(root)`], because that is the directory the journal owns
+    /// and `delete_session` removes. `None` is a harness with no session store, and `download`
+    /// refuses that case BEFORE transferring anything ([`web::DOWNLOAD_SESSION_REQUIRED`]).
+    ///
+    /// This is the crate's shape of the reference host's `downloadsDirectory` supply
+    /// (`tools/webdownload/download.tool.ts:294-311`): the SERVER chooses the folder, the tool never
+    /// guesses one, and a session's bytes are removed with the session.
+    pub downloads_root: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -166,6 +176,7 @@ impl Default for Options {
         Self {
             web_keys: WebKeys::from_environment(),
             fetch_enabled: true,
+            downloads_root: None,
         }
     }
 }
@@ -571,9 +582,22 @@ async fn dispatch(
         "search" => web::search(client, &arguments, &options.web_keys, &signal)
             .await
             .map_err(ToolFailure::Failed),
-        "download" => web::download(client, &arguments, &cwd, &signal)
+        "download" => {
+            // The destination is decided HERE, from the registry's own configuration, so the tool
+            // never guesses a folder: `downloads_root` is the sessions directory, and the per-session
+            // subfolder under it is what `delete_session` removes.
+            web::download(
+                &arguments,
+                &web::DownloadContext {
+                    keys: &options.web_keys,
+                    sessions_root: options.downloads_root.as_deref(),
+                    session_id: ctx.session_id.as_deref(),
+                },
+                &signal,
+            )
             .await
-            .map_err(ToolFailure::Failed),
+            .map_err(ToolFailure::Failed)
+        }
 
         // The session-shared todo list: a pass-through of the host's own JSON answer.
         "tasks" => {
@@ -934,6 +958,7 @@ mod tests {
         let registry = ToolRegistry::with_options(Options {
             web_keys: WebKeys::default(),
             fetch_enabled: true,
+            ..Options::default()
         });
         let summaries = registry.summaries();
 
@@ -1077,6 +1102,7 @@ mod tests {
         let keyless = ToolRegistry::with_options(Options {
             web_keys: WebKeys::default(),
             fetch_enabled: true,
+            ..Options::default()
         });
         let rows = keyless
             .summaries()
@@ -1123,8 +1149,12 @@ mod tests {
                 linkup: None,
                 // The published provider endpoints; only the keys are under test here.
                 endpoint_base: None,
+                // The download SSRF/DNS seams are test-only; production reads of the registry
+                // leave them empty, which is what `Default` means here.
+                ..WebKeys::default()
             },
             fetch_enabled: true,
+            ..Options::default()
         });
 
         assert_eq!(

@@ -107,6 +107,11 @@ pub mod manifest;
 pub mod origin;
 pub mod package_root;
 pub mod paging;
+/// The ONE byte measure every model-facing budget is gated in: `utf8_byte_length` (what the
+/// tool's TEXT costs) vs `model_payload_bytes` (what the same text costs once it is serialized
+/// into the model request), plus the per-entry and per-document charges the file and web tools
+/// spend those two figures with. TypeScript origin: `core/payload-bytes.ts`.
+pub mod payload;
 pub mod persistence;
 // The plugin LAYER (bus + host + seam), distinct from `plugins` below, which is the generated
 // catalogue metadata the host publishes. `plugin` owns behaviour, `plugins` owns the table.

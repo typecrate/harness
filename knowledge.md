@@ -2136,7 +2136,7 @@ auto-scanned in TypeScript, so the only thing an operator can change is a settin
 
 | Drift | Contract | This build after T10 |
 | --- | --- | --- |
-| `limits.tool_result_bytes` | `262144` (`harness-api.ts:216`, `harness.swagger.yaml:243`) - **the figures on this row are as of T10.** The contract figure is 32768 at `src/engine/shared/harness-api.ts:218-234` (`HARNESS_SERVICE_LIMITS.tool_result_bytes`), mirrored in `src/harness-server.swagger.yaml`, and this build is AT parity: `MODEL_TOOL_RESULT_BUDGET_BYTES = 32 * 1024` with `PUBLISHED_TOOL_RESULT_BYTES` DERIVED from it (`src/contract.rs:122`/`:129`, pinned equal by `tests/foundation.rs`). What is still open is the measurement CURRENCY, not the magnitude - `src/contract.rs:107-113`. See "Audit re-verification - 2026-11-27". | the boot document publishes `contract::PUBLISHED_TOOL_RESULT_BYTES = 262_144`; the ENFORCED budget stays `MODEL_TOOL_RESULT_BUDGET_BYTES = 65_536` until the tool stage widens (Deviations item 17), and both figures are asserted so the gap cannot drift |
+| `limits.tool_result_bytes` | `262144` (`harness-api.ts:216`, `harness.swagger.yaml:243`) - **the figures on this row are as of T10.** The contract figure is 32768 at `src/engine/shared/harness-api.ts:218-234` (`HARNESS_SERVICE_LIMITS.tool_result_bytes`), mirrored in `src/harness-server.swagger.yaml`, and this build is AT parity: `MODEL_TOOL_RESULT_BUDGET_BYTES = 32 * 1024` with `PUBLISHED_TOOL_RESULT_BYTES` DERIVED from it (`src/contract.rs:141`/`:148`, pinned equal by `tests/foundation.rs`). *(SUPERSEDED 2026-11-28: the currency gap closed - `src/payload.rs`'s `model_payload_bytes` gates in escaped payload bytes exactly as the reference does, the file tools charge the same function, and the residuals are listed under the constant in `src/contract.rs`.)* See "Audit re-verification - 2026-11-27". | the boot document publishes `contract::PUBLISHED_TOOL_RESULT_BYTES = 262_144`; the ENFORCED budget stays `MODEL_TOOL_RESULT_BUDGET_BYTES = 65_536` until the tool stage widens (Deviations item 17), and both figures are asserted so the gap cannot drift |
 | `ThreadSummary.status` | `"idle" \| "running" \| "paused" \| "stopped"` (`harness-api.ts:1481`) | `ThreadLifecycle::Paused` exists, `store::lifecycle_str` / `store::read::parse_lifecycle` carry the word, and a `paused` record no longer collapses into `Idle`. The `?status=` FILTER vocabulary stays the contract's three (`api.ts:3497`), so `?status=paused` is still a 400 there |
 | `HarnessInstructionSummaryEntry.source` | `"catalogue" \| "global" \| "harness" \| "session"` (`harness-api.ts:451`) | `InstructionSource::Session` exists, so a session-defined member's provenance parses instead of failing the read. This port models provenance as ONE enum, so the two narrower TypeScript members (`:547`, `:594`) accept the extra spelling on the way in and never emit it - an accepted superset, stated on the enum |
 | default model | `local/basalt` (`config.ts:105-111` - the file is `src/server/config.ts`, and the constant sits at `:278` as of 2026-11-27) | `config::DEFAULT_MODEL`, the boot reset target of `PATCH /config {"model": null}`, and `apply_config_patch`'s reset all moved with it; the base URL is unchanged |
@@ -2180,10 +2180,17 @@ auto-scanned in TypeScript, so the only thing an operator can change is a settin
 2. Widening `MODEL_TOOL_RESULT_BUDGET_BYTES` to the contract's 256 KiB belongs to the tool stage: it
    changes what a model is shown, and `tests/tools.rs`'s budget envelope moves with it.
    **Closed 2026-11-27, and not in the direction this row expected.** The cap is `32 * 1024` and the
-   published figure is DERIVED from it (`src/contract.rs:122`/`:129`), because the contract figure is
-   32768, not 262144 - see the R7 row above. The live gap is the measurement currency
-   (`src/contract.rs:107-113`), and `READ_CONTENT_BUDGET` (64 KiB) now sits above the cap, which
-   `src/contract.rs:114-121` reports instead of fixing.
+   published figure is DERIVED from it (`src/contract.rs:141`/`:148`), because the contract figure is
+   32768, not 262144 - see the R7 row above. The gap that was LEFT - the measurement currency -
+   closed on 2026-11-28: the gate charges escaped payload bytes (`src/payload.rs`
+   `model_payload_bytes`, the port of `modelPayloadBytes`, vectors ported from
+   `payload-bytes.test.ts`), the file tools charge that same function against allowances that have
+   already paid for the result's own scaffolding (`read_result_overhead`, `glob_page_allowance`,
+   `grep_page_allowance`, `file_list_allowance`), and `READ_CONTENT_BUDGET` IS the cap rather than
+   sitting above it. `tests/tools.rs` proves `read`/`glob`/`grep`/`files` pages at the ceiling are
+   DELIVERED, not JSON-refused, with every page size derived from the exported allowances. The
+   residuals (a lone surrogate priced as the U+FFFD this crate writes; the crate pricing its own
+   serializer rather than `JSON.stringify`) are stated under the constant.
 3. A session-defined created agent would make `InstructionSource::Session` a value this build EMITS,
    not merely accepts - the same hole "still to port" already records for the created-tool module host.
 
@@ -2418,7 +2425,7 @@ The README now states only what the manifest says.
 | Plugin catalogue | `BUILTIN_PLUGINS: [PluginMetadata; 3]` at `src/plugins.rs:159`, declared in the reference's scan order: `async-ping` (1 settings key - `intervalMs`), `context-compaction` (6 - `contextLimit`, `modelLimits`, `enabled`, `minTokens`, `safetyTurns`, `mode`), `context-trimmer` (12 - `enabled`, `dropSupersededToolCalls`, `dropInvalidToolCallsOnceAnswered`, `invalidOutcomes`, `dropOldThoughts`, `thoughtKeepUnits`, `supersedeMatch`, `dropDuplicateCalls`, `minTokens`, `minThoughtChars`, `safetyUnits`, `maxUnits`) | `tests/plugins.rs::the_catalogue_answers_both_builtins_with_their_declared_metadata_and_values` (the NAME still says "both" while the table ships three rows) plus the settings-count assertions in that file; `src/plugins.rs:1193` and `:1824` are what "in scan order" means |
 | Agent profiles | EIGHT, in `src/agents/profiles.rs::shipped_profiles()` at `:283`: general, instruct, research, workspace, reviewer, planner, debugger, summarizer | `tests/data_plane.rs::catalogue_ships_eight_profiles_and_replays_operator_edits` |
 | Preset cards | EIGHT in `src/registry/presets.rs::shipped_presets()`: general, instruct, research, workspace, reviewer, planner, debugger, chat. The `chat` card (`:347-355`) reuses the **general** profile with an empty toolbox, and `summarizer` ships as a profile with no card | `tests/data_plane.rs::registry_ships_edits_and_tombstones_the_eight_presets` |
-| Tool-result budgets | `MODEL_TOOL_RESULT_BUDGET_BYTES = 32 * 1024` (`src/contract.rs:122`), `PUBLISHED_TOOL_RESULT_BYTES` derived from it (`:129`), aggregate `MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES = 96 * 1024 = 98304` (`:142`) | the `R7` follow-up below is closed on the NUMBERS; what is left is the measurement currency note at `src/contract.rs:107-113` (this crate measures raw UTF-8 bytes where the reference gates on escaped payload bytes) |
+| Tool-result budgets | `MODEL_TOOL_RESULT_BUDGET_BYTES = 32 * 1024` (`src/contract.rs:141`), `PUBLISHED_TOOL_RESULT_BYTES` derived from it (`:148`), aggregate `MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES = 96 * 1024 = 98304` (`:142`) | the `R7` follow-up below is closed on the NUMBERS; the NUMBERS and the CURRENCY are matched as of 2026-11-28 (`src/payload.rs` prices the escaped payload bytes the gate charges, and `READ_CONTENT_BUDGET`/`LIST_CONTENT_BUDGET`/`SEARCH_CONTENT_BUDGET` ARE that cap); the residuals are the lone-surrogate arm and the crate pricing its own serializer, and `tests/tools.rs` proves the four file tools deliver a full page under the cap |
 | Projector op kinds | it mints 14 of the contract's 18 - attempt:commit, attempt:discard, context:add, context:remove, context:set, node:append, node:insert, node:set, section:open, section:set, step:set, tail:clear, tail:set, usage - and never mints `turn`, `section:remove`, `node:remove` or `pending:set` | the `"op": "..."` literals in `src/projector.rs`; see the note below about its own header |
 | Session records | mounted, answers 500 through `api::records::record_store_missing` (`src/api/records.rs:118-121`); the 404 and malformed-`since` 400 gates run first | `tests/wave_one.rs::the_records_route_runs_its_gates_before_the_placeholder` |
 | Integration targets | 19 binaries, one per `.rs` directly under `tests/`: context_lane, contract_message_flags, data_plane, foundation, http_host, http_sessions, plugin_host, plugins, projector, routes, runtime_execution, store, store_restore, stream, tools, transport, turn, wave_one, worker_execution_http | `Cargo.toml` carries no `[[test]]` table and no `autotests` key, so cargo's autodiscovery IS the inventory |
@@ -2556,3 +2563,127 @@ length this pass did not re-count. Read those as pointers, not as pins.
 Older prose in either document about a services SIGTERM/wasm build failure was an observation from one
 build state, not a contract, so it is not repeated here as a current fact - and with no `cargo` run in
 this pass there is no fresh observation to replace it with.
+
+## Web tool re-mirror - `fetch` / `search` / `download` - 2026-11-28
+
+### Why this section exists
+
+A sixteen-finding review of the reference's web tools (`packages/underload/harness/src/engine/tools/
+{webfetch,websearch,webdownload}`) landed in the TypeScript, and that package is **frozen** for this
+crate: it is the source of record, and nothing under `packages/underload/**` moved. The mirror that
+had drifted is `src/tools/web.rs`. This section records what was re-mirrored, the two seams that make
+the gated tool testable at all, the one deviation this port states rather than hides, and the numbers
+the re-mirror pinned.
+
+### What moved, per tool
+
+**`fetch`** (`tools/webfetch/index.ts` + `request.ts`). The page budget is counted in **payload
+bytes**, not characters: `FETCH_MAX_RESULT_BYTES` is `32 * 1024`, the content allowance is measured
+with `crate::payload::document_wire_bytes` (the port of `modelPayloadBytes`), and the frame is
+measured with `content: ""` so the scaffolding is paid for before the page is sized - which is the
+shape of the reference's `fitResult`, 5%-step-down ladder included. The two currencies stay distinct
+on purpose, and the module says so where each is used: `characters` / `nextOffset` / `offset` count
+**code units** (the reference's `output.length`), while the budget spends escaped bytes. The resume
+offset is derived from where the cut actually landed (`resume_offset_for_cut`), and the two proximity
+notes (`PROXIMITY_NOTE_CUT` / `PROXIMITY_NOTE_WHOLE`) are chosen by which pointer the caller used.
+
+**`search`** (`tools/websearch/{index,request}.ts`). `SEARCH_MAX_RESULT_BYTES` (`:1706`) is `32 *
+1024` - the same magnitude as `MODEL_TOOL_RESULT_BUDGET_BYTES`, which is the point: the tool trims its
+rows so the delivery step never has to. Row validation counts unusable rows BEFORE the fit runs
+(`normalize_matches` returns the kept rows and the dropped count), and the two failure notes are kept
+strictly apart: `droppedResults` + `unusable_rows_note` blame the provider's rows, `resultsTruncated`
++ `size_note` blame the budget, and neither may overwrite the other. The three category-combination
+refusals are gated on the RESOLVED provider being Exa - the only provider with a `category` argument -
+and a Brave or Linkup call that Exa would refuse still runs.
+
+**`download`** (`tools/webdownload/download.tool.ts`). The SSRF gate runs on the first hop **and every
+redirect**: `Location` is resolved against the hop that produced it, then gated, then asked for, with
+`Policy::none()` and a hand-followed chain capped at 5 hops. A declaration is checked before the body
+(`content-length` over the cap refuses without opening a socket) and again while streaming. The
+destination is proven before the transfer: an absolute `path`, a drive colon, or any `..` segment is
+refused rather than normalized, and the summary reports `saved` / `path` / `saveError` plus the note
+the file tools need. The published summary key set is the reference's, with `Null` values ABSENT
+rather than null; the bytes ride the `__toolMedia` envelope, not the model's text.
+
+### The destination, and why it is a cross-module fact
+
+The reference writes into a host-supplied session downloads folder - its old
+`<cwd>/.underload/downloads/` default is gone, and the frozen manifest says the same thing
+(`tool-manifest.ts:2488-2524`). This crate supplies that root from
+`persistence::sessions_dir(root)`, wired once at `src/runtime.rs:560` into
+`tools::Options::downloads_root`; the tool composes `<root>/<session id>/downloads`, which is the
+directory `Store::delete_session` removes (`src/store/session.rs:482`). With no root, or no session
+id, the tool refuses before transferring instead of writing somewhere the caller never named.
+
+### Two seams, one stated deviation
+
+`tools::WebKeys` gained `dns_answers` (the mirror of the reference's injectable `lookup`) and
+`connect_to` (addresses reqwest pins for a name, via `resolve_to_addrs`). Together they let a PUBLIC
+host name reach a loopback stub, which is the only way a gated download can be tested without public
+DNS - and they are test seams: both are empty in production, and `src/tools/ssrf.rs`'s `Resolver`
+distinguishes "the lookup answered nothing" (fail open, the reference's rule) from "no resolver" (no
+verdict at all).
+
+The deviation: **`fetch` is not SSRF-gated here.** The gate exists once, in `src/tools/ssrf.rs`, and
+runs on download at every hop; fetch keeps the reference's format-only rule
+(`assertPublicUrlHostFormat`, `webfetch/request.ts:373-392`) because the reference tool's own
+allow-list and this crate's existing fetch coverage dial loopback origins. `src/tools/web.rs`'s module
+header states this rather than letting the shared module imply it.
+
+### Catalogue row re-mirror
+
+The manifest's `download` metadata had already moved with the review, so the Rust row was re-copied
+byte-for-byte off the current entry: `description` 1,367 characters, the `url` parameter description
+260, the `path` parameter description 279, compared string-for-string by a scratch probe
+(`Temp/r1-rust/check_p5_parity.py`) rather than by eye. The `search` and `fetch` rows were NOT
+touched: they mirror `tools/runtime/{search,fetch}.tool.ts`, and those generic rows are still current
+in the frozen source - the per-harness provider surface is a registration-time override there, exactly
+as the row text says. `src/contract.rs`'s budget note gained the current reading (item 4): the web
+tools now budget themselves in payload bytes, so the oversized-JSON refusal stays reserved for a
+result nothing sized - `command`'s 128 KiB stdout transcript.
+
+### Tests: what is pinned, and where
+
+`src/tools/ssrf.rs` carries its own corpus (11 in-file tests): every private IPv4 range and notation
+(decimal, octal, hex, `127.1`), the CGNAT prefix, link-local and the metadata IP, the IPv4-compatible
+/ mapped / translated forms, 6to4's non-inverted middle groups, Teredo's inverted client and relay
+halves, and the fail-open order of `resolve_public_host` - including the two vectors the reference
+decided AGAINST widening (ORCHID, 6VTEL). `src/tools/web.rs`'s module tests were re-pinned to the new
+contract rather than to observed output: the 20,000-`é` page lands at exactly 14,704 characters and
+29,408 content bytes; a 70,000-character page takes THREE calls to page at the content ceiling; the
+20-row oversized search keeps 7 rows and its note names the 13 that fell; `Content-Disposition`
+`filename*=UTF-8''` decodes to `€ euro.png` and a quoted `report; final.png` survives its semicolon; a
+5-hop chain costs 6 requests; junk rows are counted and named without spending the quota.
+
+`tests/web_surface.rs` (NEW, 8 tests) is the boundary file: it drives the REGISTRY, so the ceiling is
+asserted where the cap is enforced (`result::completed_outcome`, `src/tools/mod.rs:470`) -
+a whole page and an oversized row set must arrive `ok`, inside 32,768 payload bytes, and be TRIMMED
+rather than JSON-refused. It also proves the folder claim end to end (the file lands under
+`sessions_dir/<id>/downloads` and the delete that removes that directory removes the file), that the
+gate costs no socket and no folder across thirteen address spellings, that a redirect into loopback
+refuses after exactly one request, and that the two destination refusals transfer no byte.
+
+### Verification, run after the last edit on 2026-11-28
+
+From `packages/typecrate/harness`, with `TMPDIR` pointed at the repo's `Temp/r1-rust/`:
+
+* `cargo test --no-fail-fast` - **24 targets and the doc-tests, 613 passed, 0 failed** (lib 241,
+  `bin/server` 14, `context_lane` 11, `contract_message_flags` 9, `data_plane` 18,
+  `delivery_surface` 13, `foundation` 24, `http_host` 17, `http_sessions` 30, `plugin_host` 31,
+  `plugins` 24, `projector` 15, `routes` 7, `runtime_execution` 12, `store` 30, `store_restore` 6,
+  `stream` 25, `tools` 30, `transport` 24, `turn` 13, `wave_one` 10, `web_surface` 8,
+  `worker_execution_http` 1).
+* `cargo clippy --all-targets -- -D warnings` - clean, no findings.
+* `rustfmt --edition 2024 --check` on every file this pass touched (`src/tools/web.rs`,
+  `src/tools/ssrf.rs`, `src/tools/mod.rs`, `src/tools/catalogue.rs`, `src/contract.rs`,
+  `src/runtime.rs`, `tests/web_surface.rs`) - clean.
+
+`tests/delivery_surface.rs` has a load-sensitive assertion (`:402`) that fails occasionally under a
+parallel suite run and was left alone; in the run above it passed 13/13. The crate's own
+`Fixture`-style scratch directories live under the repo's `Temp/typecrate-harness/web/`, per the
+scratch-space rule.
+
+One figure elsewhere in this file is now stale and is NOT re-derived here: the T4 section lists the
+module sizes as they landed in that stage (`src/tools/web.rs` "818", `mod.rs` "1 045"). `web.rs` is
+6,349 lines after this pass and `ssrf.rs` (997) did not exist yet; read those T4 numbers as that
+stage's state, and this section's line references as the current one.

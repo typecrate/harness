@@ -551,7 +551,15 @@ fn build_runtime(
 
     // 5. The collaborators. The catalogue resolves availability NOW, which is the point of the
     // ordering above; the executor and the projector are stateless factories.
-    let tools = ToolRegistry::new();
+    //
+    // `downloads_root` is the ONE production wiring of the download destination: the sessions
+    // directory, which is the directory the journal owns and `delete_session` removes, so a session's
+    // downloaded bytes are removed with it (`tools/webdownload/download.tool.ts:294-311` is the
+    // reference's same rule, supplied by its host).
+    let tools = ToolRegistry::with_options(crate::tools::Options {
+        downloads_root: Some(persistence::sessions_dir(root)),
+        ..crate::tools::Options::default()
+    });
     let executor = AgentExecutor::new();
     let projector = TurnProjectorFactory::new();
     let task_host = Arc::new(StoreTaskHost::new());

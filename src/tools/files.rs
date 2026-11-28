@@ -12,7 +12,9 @@
 //!     apply in request order, write once", and the same partial-success sentence;
 //!   * `tools/files/fileList.tool.ts` - the paged listing whose entries are prefixed
 //!     with the directory they came from, directories end with `/`, sorted by code
-//!     point, 200/1000 entries and a 64 KiB text budget;
+//!     point, 200/1000 entries, and a page budget of ONE model-facing result (32 KiB) that is
+//!     charged in the harness's delivery currency - see [`crate::payload`] and
+//!     [`file_list_allowance`];
 //!   * `tools/files/glob.tool.ts` + `glob.ts` - the walker, the pattern language, and
 //!     the `{files, truncated, offset, limit, nextOffset, bytes, contentBudget,
 //!     stopReason, partial, searched, excluded, patterns, note?}` document;
@@ -49,22 +51,49 @@ use std::path::{Component, Path, PathBuf};
 use regex::Regex;
 use serde_json::{Value, json};
 
+use crate::contract::MODEL_TOOL_RESULT_BUDGET_BYTES;
+use crate::payload::{
+    MAX_SAFE_INTEGER, char_payload_bytes, document_wire_bytes, entry_wire_bytes,
+    model_payload_bytes, utf8_byte_length,
+};
+
 /// `FILE_READ_DEFAULT_MAX_LINES` (`read.tool.ts:122`).
 pub const READ_DEFAULT_MAX_LINES: i64 = 200;
 /// `FILE_READ_MAX_LINES` (`read.tool.ts:123`).
 pub const READ_MAX_LINES: i64 = 5_000;
-/// `FILE_READ_CONTENT_BUDGET` (`read.tool.ts:124`).
-pub const READ_CONTENT_BUDGET: usize = 64 * 1024;
+/// `FILE_READ_CONTENT_BUDGET` / `FILE_READ_WIRE_BUDGET` (`read.tool.ts:693-698`): the ONE
+/// number a `read` window may cost, in the harness's delivery currency
+/// ([`model_payload_bytes`]).
+///
+/// It USED to be 64 KiB of raw content bytes, and `src/contract.rs` recorded the consequence:
+/// a read that exactly filled its own budget arrived at 64 KiB of TEXT inside a JSON document,
+/// which is comfortably above the 32 KiB per-result cap, so `bound_with_reason` answered it
+/// with a refusal - the tool had filled a budget the delivery could not carry. TS closed the
+/// same interaction by setting `FILE_READ_WIRE_BUDGET = MODEL_TOOL_RESULT_BUDGET_BYTES` and
+/// charging it with `contentWireBytes`; this constant is that constant, and the page loops
+/// below are that charge.
+///
+/// THE GUARANTEE these three budgets now hold together (and the tests below prove it):
+/// `result_overhead(...) + every charge <= BUDGET`, measured on the document THIS tool will
+/// serialize, so a tool that fills its own page survives [`crate::tools::result`] byte for byte
+/// instead of being JSON-refused by a cap it believed it had filled exactly.
+pub const READ_CONTENT_BUDGET: usize = MODEL_TOOL_RESULT_BUDGET_BYTES;
 /// `FILE_READ_MAX_TARGETS` (`read.tool.ts:127`).
 pub const READ_MAX_TARGETS: usize = 100;
 /// `FILE_LIST_DEFAULT_LIMIT` / `FILE_LIST_MAX_LIMIT` (`fileList.tool.ts`).
 pub const LIST_DEFAULT_LIMIT: usize = 200;
 /// The hard page ceiling for `fileList` (`fileList.tool.ts`).
 pub const LIST_MAX_LIMIT: usize = 1_000;
-/// `FILE_LIST_CONTENT_BUDGET` (`fileList.tool.ts:109`).
-pub const LIST_CONTENT_BUDGET: usize = 64 * 1024;
-/// `FILE_GLOB_CONTENT_BUDGET` (`glob.tool.ts:124`) and the grep budget (`grep.tool.ts:186`).
-pub const SEARCH_CONTENT_BUDGET: usize = 64 * 1024;
+/// `FILE_LIST_CONTENT_BUDGET` (`fileList.tool.ts:109`) - 32 KiB of the harness's delivery
+/// currency, per the note on [`READ_CONTENT_BUDGET`]. Charges entries at
+/// [`entry_wire_bytes`] against [`file_list_allowance`].
+pub const LIST_CONTENT_BUDGET: usize = MODEL_TOOL_RESULT_BUDGET_BYTES;
+/// `FILE_GLOB_CONTENT_BUDGET` (`glob.tool.ts:239`) and `FILE_GREP_CONTENT_BUDGET`
+/// (`grep.tool.ts:312`), both of which ARE `MODEL_TOOL_RESULT_BUDGET_BYTES` in the reference.
+/// Both tools charge per-entry wire bytes ([`entry_wire_bytes`]) against a page allowance that
+/// has already paid for the result's own scaffolding ([`glob_page_allowance`],
+/// [`grep_page_allowance`]).
+pub const SEARCH_CONTENT_BUDGET: usize = MODEL_TOOL_RESULT_BUDGET_BYTES;
 /// `FILE_GLOB_DEFAULT_LIMIT` / the clamped maximum (`glob.ts`).
 pub const SEARCH_DEFAULT_MAX_RESULTS: i64 = 100;
 /// The hard result cap `glob`/`grep` clamp `maxResults` to (`glob.ts`).
@@ -418,7 +447,32 @@ pub(crate) fn read(arguments: &Value, cwd: &Path) -> Result<Value, String> {
         }
     }
 
-    let mut remaining_budget = READ_CONTENT_BUDGET;
+    // THE PAGE ALLOWANCE, measured before a single window is cut: the cap minus the serialized
+    // cost of everything the document carries BESIDES the window texts. TS charges `read` the
+    // same way (`read.tool.ts`'s ENTRY_SHELL/RESULT_SHELL reserve, and the `noteReserve` that
+    // keeps `wireBytes <= contentBudget` true by construction); the figure here is measured on
+    // a skeleton of the real document rather than estimated, which is what makes the guarantee
+    // in [`READ_CONTENT_BUDGET`]'s note a property rather than a hope.
+    let overhead = read_result_overhead(
+        &planned
+            .iter()
+            .map(|entry| {
+                let target = entry
+                    .target
+                    .as_ref()
+                    .expect("a planned entry names its target");
+                let missing = entry.missing.then(|| {
+                    format!(
+                        "read could not find \"{}\": no such file or directory (ENOENT).",
+                        target.requested
+                    )
+                });
+
+                (display_path(&target.path), missing)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let mut remaining_budget = READ_CONTENT_BUDGET.saturating_sub(overhead);
     let mut files: Vec<Value> = Vec::with_capacity(planned.len());
 
     for (index, entry) in planned.iter().enumerate() {
@@ -451,7 +505,8 @@ pub(crate) fn read(arguments: &Value, cwd: &Path) -> Result<Value, String> {
 
         // Fair share of what is left: one file may use the whole budget, two split it,
         // and a file that returns fewer bytes leaves the remainder to the rest
-        // (`read.tool.ts` PHASE 2).
+        // (`read.tool.ts` PHASE 2). "What is left" is the ALLOWANCE above, and it is spent in
+        // payload bytes, so a quote-heavy window costs what the provider bills for it.
         let remaining_readable = planned[index..]
             .iter()
             .filter(|entry| !entry.missing)
@@ -467,7 +522,11 @@ pub(crate) fn read(arguments: &Value, cwd: &Path) -> Result<Value, String> {
             allowance,
         );
 
-        remaining_budget = remaining_budget.saturating_sub(window.bytes);
+        // The remainder is reduced by what the window COST (payload bytes), while the entry's
+        // own `bytes` field keeps reporting the UTF-8 length of its text - the question the
+        // caller reads that number for ("how much of the file did I get"). The two units are
+        // stated in `result-budget.ts`'s `spillNote` note and this tool follows the same split.
+        remaining_budget = remaining_budget.saturating_sub(window.wire_bytes);
 
         files.push(json!({
             "path": display_path(&target.path),
@@ -497,6 +556,61 @@ pub(crate) fn read(arguments: &Value, cwd: &Path) -> Result<Value, String> {
     }))
 }
 
+/// The serialized cost of everything a `read` result carries BESIDES the window texts: the
+/// reference's ENTRY_SHELL/RESULT_SHELL reserve (`read.tool.ts:1700-1740`), measured the way
+/// `grep.tool.ts:303` measures its own overhead - a skeleton with the REAL document's key names
+/// and key order, every counter at the widest value it can print, the caller's paths echoed at
+/// their real size, and the exact ENOENT sentence for each entry that will carry one.
+///
+/// Over-reserving a few hundred bytes is the deliberate direction: an allowance can end the page
+/// one line early, and that is a `truncated: true` with a resume point. An UNDER-reserve is what
+/// used to produce a refusal, because the document that leaves this function is bigger than the
+/// content that went into it.
+///
+/// `entries` is `(displayed path, the entry's ENOENT message when the path is missing)`.
+///
+/// PUBLIC for the same reason the reference exports `globPageAllowance`/`grepPageAllowance`
+/// (`glob.tool.ts:330`, `grep.tool.ts:312`): a pin that wants the EXACT window this call will
+/// return derives it from the overhead plus the budget instead of freezing one checkout's number -
+/// the path the caller passed is echoed in the document, so any frozen width here is only true at
+/// one path length.
+pub fn read_result_overhead(entries: &[(String, Option<String>)]) -> usize {
+    let shells: Vec<Value> = entries
+        .iter()
+        .map(|(path, missing_error)| {
+            let mut shell = json!({
+                // The path is echoed at its real size: it is the one field whose width the
+                // caller, not the tool, decides.
+                "path": path,
+                "content": "",
+                "startLine": MAX_SAFE_INTEGER,
+                "endLine": MAX_SAFE_INTEGER,
+                "truncated": true,
+                // Widest, though the real value is `null` or a small number.
+                "nextLine": MAX_SAFE_INTEGER,
+                "nextColumn": MAX_SAFE_INTEGER,
+                "bytes": MAX_SAFE_INTEGER,
+            });
+
+            if let Some(message) = missing_error {
+                // The failed entry's whole payload IS its error object, so it belongs in the
+                // scaffolding rather than in the content allowance. Key order matches the emitted
+                // entry, which appends `error` last.
+                shell["error"] = json!({ "code": "ENOENT", "message": message });
+            }
+
+            shell
+        })
+        .collect();
+
+    document_wire_bytes(&json!({
+        "files": shells,
+        "truncated": true,
+        "bytes": MAX_SAFE_INTEGER,
+        "contentBudget": READ_CONTENT_BUDGET,
+    }))
+}
+
 /// One returned window (`read.tool.ts:159` `FileReadEntry`, minus the path/error).
 struct Window {
     content: String,
@@ -505,7 +619,39 @@ struct Window {
     truncated: bool,
     next_line: Option<i64>,
     next_column: Option<usize>,
+    /// UTF-8 bytes of `content`: the number the entry REPORTS, and the unit the caller uses to
+    /// diff the window against the file.
     bytes: usize,
+    /// The same text's cost in the harness's delivery currency ([`model_payload_bytes`]): the
+    /// unit the byte budget is actually SPENT in. `bytes` and `wire_bytes` differ by every quote,
+    /// backslash, newline and control character the window carries, which is the whole reason the
+    /// budget is charged with the second one.
+    wire_bytes: usize,
+}
+
+/// The longest prefix of `slice` that costs at most `room` PAYLOAD bytes.
+///
+/// The reference's scanner appends one character at a time and stops at the first that does not
+/// fit, pricing each character with `escapedCharBytes` (`read.tool.ts:3212`); walking `chars()`
+/// and pricing each one the same way is that decision, and it can only stop on a character
+/// boundary, which is what keeps the `nextColumn` it reports a value `read` accepts back on the
+/// next call.
+fn wire_cut_prefix(slice: &str, room: usize) -> usize {
+    let mut used = 0_usize;
+    let mut offset = 0_usize;
+
+    for character in slice.chars() {
+        let cost = char_payload_bytes(character);
+
+        if used + cost > room {
+            break;
+        }
+
+        used += cost;
+        offset += character.len_utf8();
+    }
+
+    offset
 }
 
 /// Cuts one window out of a decoded file.
@@ -520,6 +666,10 @@ struct Window {
 ///   4. a character that would exceed the byte budget truncates at that exact character,
 ///      reporting `nextLine`/`nextColumn` for resuming inside a giant line;
 ///   5. only then is the character appended and counted.
+///
+/// The budget (`allowance`) is measured in PAYLOAD bytes, exactly as `FILE_READ_WIRE_BUDGET` is
+/// in the reference; rules 3 and 4's OFFSETS stay byte-based, because `startColumn`/`nextColumn`
+/// are positions in the file and the two currencies only disagree about cost.
 fn window_of(
     text: &str,
     start_line: i64,
@@ -536,6 +686,8 @@ fn window_of(
     let mut emitted = 0usize;
     let mut end_line = start_line - 1;
     let mut index = first_index;
+    // The running cost of `content` in the currency the allowance is declared in.
+    let mut charged = 0usize;
 
     // Rule 3: the byte offset into the first requested line, snapped to a boundary.
     let mut column = if first_index < lines.len() {
@@ -560,17 +712,19 @@ fn window_of(
             line
         };
 
-        let fits = content.len() + slice.len() <= allowance;
+        let fits = charged + model_payload_bytes(slice) <= allowance;
 
         if !fits {
             // Rule 4: cut this line at the byte budget and report how to resume, so a
-            // single giant line can still be paged through without omission.
-            let room = allowance.saturating_sub(content.len());
-            let cut = snap_to_boundary(slice, room.min(slice.len()));
+            // single giant line can still be paged through without omission. The room is
+            // measured in payload bytes and the cut can only land on a character boundary.
+            let room = allowance.saturating_sub(charged);
+            let cut = wire_cut_prefix(slice, room);
             let line_start = line.len() - slice.len();
 
             if cut > 0 {
                 content.push_str(&slice[..cut]);
+                charged += model_payload_bytes(&slice[..cut]);
             }
 
             let bytes = content.len();
@@ -583,10 +737,12 @@ fn window_of(
                 next_line: Some(line_number),
                 next_column: Some(line_start + cut),
                 bytes,
+                wire_bytes: charged,
             };
         }
 
         content.push_str(slice);
+        charged += model_payload_bytes(slice);
         end_line = line_number;
         emitted += 1;
         index += 1;
@@ -612,6 +768,7 @@ fn window_of(
         // returned; a complete one reports no resume point at all.
         next_column: next_line.map(|_| 0),
         bytes,
+        wire_bytes: charged,
     }
 }
 
@@ -1265,6 +1422,33 @@ fn page_number(arguments: &Value, name: &str, fallback: usize) -> Result<usize, 
     }
 }
 
+/// The serialized cost of everything a `fileList` page carries BESIDES the entry names: the
+/// document's own keys and framing, every counter priced at the widest value it can print
+/// (`files.tool.ts:1061` `filesResultOverhead`, applied to this tool's published shape).
+fn file_list_result_overhead() -> usize {
+    document_wire_bytes(&json!({
+        // The brackets stay; the entries are what the page allowance buys.
+        "entries": [],
+        "truncated": true,
+        "nextOffset": MAX_SAFE_INTEGER,
+        "offset": MAX_SAFE_INTEGER,
+        "limit": MAX_SAFE_INTEGER,
+        "bytes": MAX_SAFE_INTEGER,
+        "contentBudget": LIST_CONTENT_BUDGET,
+    }))
+}
+
+/// The most entry cost ONE `fileList` page may charge, in the harness's delivery currency: the
+/// cap minus the result's own scaffolding, so the guarantee
+/// `model_payload_bytes(JSON.stringify(result)) <= LIST_CONTENT_BUDGET` holds for the WHOLE
+/// document rather than only for the names in it (`files.tool.ts:1067` `filesListAllowance`).
+/// Exported so a test or a document quotes the number the implementation enforces instead of
+/// re-deriving it.
+#[must_use]
+pub fn file_list_allowance() -> usize {
+    LIST_CONTENT_BUDGET.saturating_sub(file_list_result_overhead())
+}
+
 /// `fileList`: one page of the flat, prefixed, sorted listing of one or more directories
 /// (`fileList.tool.ts:132-148` and the ORDERING notes).
 pub(crate) fn file_list(arguments: &Value, cwd: &Path) -> Result<Value, String> {
@@ -1407,24 +1591,33 @@ pub(crate) fn file_list(arguments: &Value, cwd: &Path) -> Result<Value, String> 
     // and the sequence never depends on the page size (`paginateEntries`).
     let total = entries.len();
     let mut page: Vec<String> = Vec::new();
+    // The budget is spent in the harness's delivery currency, per entry, and the allowance has
+    // already paid for the document's own keys (`files.tool.ts:1067` `filesListAllowance`,
+    // applied to this tool's shape). `bytes` therefore reports CHARGED bytes, not the entries'
+    // UTF-8 length: the two answers different questions and only one of them is a budget.
+    let allowance = file_list_allowance();
     let mut bytes = 0usize;
 
     for entry in entries.into_iter().skip(offset).take(limit) {
-        let size = entry.len();
+        let size = entry_wire_bytes(&json!(&entry));
 
-        // A single entry bigger than the whole budget can never be returned at ANY
+        // A single entry bigger than the whole allowance can never be returned at ANY
         // offset: stopping before it would report `truncated: true` with a `nextOffset`
-        // that never advances, an infinite loop the caller cannot escape.
-        if size > LIST_CONTENT_BUDGET {
+        // that never advances, an infinite loop the caller cannot escape. Tested BEFORE the
+        // cumulative test below, because at the start of a page `bytes` is 0 and the two
+        // conditions coincide - the cumulative reading would call it a budget stop and promise
+        // a resume that leads back to the same entry (`files.tool.ts:1459-1470`).
+        if size > allowance {
             return Err(format!(
-                "fileList entry at offset {} is {size} UTF-8 bytes, larger than the {LIST_CONTENT_BUDGET}-byte page budget, so it can never be returned. List a deeper directory so the entry prefix is shorter, or shorten the entry's name.",
-                offset + page.len()
+                "fileList entry at offset {} costs {size} payload bytes, more than the                  {allowance}-byte entry allowance (the {LIST_CONTENT_BUDGET}-byte delivery budget                  minus {} bytes of result scaffolding), so it can never be returned. List a deeper                  directory so the entry prefix is shorter, or shorten the entry's name.",
+                offset + page.len(),
+                file_list_result_overhead(),
             ));
         }
 
         // Stop BEFORE the entry that would cross the cap: an entry is never split, and
         // `nextOffset` below resumes at exactly this entry.
-        if bytes + size > LIST_CONTENT_BUDGET {
+        if bytes + size > allowance {
             break;
         }
 
@@ -1767,6 +1960,52 @@ pub(crate) fn matches_patterns(compiled: &[CompiledPattern], relative: &str) -> 
 // glob
 // ---------------------------------------------------------------------------
 
+/// The serialized cost of everything a `glob` result carries BESIDES `files`: key names and
+/// order taken from the real document (`"files": []` keeps the array's brackets, so appending an
+/// entry costs exactly what [`entry_wire_bytes`] charges), every counter priced at the widest
+/// value it can print, the caller's `patterns` echoed at their real size, and `note` priced at
+/// the longest sentence this call can emit (`glob.tool.ts:190-224` `globResultOverhead`).
+fn glob_result_overhead(patterns: &[String]) -> usize {
+    // The worst case of [`build_note`]: every condition true with every number at its widest,
+    // including the byte-budget clause (F8), whose longest spelling is a widest allowance.
+    let worst_note = usize::try_from(MAX_SAFE_INTEGER).unwrap_or(usize::MAX);
+    let note =
+        build_note(worst_note, worst_note, worst_note, true, true, worst_note).unwrap_or_default();
+
+    document_wire_bytes(&json!({
+        "files": [],
+        "truncated": true,
+        "offset": MAX_SAFE_INTEGER,
+        "limit": MAX_SAFE_INTEGER,
+        "nextOffset": MAX_SAFE_INTEGER,
+        "bytes": MAX_SAFE_INTEGER,
+        "contentBudget": SEARCH_CONTENT_BUDGET,
+        // The longer of the two verdicts this tool emits.
+        "stopReason": "contentBudget",
+        "partial": true,
+        "searched": { "inScope": MAX_SAFE_INTEGER, "roots": MAX_SAFE_INTEGER },
+        "excluded": {
+            "ignoredFiles": MAX_SAFE_INTEGER,
+            "prunedDirectories": MAX_SAFE_INTEGER,
+            "skippedDirectories": MAX_SAFE_INTEGER,
+            "unreadableDirectories": MAX_SAFE_INTEGER,
+            "symlinks": MAX_SAFE_INTEGER,
+            "ignoreFilesParsed": MAX_SAFE_INTEGER,
+            "ignoreRulesTruncated": true,
+        },
+        "patterns": patterns,
+        "note": note,
+    }))
+}
+
+/// The most entry cost ONE `glob` page may charge, in the harness's delivery currency
+/// (`glob.tool.ts:224` `globPageAllowance`). Exported so a test or a document quotes the number
+/// the implementation enforces.
+#[must_use]
+pub fn glob_page_allowance(patterns: &[String]) -> usize {
+    SEARCH_CONTENT_BUDGET.saturating_sub(glob_result_overhead(patterns))
+}
+
 /// `glob`: every file under the requested roots whose root-relative path matches the
 /// pattern set, paged by `offset`/`maxResults` (`glob.tool.ts:155` `FileGlobResult`).
 pub(crate) fn glob(arguments: &Value, cwd: &Path) -> Result<Value, String> {
@@ -1795,6 +2034,37 @@ pub(crate) fn glob(arguments: &Value, cwd: &Path) -> Result<Value, String> {
         super::result::bounded_integer(arguments, "offset", 0, 0, i64::MAX).unwrap_or(0),
     )
     .unwrap_or(0);
+
+    // The fixed half of the cost, priced BEFORE the walk (`glob.tool.ts:377-387`): the patterns the
+    // result echoes decide the allowance, so nothing here depends on what the filesystem holds, and a
+    // call the patterns already doom does not pay for a walk. `effective` is the reference's
+    // `set.effective`: the list the overhead prices, the allowance is derived from, AND the document
+    // echoes, so the three cannot drift (`compile_patterns` keeps `source` verbatim, which is what
+    // makes it the caller's own list again).
+    let effective: Vec<String> = compiled
+        .iter()
+        .map(|pattern| pattern.source.clone())
+        .collect();
+
+    // `overhead` is re-measured beside the exported allowance rather than returned by it: the refusal
+    // sentence quotes BOTH numbers, and keeping the allowance's public signature identical to
+    // `globPageAllowance`'s is worth one extra skeleton per call.
+    let overhead = glob_result_overhead(&effective);
+    let allowance = glob_page_allowance(&effective);
+
+    // GUARD: a request whose FIXED half already fills the cap gets a named refusal rather than a
+    // page that can never advance. A few hundred long patterns leave no room for one path, and an
+    // empty `files` beside `nextOffset: 0` reads as "no matches" - the wrong answer - where this
+    // sentence tells the caller which argument to shrink.
+    if allowance == 0 {
+        return Err(format!(
+            "glob cannot answer this call: its own result scaffolding - {} compiled pattern(s), \
+             {} bytes of pattern text the result echoes - fills the whole {SEARCH_CONTENT_BUDGET}-\
+             byte delivery budget, leaving no room for a path. Pass fewer or shorter \"patterns\".",
+            effective.len(),
+            utf8_byte_length(&json!(&effective).to_string()),
+        ));
+    }
 
     let mut unreadable = 0usize;
     let mut symlinks = 0usize;
@@ -1856,27 +2126,61 @@ pub(crate) fn glob(arguments: &Value, cwd: &Path) -> Result<Value, String> {
     let truncated = page.len() > limit;
     let returned: Vec<String> = page.into_iter().take(limit).collect();
 
-    // The byte budget is a second, independent stop: an over-budget page keeps the
-    // entries that fit and reports the reason it stopped.
+    // The byte budget is a second, INDEPENDENT stop, charged in the harness's delivery currency: a
+    // kept name costs what it ADDS to the serialized document (`glob.tool.ts:404` `entryWireBytes`),
+    // and the allowance above has already paid for everything else the document carries
+    // (`glob.tool.ts:224` `globPageAllowance`), because the cap covers the whole result, not just the
+    // names in it.
     let mut kept: Vec<String> = Vec::with_capacity(returned.len());
     let mut charged = 0usize;
     let mut stopped_on_budget = false;
 
     for entry in returned {
-        if charged + entry.len() > SEARCH_CONTENT_BUDGET && !kept.is_empty() {
+        let size = entry_wire_bytes(&json!(&entry));
+
+        // GUARD, tested BEFORE the cumulative one (`glob.tool.ts:421-434`): an entry costing more
+        // than the WHOLE allowance can never come back at ANY offset, so stopping before it would
+        // promise a resume (`truncated: true`, `nextOffset === offset`) and meet the same entry
+        // again - an answer that repeats itself. A real path is under `PATH_MAX`, so this is nearly
+        // unreachable and the cumulative test below is the one that fires; it is kept because an
+        // unpriced oversized entry would be DELIVERED, and a document over the ceiling is refused
+        // whole by the result budget instead of paginated.
+        if size > allowance {
+            let shown: String = entry.chars().take(200).collect();
+
+            return Err(format!(
+                "glob entry \"{shown}\" costs {size} payload bytes, more than the {allowance}-byte \
+                 page allowance (the {SEARCH_CONTENT_BUDGET}-byte delivery budget minus {overhead} \
+                 bytes of result scaffolding), so it can never be returned. Walk a deeper directory \
+                 so the prefix is shorter."
+            ));
+        }
+
+        // Stop BEFORE the entry that would cross the allowance: a name is never split, and
+        // `nextOffset` below resumes at exactly this entry. With the guard above, `charged` is 0
+        // only while `kept` is empty, so a stop here always leaves at least one delivered entry
+        // behind it - the escape hatch that used to force one through (`&& !kept.is_empty()`) is
+        // what produced an over-budget page.
+        if charged + size > allowance {
             stopped_on_budget = true;
             break;
         }
 
-        charged += entry.len();
+        charged += size;
         kept.push(entry);
     }
 
-    let budget_truncated = stopped_on_budget || charged > SEARCH_CONTENT_BUDGET;
     let consumed = offset + kept.len();
-    let truncated = truncated || budget_truncated;
+    let truncated = truncated || stopped_on_budget;
 
-    let note = build_note(in_scope, kept.len(), unreadable, truncated);
+    let note = build_note(
+        in_scope,
+        kept.len(),
+        unreadable,
+        truncated,
+        stopped_on_budget,
+        allowance,
+    );
 
     let mut result = json!({
         "files": kept,
@@ -1886,11 +2190,14 @@ pub(crate) fn glob(arguments: &Value, cwd: &Path) -> Result<Value, String> {
         "nextOffset": if truncated { json!(consumed) } else { Value::Null },
         "bytes": charged,
         "contentBudget": SEARCH_CONTENT_BUDGET,
-        "stopReason": if truncated { "resultCap" } else { "complete" },
+        // The published union names which bound closed the window, so a page the BYTE budget
+        // stopped says so instead of blaming the result cap (`glob.tool.ts` `stopReason`:
+        // "resultCap" | "contentBudget" | "searchBudget" | "complete").
+        "stopReason": if stopped_on_budget { "contentBudget" } else if truncated { "resultCap" } else { "complete" },
         "partial": unreadable > 0,
         "searched": { "inScope": in_scope, "roots": walked_roots },
         "excluded": excluded_value(unreadable, symlinks),
-        "patterns": compiled.iter().map(|pattern| pattern.source.clone()).collect::<Vec<_>>(),
+        "patterns": effective,
     });
 
     // `note` rides ONLY when something was withheld for a reason the caller can act on
@@ -1904,15 +2211,34 @@ pub(crate) fn glob(arguments: &Value, cwd: &Path) -> Result<Value, String> {
 
 /// The sentence an incomplete listing cannot produce on its own (`glob.tool.ts:196`
 /// `buildNote`, condensed to the clauses this port can honestly state).
+///
+/// `budget_stopped`/`allowance` carry the byte budget's own explanation: since F8 the page can
+/// close on BYTES rather than on the entry cap, and `stopReason: "contentBudget"` is a word the
+/// caller cannot act on without knowing which budget closed the page and what number to resume
+/// against.
 fn build_note(
     in_scope: usize,
     returned: usize,
     unreadable: usize,
     truncated: bool,
+    budget_stopped: bool,
+    allowance: usize,
 ) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
 
-    if truncated {
+    // First, because it is the clause that explains `stopReason: "contentBudget"`
+    // (`glob.tool.ts:323-326`).
+    if budget_stopped {
+        parts.push(format!(
+            "the page stopped at its {allowance}-byte path-text allowance (the \
+             {SEARCH_CONTENT_BUDGET}-byte delivery budget minus the result's own JSON scaffolding), \
+             not at the entry cap; resume with `offset`."
+        ));
+    }
+
+    // The generic "in scope vs returned" clause would say the same thing less precisely, so it is
+    // kept only for pages the ENTRY CAP closed; both clauses together would repeat the advice.
+    if truncated && !budget_stopped {
         parts.push(format!(
             "{in_scope} files were in scope and only {returned} were returned; page with `offset`."
         ));
@@ -1932,6 +2258,60 @@ fn build_note(
 // ---------------------------------------------------------------------------
 // grep
 // ---------------------------------------------------------------------------
+
+/// The serialized cost of everything a `grep` result carries BESIDES `matches`
+/// (`grep.tool.ts:283-300` `grepResultOverhead`, priced on THIS tool's published shape): the
+/// real key names and order, every counter at the widest value it can print, and the longest of
+/// the verdicts this call can emit. It quotes no path and no pattern, which is what keeps the
+/// caller's roots and pattern out of the overhead - and what makes the allowance independent of
+/// the arguments.
+fn grep_result_overhead() -> usize {
+    document_wire_bytes(&json!({
+        // The longest of the three mode names.
+        "output": "content",
+        // The array's brackets stay, so an entry costs exactly [`entry_wire_bytes`].
+        "matches": [],
+        "truncated": true,
+        "offset": MAX_SAFE_INTEGER,
+        "limit": MAX_SAFE_INTEGER,
+        "nextOffset": MAX_SAFE_INTEGER,
+        "bytes": MAX_SAFE_INTEGER,
+        "contentBudget": SEARCH_CONTENT_BUDGET,
+        "partial": true,
+        // The longest of the verdicts this tool emits.
+        "stopReason": "contentBudget",
+        "searched": {
+            "inScope": MAX_SAFE_INTEGER,
+            "scanned": MAX_SAFE_INTEGER,
+            "roots": MAX_SAFE_INTEGER,
+        },
+        "skipped": {
+            "tooLarge": MAX_SAFE_INTEGER,
+            "binary": MAX_SAFE_INTEGER,
+            "unreadable": MAX_SAFE_INTEGER,
+        },
+        "excluded": {
+            "ignoredFiles": MAX_SAFE_INTEGER,
+            "prunedDirectories": MAX_SAFE_INTEGER,
+            "skippedDirectories": MAX_SAFE_INTEGER,
+            "unreadableDirectories": MAX_SAFE_INTEGER,
+            "symlinks": MAX_SAFE_INTEGER,
+            "ignoreFilesParsed": MAX_SAFE_INTEGER,
+            "ignoreRulesTruncated": true,
+        },
+    }))
+}
+
+/// The most match cost ONE `grep` page may charge, in the harness's delivery currency
+/// (`grep.tool.ts:302` `grepPageAllowance`): the delivery cap minus the result's own
+/// scaffolding, so `model_payload_bytes(JSON.stringify(result)) <= SEARCH_CONTENT_BUDGET` holds
+/// for the WHOLE document and a grep that fills its own page survives
+/// [`crate::tools::result::bound_tool_result`] byte for byte. Exported for the same reason TS
+/// exports it: a test or a document should quote the enforced number, not re-derive it.
+#[must_use]
+pub fn grep_page_allowance() -> usize {
+    SEARCH_CONTENT_BUDGET.saturating_sub(grep_result_overhead())
+}
 
 /// `grep`: one pattern over the files a glob selects, in `content`/`files`/`count` mode
 /// (`grep.tool.ts:273` `FileGrepResult`).
@@ -2052,11 +2432,61 @@ pub(crate) fn grep(arguments: &Value, cwd: &Path) -> Result<Value, String> {
         }
     }
 
+    // `total` is every unit the walk produced, so `truncated` below is PROVEN by a unit that
+    // exists beyond the window rather than inferred from the requested limit.
     let total = units.len();
-    let truncated = offset + limit < total;
-    let page: Vec<Value> = units.into_iter().skip(offset).take(limit).collect();
-    let bytes: usize = page.iter().map(|entry| entry.to_string().len()).sum();
+    // The page is charged entry by entry in the harness's delivery currency and stopped by the
+    // ALLOWANCE, not by the raw cap: one match object costs its `path`, its `line`, its `text`
+    // and any `before`/`after` context as the SERIALIZED document sees them, plus the comma
+    // between entries (`grep.tool.ts:235` `entryWireBytes`, and `grep.tool.ts:302`
+    // `grepPageAllowance` for everything that is not `matches`). A page that only counted the
+    // snippet text used to report itself inside its budget and then be refused on the wire.
+    let allowance = grep_page_allowance();
+    let mut page: Vec<Value> = Vec::new();
+    let mut bytes = 0usize;
+    let mut stopped_on_budget = false;
+
+    for unit in units.into_iter().skip(offset).take(limit) {
+        let size = entry_wire_bytes(&unit);
+
+        if bytes + size > allowance {
+            // GUARD against a cursor that can never advance (`grep.tool.ts:915-933`). A unit bigger
+            // than the WHOLE allowance - one `context: 10` match on lines heavy with control
+            // characters escapes past it - is refused by every page of the sequence, so returning an
+            // empty page with `nextOffset === offset` would trap a caller paging it. This is the one
+            // unit built and then withheld, and it is a refusal with the remedy named in it, not a
+            // `truncated` page: the caller has to shrink the arguments, not move the cursor.
+            if page.is_empty() {
+                // `'line' in unit` in the reference: a content hit names its line, a files/count
+                // entry only names the file (`grep.tool.ts:923-925`).
+                let place = match unit.get("line") {
+                    Some(line) => format!(
+                        "\"{}\" at line {}",
+                        unit["path"].as_str().unwrap_or_default(),
+                        line
+                    ),
+                    None => format!("\"{}\"", unit["path"].as_str().unwrap_or_default()),
+                };
+
+                return Err(format!(
+                    "grep cannot return {place}: it costs {size} payload bytes, more than the \
+                     {allowance}-byte page allowance (the {SEARCH_CONTENT_BUDGET}-byte delivery \
+                     budget minus {} bytes of result scaffolding). Ask for fewer \"context\" lines, \
+                     \"output\": \"count\"/\"files\", or read the file directly.",
+                    grep_result_overhead()
+                ));
+            }
+
+            stopped_on_budget = true;
+            break;
+        }
+
+        bytes += size;
+        page.push(unit);
+    }
+
     let consumed = offset + page.len();
+    let truncated = consumed < total;
 
     Ok(json!({
         "output": output,
@@ -2068,7 +2498,9 @@ pub(crate) fn grep(arguments: &Value, cwd: &Path) -> Result<Value, String> {
         "bytes": bytes,
         "contentBudget": SEARCH_CONTENT_BUDGET,
         "partial": partial,
-        "stopReason": if truncated { "resultCap" } else { "complete" },
+        // The published union names which bound closed the window: a page the BYTE budget
+        // stopped answers "contentBudget", not "resultCap" (`grep.tool.ts` `FileGrepStopReason`).
+        "stopReason": if stopped_on_budget { "contentBudget" } else if truncated { "resultCap" } else { "complete" },
         "searched": { "inScope": in_scope, "scanned": scanned, "roots": walked_roots },
         "skipped": {
             "tooLarge": skipped_too_large,

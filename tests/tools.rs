@@ -86,6 +86,7 @@ fn registry() -> std::sync::Arc<ToolRegistry> {
     ToolRegistry::with_options(Options {
         web_keys: Default::default(),
         fetch_enabled: true,
+        ..Options::default()
     })
 }
 
@@ -501,8 +502,11 @@ fn a_keyless_host_reports_search_unconfigured_and_never_leaks_a_credential() {
             // The published provider endpoints; only the key's effect on availability is under
             // test here.
             endpoint_base: None,
+            // The download SSRF/DNS seams override a production lookup; a catalogue test has none.
+            ..typecrate_harness::tools::web::WebKeys::default()
         },
         fetch_enabled: false,
+        ..Options::default()
     });
     let configured_search = configured
         .summaries()
@@ -665,7 +669,7 @@ async fn write_then_read_then_edit_round_trip_is_the_published_shape() {
     assert_eq!(document["files"][0]["endLine"], json!(2));
     assert_eq!(document["files"][0]["truncated"], json!(false));
     assert_eq!(document["files"][0]["nextLine"], Value::Null);
-    assert_eq!(document["contentBudget"], json!(65_536));
+    assert_eq!(document["contentBudget"], json!(32_768));
     assert_eq!(document["bytes"], json!(8));
 
     let edited = call(
@@ -927,7 +931,7 @@ async fn file_list_pages_prefixes_and_marks_directories() {
         vec!["src/a.ts", "src/b.ts", "src/nested/", "src/", "top.md"]
     );
     assert_eq!(document["limit"], json!(200));
-    assert_eq!(document["contentBudget"], json!(65_536));
+    assert_eq!(document["contentBudget"], json!(32_768));
 
     let paged = call(
         &runtime,
@@ -1290,11 +1294,35 @@ async fn paths_resolve_against_the_cwd_and_reject_nul() {
         nul.error.as_deref(),
         Some("Tool \"read\" failed: read paths must not contain NUL characters.")
     );
-    assert_eq!(nul.duration_ms, 0, "a refused call never executed");
+    // `duration_ms` is deliberately NOT pinned here. The NUL refusal happens INSIDE the `read`
+    // body, so the call goes through `failed_outcome`, whose duration is the MEASURED span of the
+    // attempt (`src/tools/mod.rs:1066-1071`) — 0 on an idle machine and several milliseconds on a
+    // loaded one. Only a STRUCTURAL refusal, which never reaches a tool body, reports a hard zero
+    // (`src/tools/mod.rs:1076-1087`; `an_unknown_tool_and_missing_required_arguments_are_rejections`
+    // below pins that one). What
+    // "the call never executed" MEANS is filesystem-visible, so that is what gets pinned: the
+    // refusal happened before any access, and the fixture still holds exactly the one file this
+    // test created — nothing opened, created, or touched.
+    let entries: Vec<String> = std::fs::read_dir(&fixture.directory)
+        .expect("the fixture directory is listable")
+        .map(|entry| {
+            entry
+                .expect("a fixture entry is readable")
+                .file_name()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+
+    assert_eq!(
+        entries,
+        vec!["abs.txt".to_owned()],
+        "the refused read touched nothing"
+    );
 }
 
 #[tokio::test]
-async fn an_oversized_json_read_result_is_refused_rather_than_truncated() {
+async fn a_read_result_at_the_wire_ceiling_is_delivered_rather_than_refused() {
     let runtime = registry();
     let fixture = Fixture::new("result-budget");
 
@@ -1302,17 +1330,25 @@ async fn an_oversized_json_read_result_is_refused_rather_than_truncated() {
     // this pin with it instead of leaving a stale number behind.
     let budget = typecrate_harness::contract::MODEL_TOOL_RESULT_BUDGET_BYTES;
 
-    // One line per 2 KiB, 200 lines: `read` caps its OWN content at 64 KiB and says so with
-    // `truncated`, so the document arrives ABOVE the model-facing budget (its exact byte count is
-    // derived from the document's own shape in the note below).
-    // The reference's file tools cap their content at the same 64 KiB
-    // (`engine/tools/files/files.tool.ts:408 FILES_CONTENT_BUDGET`), so the reference can produce
-    // the same oversize document, and its cutter answers that document with a REFUSAL: an
-    // over-budget result that PARSES as JSON is dropped whole (`rejected: { reason:
-    // 'oversized-json' }`, `truncated: false`) while only prose is cut into the head/tail envelope
-    // (`engine/core/result-budget.ts:655-724`). The "256 KiB" premise this pin used to carry came
-    // from this crate's wrong published budget, which made the case unreachable; at the real
-    // 32,768-byte budget the refusal is what the wire must carry.
+    // 200 lines, each 2,047 characters of text plus a newline (the `{:0<2047}` pad and the `\n`):
+    // 2,048 raw bytes per line, 2,049 PAYLOAD bytes, because a newline inside a JSON string can only
+    // travel as the two-byte `\n` escape. `maxLines: 5000` keeps the line guard out of it, so the
+    // window closes on BYTES. This is the shape that used to be REFUSED: `read` filled its content
+    // budget, the document it returns came out bigger than the budget because the budget was
+    // counted in raw bytes, and an over-budget result that parses as JSON is dropped whole
+    // (`rejected: { reason: 'oversized-json' }`) instead of being cut
+    // (`src/tools/result.rs`'s oversized-JSON branch).
+    //
+    // Both harnesses now spend the SAME currency at both ends, so the tool's ceiling IS the
+    // delivery ceiling: `READ_CONTENT_BUDGET` is `MODEL_TOOL_RESULT_BUDGET_BYTES`
+    // (`src/tools/files.rs:59-75`) and the window's allowance is that budget MINUS the serialized
+    // cost of the document around it (`read_result_overhead`, `src/tools/files.rs:554-601`, the
+    // reference's `FILE_READ_WIRE_BUDGET` / entry-shell reserve, `read.tool.ts:1697-1740`). What
+    // `read` decides to cut and what the cutter decides to keep are now the same measurement, so
+    // the page arrives WHOLE with its own `truncated: true` — and the refusal this test used to pin
+    // stays pinned one level down, where it is still the contract, at
+    // `src/tools/result.rs`'s `an_oversized_json_document_is_refused_instead_of_two_broken_halves`
+    // and `a_json_document_at_exactly_the_payload_budget_is_delivered_whole`.
     let text = (0..200)
         .map(|line| format!("{:0<2047}\n", format!("line {line}")))
         .collect::<String>();
@@ -1327,97 +1363,131 @@ async fn an_oversized_json_read_result_is_refused_rather_than_truncated() {
     )
     .await;
 
-    // An oversized JSON result is a FAILED call, not a delivered one: the reference classifies the
-    // same outcome `failed` when the bounded result carries `rejected`
-    // (`engine/harness.ts:11181 outcome = delivered.rejected ? 'failed' : 'completed'`), while the
-    // text it records is the refusal sentence itself (`engine/harness.ts:10842-10845`).
-    // THE COUNT IS DERIVED, NOT FROZEN.
-    //
-    // `original_bytes` in the refusal is the UTF-8 length of the read tool's OWN JSON document
-    // (`src/tools/result.rs:996-1001` `serialize_value` feeds `:544` `original_bytes`, and
-    // `:566-589` refuses it), and that document embeds this fixture's absolute path exactly once,
-    // in platform-native spelling (`src/tools/files.rs:473` `"path": display_path(&target.path)`,
-    // spelled by `:208-212` and resolved by `:163-179`). The count is therefore a STRUCTURAL
-    // constant plus the JSON-escaped length of one path: stable across checkouts only once the path
-    // term is computed, which is why the frozen `65864` this pin used to carry was never
-    // machine-independent — it was simply this checkout's root length, and any other root (a CI
-    // checkout, a different drive letter, a deeper clone path) moved it.
-    //
-    // The structural half, i.e. everything the document serializes EXCEPT the path string:
-    //   * 65,536 = the content window `read` returns. `READ_CONTENT_BUDGET` is 64 KiB
-    //              (`src/tools/files.rs:57`) and the fixture's lines are exactly 2,048 bytes each,
-    //              so the allowance is spent on exactly 32 whole lines (32 x 2,048 = 65,536 with no
-    //              remainder) and `window_of` (`src/tools/files.rs:563-586`) returns them with
-    //              `truncated: true` on the next line's `fits` failure, cutting nothing mid-line;
-    //   +    32  = JSON escaping of the content: each of the 32 newlines serializes as the two-byte
-    //              `\n` escape, one extra byte per line;
-    //   +   176  = the rest of the compact document — the `files` array wrapper, the one
-    //              entry's key/quote/colon/brace bytes for `path`, `content`, `startLine`,
-    //              `endLine`, `truncated`, `nextLine`, `nextColumn` and `bytes`
-    //              (`src/tools/files.rs:472-481`), and the document-level `files`, `truncated`,
-    //              `bytes` and `contentBudget` keys (`:492-497`). Those keys come out in INSERTION
-    //              order, never sorted: `Cargo.toml:83-86` switches serde_json's `preserve_order`
-    //              on deliberately, so `:492-497` writes `files`, `truncated`, `bytes`,
-    //              `contentBudget` exactly as written and `:472-481` writes its eight keys in
-    //              theirs. Order moves no bytes here; it is just the spelling the 176 is counted
-    //              from, so do not re-derive it against a sorted map.
-    // Three preconditions hold this constant, and this test owns all of them. ONE read target: a
-    // second splits the 64 KiB allowance across targets (`src/tools/files.rs:421` seeds the budget,
-    // `:455-460` divides it by the count of readable ones), which halves BOTH windows and embeds a
-    // second path this formula never counts. `maxLines: 5000`, which must stay above the 32 lines
-    // the byte allowance closes — otherwise `window_of` stops on its line-count guard (`:550`)
-    // instead of the `!fits` byte cut (`:563-586`) and the content term is no longer 65,536. And
-    // the 64 KiB budget plus the fixture's 2,048-byte lines, which together keep `bytes` and
-    // `contentBudget` at 5 digits (65536) and `endLine`/`nextLine` at 2 (32, 33). Re-derive on any
-    // change to those.
-    const DOCUMENT_BYTES_WITHOUT_PATH: usize = 65_744;
-
-    // The path half: the very spelling the tool writes into the document (`cwd` joined with the
-    // target; `repo_root()` output is already absolute and free of `.`/`..`, so the crate's lexical
-    // `normalize_absolute` is the identity here) measured through the SAME escaping the product
-    // serializes with. `serialize_value` hands a TOP-LEVEL `Value::String` back raw
-    // (`src/tools/result.rs:813-818`), so it cannot show escaping on its own; one level of nesting
-    // does, and `serde_json::to_string` on a `String` is the identical compact serializer
-    // `Value::to_string()` reaches at `:817`. The `- 2` strips the wrapper's quote pair, leaving the
-    // exact byte count this string occupies inside the document — backslashes included, because
-    // JSON escapes every Windows separator and that is why the term is counted, not assumed equal to
-    // `displayed_path.len()`.
-    let displayed_path = fixture.directory.join("big.txt").display().to_string();
-    let escaped_path_bytes = serde_json::to_string(&displayed_path)
-        .expect("a path serializes as a JSON string")
-        .len()
-        - 2;
-    let expected_bytes = DOCUMENT_BYTES_WITHOUT_PATH + escaped_path_bytes;
-
-    // The sentence itself is pinned verbatim (`src/tools/result.rs:333-369` `refusal_message`,
-    // handle-free arm, plus the write-safety clause it always appends); only the two numbers are
-    // interpolated — the byte count from the derivation above, and the budget from the contract
-    // value already read at the top of this test.
-    let refusal = format!(
-        "Tool result too large to deliver: {expected_bytes} bytes against a {budget}-byte budget. \
-         The result was discarded, not truncated: no part of it reached this transcript. Re-run the \
-         tool call with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it. \
-         If this call could have written anything, that write may already be applied — re-read \
-         before retrying."
+    // THE RESULT IS DELIVERED, NOT REFUSED. The transcript text is the tool's own JSON document,
+    // so it parses; the refusal sentence this pin used to assert is plain text and would not.
+    assert!(
+        outcome.ok,
+        "a read page at the delivery ceiling arrives whole: {}",
+        outcome.error.unwrap_or_default()
     );
 
+    let document: Value =
+        serde_json::from_str(&outcome.content).expect("the delivered result is a JSON document");
+
+    // THE PAGE IS CLOSED BY BYTES, NOT BY LINES, AND ITS WIDTH IS DERIVED RATHER THAN FROZEN.
+    //
+    // 200 lines were requested with `maxLines: 5000`, so the line guard is far away and only the
+    // byte allowance can close this page. The allowance is the 32,768-byte budget MINUS the
+    // serialized cost of the document AROUND the window (`read_result_overhead`,
+    // `src/tools/files.rs`; the entry-shell/RESULT_SHELL reserve that stands behind the reference's
+    // `FILE_READ_WIRE_BUDGET`, `read.tool.ts:1697-1740`). A line costs 2,047 payload bytes of text -
+    // the fixture's pad is pure ASCII, so text costs one byte per character in either currency -
+    // plus 2 for its newline (`char_payload_bytes`, `src/payload.rs`): 2,049 per line. 15 lines fit
+    // and the 16th does not, and the room left over is spent INSIDE line 16, which is why
+    // `nextColumn` is a column rather than 0.
+    //
+    // The overhead is read from the crate instead of being written out as a literal: it echoes the
+    // caller's path, so any frozen window width here would only be true at one checkout's path
+    // length - the same reason the frozen `65864` this test used to carry was never
+    // machine-independent.
+    let displayed_path = fixture.directory.join("big.txt").display().to_string();
+    let overhead =
+        typecrate_harness::tools::files::read_result_overhead(&[(displayed_path.clone(), None)]);
+    let allowance = budget - overhead;
+    let full_lines = allowance / 2_049;
+    let partial = allowance - (full_lines * 2_049);
+
+    // The fixture's shape is what makes the numbers above mean anything: 15 lines fit and a 16th
+    // does not, while 200 lines wait behind it.
+    assert_eq!(full_lines, 15, "the allowance holds 15 whole lines");
     assert!(
-        !outcome.ok,
-        "an oversized JSON document is refused, not delivered"
+        partial > 0 && partial < 2_049,
+        "and {partial} bytes into the 16th, which is the mid-line cut this page must report"
+    );
+
+    let window = &document["files"][0];
+
+    assert_eq!(
+        window["path"],
+        json!(displayed_path),
+        "the entry echoes the caller's path in the spelling the overhead reserved"
+    );
+    assert_eq!(window["startLine"], json!(1), "the window starts at line 1");
+    assert_eq!(
+        window["endLine"],
+        json!(full_lines),
+        "and names the last WHOLE line it delivered: the partial line counts toward `bytes` but \
+         not toward a line the model can read, which is exactly what `nextLine`/`nextColumn` are \
+         for (`read.tool.ts:309-310` 'endLine is the last line represented' and `:322-326` for the \
+         0-based byte offset that resumes a cut line)"
     );
     assert_eq!(
-        outcome.error.as_deref(),
-        Some(refusal.as_str()),
-        "the refusal is the reference's sentence, byte for byte"
+        window["bytes"],
+        json!(full_lines * 2_048 + partial),
+        "the entry REPORTS the UTF-8 width of its text (15 x 2,048 + the partial line) while the \
+         budget spends the escaped width (15 x 2,049 + the same partial) - the two-unit split \
+         `result-budget.ts`'s `spillNote` states and `src/payload.rs` keeps honest"
     );
-    assert_eq!(outcome.content, refusal);
+    assert_eq!(
+        window["content"]
+            .as_str()
+            .expect("a content window")
+            .chars()
+            .count(),
+        full_lines * 2_048 + partial,
+        "and the text itself has exactly that length"
+    );
+    assert_eq!(
+        window["truncated"],
+        json!(true),
+        "the page says more remains"
+    );
+    assert_eq!(
+        window["nextLine"],
+        json!(full_lines + 1),
+        "and hands back the line to resume from"
+    );
+    assert_eq!(
+        window["nextColumn"],
+        json!(partial),
+        "at the byte offset inside that line where the allowance ran out"
+    );
+    assert_eq!(
+        document["contentBudget"],
+        json!(32_768),
+        "the budget the page publishes is the model-facing one, not a private 64 KiB"
+    );
+    assert_eq!(document["truncated"], json!(true));
+    assert_eq!(
+        document["bytes"],
+        json!(full_lines * 2_048 + partial),
+        "one entry, so the document sum is the window's own width"
+    );
+
+    // THE CURRENCY PIN. What reaches the model costs at most the budget IN THE UNIT THE BUDGET IS
+    // DEFINED IN - the escaped payload width `crate::payload::model_payload_bytes` measures, kept
+    // in sync with the reference's `modelPayloadBytes` by `src/payload.rs`'s vectors - and it is
+    // within ONE LINE of the ceiling, which is what "the tool sized the page, the cutter did not
+    // have to" looks like from outside. This is the assertion that failed when the gate counted
+    // payload bytes while `read` still spent raw ones: the page cost ~68.2 KB of payload against a
+    // 32,768-byte budget and was dropped whole, because `read` believed it had 64 KiB to fill.
+    let delivered_payload = result::model_payload_bytes(&outcome.content);
+
     assert!(
-        serde_json::from_str::<Value>(&outcome.content).is_err(),
-        "a refusal is plain text, so a client can tell it from a bounded document"
+        delivered_payload <= budget,
+        "the delivered page costs {delivered_payload} payload bytes against a {budget}-byte budget"
     );
     assert!(
-        result::utf8_byte_length(&outcome.content) <= budget,
-        "the refusal is itself inside the budget it enforces"
+        delivered_payload > budget - 2_049,
+        "the page filled the ceiling instead of leaving a line of it unused: {delivered_payload} \
+         payload bytes spent"
+    );
+    assert!(
+        result::utf8_byte_length(&outcome.content) < delivered_payload,
+        "the same document is {delivered_payload} payload bytes and only {} raw ones, because \
+         every newline in the window serializes as an escape - the gap that used to make the raw \
+         count useless as a delivery test",
+        result::utf8_byte_length(&outcome.content)
     );
 }
 
@@ -1479,7 +1549,11 @@ async fn shell_captures_exit_stdout_stderr_and_the_timeout_flags() {
         // `shell.tool.ts:196` — the reference sentence, not the older local one.
         Some("Tool \"shell\" failed: shell requires a non-empty command string.")
     );
-    assert_eq!(empty.duration_ms, 0);
+    // The pinned sentence IS the proof that nothing ran: `shell` rejects a blank command in its
+    // body before spawning `sh -c`, so this is a failed call (`src/tools/mod.rs:1066-1071`) rather
+    // than a structural rejection. Its `duration_ms` is therefore the measured span of the attempt,
+    // which a loaded machine can report as a few milliseconds; only a call that never reaches a
+    // tool body is contracted to report 0 (`src/tools/mod.rs:1076-1087`), so no duration pin here.
 }
 
 #[tokio::test]
@@ -2111,5 +2185,406 @@ fn the_attachment_kind_table_is_the_shared_one() {
     assert_eq!(
         typecrate_harness::tools::web::kind_for_mime("application/octet-stream"),
         AttachmentKind::File
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The delivery currency at the file tools' own ceilings (F8)
+// ---------------------------------------------------------------------------
+//
+// `read` above is the case that used to be REFUSED; these three are the same failure in the three
+// other budgeted tools. Each fixture is sized so the TOOL closes its page on its byte allowance
+// rather than on its entry cap (`maxResults`/`limit` are pushed to the published maximum so the
+// allowance is the only thing that can fire), and each then asserts both halves of the F8 property:
+//
+//   1. the tool stopped itself and said so - `truncated`, a `nextOffset` that advances, and where
+//      the row publishes it, the `stopReason` that names the budget that closed the page;
+//   2. the document that stopped there is inside the model-facing cap IN THE CAP'S OWN UNIT, so
+//      `crate::tools::result` never receives a result it would refuse. Before F8 the tools measured
+//      their content in raw bytes while the cutter charged escaped payload bytes, so a tool that
+//      believed it had filled its budget exactly arrived over the cap and a JSON document over the
+//      cap is dropped whole.
+//
+// The page size is DERIVED from the tool's own exported allowance in every test, because the
+// overhead inside that allowance echoes the caller's path and patterns: a frozen entry count here
+// would be true only at this checkout's path length.
+
+#[tokio::test]
+async fn a_glob_page_closed_by_its_byte_allowance_is_delivered_rather_than_refused() {
+    let runtime = registry();
+    let fixture = Fixture::new("glob-wire-ceiling");
+
+    // 400 names of IDENTICAL width, so the page's charge is the delivered count times one entry's
+    // cost - and the cost is the same `entry_wire_bytes` the tool charges with, not a guess at it.
+    for index in 0..400 {
+        fixture.write(&format!("src/{:0<90}.ts", index), "x");
+    }
+
+    let outcome = call(
+        &runtime,
+        "glob",
+        json!({ "patterns": ["**/*.ts"], "maxResults": 1000 }),
+        &fixture.directory,
+    )
+    .await;
+    assert!(
+        outcome.ok,
+        "a glob that fills its page is delivered, not refused: {}",
+        outcome.error.unwrap_or_default()
+    );
+
+    let budget = typecrate_harness::contract::MODEL_TOOL_RESULT_BUDGET_BYTES;
+    let patterns = vec!["**/*.ts".to_owned()];
+    let allowance = typecrate_harness::tools::files::glob_page_allowance(&patterns);
+    let entry_cost =
+        typecrate_harness::payload::entry_wire_bytes(&json!(format!("src/{:0<90}.ts", 0)));
+    let fits = allowance / entry_cost;
+
+    // The fixture's precondition: the allowance, not the cap, is what closes this page, and the
+    // walk still has names left over to withhold.
+    assert!(
+        fits < 400 && fits > 100,
+        "the allowance holds {fits} of the 400 names at {entry_cost} payload bytes each"
+    );
+
+    let document: Value =
+        serde_json::from_str(&outcome.content).expect("the delivered result is a JSON document");
+
+    assert_eq!(
+        document["files"]
+            .as_array()
+            .expect("an array of paths")
+            .len(),
+        fits,
+        "the page stops one name before the name that would cross the allowance"
+    );
+    assert_eq!(
+        document["bytes"],
+        json!(fits * entry_cost),
+        "`bytes` reports what the kept names charged in the delivery currency"
+    );
+    assert_eq!(document["truncated"], json!(true));
+    assert_eq!(
+        document["nextOffset"],
+        json!(fits),
+        "and the cursor advances, so a caller paging this sequence is not trapped"
+    );
+    assert_eq!(
+        document["limit"],
+        json!(1000),
+        "the cap that did NOT close the page"
+    );
+    assert_eq!(
+        document["stopReason"],
+        json!("contentBudget"),
+        "the row names the bound that closed it instead of blaming the entry cap"
+    );
+    assert_eq!(document["contentBudget"], json!(32_768));
+    assert!(
+        document["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("path-text allowance"),
+        "and `note` states the allowance by number: {}",
+        document["note"]
+    );
+
+    let delivered_payload = result::model_payload_bytes(&outcome.content);
+
+    assert!(
+        delivered_payload <= budget,
+        "a glob that fills its page is inside the cap it publishes: {delivered_payload} payload \
+         bytes against a {budget}-byte budget"
+    );
+}
+
+#[tokio::test]
+async fn a_grep_page_closed_by_its_byte_allowance_is_delivered_rather_than_refused() {
+    let runtime = registry();
+    let fixture = Fixture::new("grep-wire-ceiling");
+
+    // 500 matching lines of identical width: every entry is the same snippet under the same path,
+    // so the only variation in an entry's cost is how many digits its line number prints.
+    let line = format!("{:0<66}needle", 0);
+    let text = (0..500).map(|_| format!("{line}\n")).collect::<String>();
+
+    fixture.write("hits.txt", &text);
+
+    let outcome = call(
+        &runtime,
+        "grep",
+        json!({ "pattern": "needle", "paths": ["hits.txt"], "maxResults": 1000 }),
+        &fixture.directory,
+    )
+    .await;
+    assert!(
+        outcome.ok,
+        "a grep that fills its page is delivered, not refused: {}",
+        outcome.error.unwrap_or_default()
+    );
+
+    let budget = typecrate_harness::contract::MODEL_TOOL_RESULT_BUDGET_BYTES;
+    let allowance = typecrate_harness::tools::files::grep_page_allowance();
+    let document: Value =
+        serde_json::from_str(&outcome.content).expect("the delivered result is a JSON document");
+    let matches = document["matches"].as_array().expect("an array of hits");
+
+    // THE NUMBER THE TOOL PUBLISHES IS THE NUMBER THE CURRENCY CHARGES. `bytes` is no longer the
+    // sum of snippet text: it is what the page cost the budget, and this recomputes it from the
+    // entries the page actually delivered.
+    let charged: usize = matches
+        .iter()
+        .map(typecrate_harness::payload::entry_wire_bytes)
+        .sum();
+
+    assert_eq!(
+        document["bytes"],
+        json!(charged),
+        "the result's `bytes` is the delivery-currency charge for exactly these {} entries",
+        matches.len()
+    );
+    assert!(
+        matches.len() >= 100 && matches.len() < 500,
+        "the allowance closed the page after {} of the 500 matches",
+        matches.len()
+    );
+    assert!(
+        charged + typecrate_harness::payload::entry_wire_bytes(&matches[matches.len() - 1])
+            > allowance,
+        "and it stopped at {charged} of the {allowance}-byte allowance: one more of these entries \
+         would not have fitted"
+    );
+
+    // An entry's OWN `bytes` stays the UTF-8 size of its snippet, which is a different number from
+    // the page's charge and the unit the caller uses to judge a cut line (`grep.tool.ts:347-351`).
+    assert_eq!(matches[0]["bytes"], json!(line.len()));
+    assert_eq!(matches[0]["text"], json!(line));
+    assert_eq!(matches[0]["line"], json!(1));
+    assert_eq!(matches[0]["path"], json!("hits.txt"));
+
+    assert_eq!(document["truncated"], json!(true));
+    assert_eq!(document["nextOffset"], json!(matches.len()));
+    assert_eq!(
+        document["stopReason"],
+        json!("contentBudget"),
+        "a page the byte budget closed does not blame the result cap"
+    );
+    assert_eq!(document["contentBudget"], json!(32_768));
+
+    let delivered_payload = result::model_payload_bytes(&outcome.content);
+
+    assert!(
+        delivered_payload <= budget,
+        "a grep that fills its page is inside the cap it publishes: {delivered_payload} payload \
+         bytes against a {budget}-byte budget"
+    );
+    assert!(
+        delivered_payload > budget - 2_048,
+        "the page used the ceiling instead of leaving a match of slack: {delivered_payload} spent"
+    );
+}
+
+#[tokio::test]
+async fn a_file_list_page_closed_by_its_byte_allowance_is_delivered_rather_than_refused() {
+    let runtime = registry();
+    let fixture = Fixture::new("file-list-wire-ceiling");
+
+    // One flat directory, 400 entries of identical width, so the page's charge is the delivered
+    // count times one entry's cost.
+    for index in 0..400 {
+        fixture.write(&format!("src/{:0<90}.ts", index), "x");
+    }
+
+    let outcome = call(
+        &runtime,
+        "files",
+        json!({ "paths": ["src"], "limit": 1000 }),
+        &fixture.directory,
+    )
+    .await;
+    assert!(
+        outcome.ok,
+        "a listing that fills its page is delivered, not refused: {}",
+        outcome.error.unwrap_or_default()
+    );
+
+    let budget = typecrate_harness::contract::MODEL_TOOL_RESULT_BUDGET_BYTES;
+    let allowance = typecrate_harness::tools::files::file_list_allowance();
+    let entry_cost =
+        typecrate_harness::payload::entry_wire_bytes(&json!(format!("src/{:0<90}.ts", 0)));
+    let fits = allowance / entry_cost;
+
+    assert!(
+        fits < 400 && fits > 100,
+        "the allowance holds {fits} of the 400 entries at {entry_cost} payload bytes each"
+    );
+
+    let document: Value =
+        serde_json::from_str(&outcome.content).expect("the delivered result is a JSON document");
+
+    assert_eq!(
+        document["entries"]
+            .as_array()
+            .expect("an array of entry names")
+            .len(),
+        fits,
+        "the page stops one entry before the entry that would cross the allowance"
+    );
+    assert_eq!(
+        document["bytes"],
+        json!(fits * entry_cost),
+        "`bytes` is what the delivered names charged the page allowance"
+    );
+    assert_eq!(document["truncated"], json!(true));
+    assert_eq!(document["nextOffset"], json!(fits));
+    assert_eq!(document["limit"], json!(1000));
+    assert_eq!(document["contentBudget"], json!(32_768));
+
+    let delivered_payload = result::model_payload_bytes(&outcome.content);
+
+    assert!(
+        delivered_payload <= budget,
+        "a listing that fills its page is inside the cap it publishes: {delivered_payload} payload \
+         bytes against a {budget}-byte budget"
+    );
+}
+
+#[tokio::test]
+async fn a_grep_match_too_large_for_any_page_is_refused_with_the_remedy() {
+    let runtime = registry();
+    let fixture = Fixture::new("grep-unpageable");
+
+    // One control character is ONE byte in the file and SIX in the delivery currency (`\u0001`,
+    // `src/payload.rs`), so a page of them escapes past the allowance that the same number of bytes
+    // would fit - exactly the case the reference's cursor guard exists for (`grep.tool.ts:915-933`).
+    // `context: 10` then puts eleven of those snippets in the FIRST match, which is more than the
+    // whole page allowance: the unit cannot be returned at any offset.
+    let line = format!("{}a", "\u{1}".repeat(1_000));
+    let text = (0..20).map(|_| format!("{line}\n")).collect::<String>();
+
+    fixture.write("ctrl.txt", &text);
+
+    let budget = typecrate_harness::contract::MODEL_TOOL_RESULT_BUDGET_BYTES;
+    let allowance = typecrate_harness::tools::files::grep_page_allowance();
+
+    let outcome = call(
+        &runtime,
+        "grep",
+        json!({ "pattern": "a", "paths": ["ctrl.txt"], "context": 10, "maxResults": 1000 }),
+        &fixture.directory,
+    )
+    .await;
+
+    // THE CALL IS REFUSED, NOT PAGED. An empty page with `nextOffset: 0` would send a caller paging
+    // this sequence back to the same entry forever; the refusal names the three arguments that would
+    // make the unit small enough to return.
+    assert!(
+        !outcome.ok,
+        "an unpageable unit is a refusal, not an empty page: {}",
+        outcome.content
+    );
+
+    // The refused unit, rebuilt exactly as `collect_matches` builds it: the matched line's snippet,
+    // no `before` (line 1 has no neighbours), and ten lines of `after`. Its cost is the number the
+    // sentence quotes, so the sentence is DERIVED here rather than frozen - the same discipline the
+    // read refusal above follows.
+    let snippet = &line[..1_001.min(line.len())];
+    let refused_unit = json!({
+        "path": "ctrl.txt",
+        "line": 1,
+        "text": snippet,
+        "textTruncated": false,
+        "bytes": snippet.len(),
+        "contextBefore": [],
+        "contextAfter": vec![json!(snippet); 10],
+    });
+    let unit_cost = typecrate_harness::payload::entry_wire_bytes(&refused_unit);
+
+    assert!(
+        unit_cost > allowance,
+        "the fixture's premise: one match costs {unit_cost} payload bytes against a \
+         {allowance}-byte page allowance"
+    );
+
+    let refusal = format!(
+        "grep cannot return \"ctrl.txt\" at line 1: it costs {unit_cost} payload bytes, more than \
+         the {allowance}-byte page allowance (the {budget}-byte delivery budget minus {} bytes of \
+         result scaffolding). Ask for fewer \"context\" lines, \"output\": \"count\"/\"files\", \
+         or read the file directly.",
+        budget - allowance
+    );
+
+    // The registry prefixes a tool failure with the row that produced it; everything after that
+    // prefix is the tool's own sentence, byte for byte.
+    let expected = format!("Tool \"grep\" failed: {refusal}");
+
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some(expected.as_str()),
+        "the refusal quotes the measured cost, the allowance, and the scaffolding the allowance \
+         subtracted"
+    );
+    assert_eq!(outcome.content, expected);
+    assert!(
+        typecrate_harness::payload::utf8_byte_length(&outcome.content) <= budget,
+        "and the refusal itself is inside the budget it enforces"
+    );
+}
+
+#[tokio::test]
+async fn a_glob_whose_patterns_fill_the_delivery_budget_is_refused_not_emptied() {
+    let runtime = registry();
+    let fixture = Fixture::new("glob-pattern-budget");
+
+    // Two patterns of 16,384 characters each: the document echoes them, so the result's FIXED half
+    // is already 32,774 bytes and the page allowance - the budget minus that scaffolding - is zero
+    // (`glob.tool.ts:381-387`). The directory does not even have to exist: the guard prices only the
+    // arguments, so it fires before the walk, and reaching this sentence rather than a
+    // directory-not-found sentence IS the ordering proof.
+    let patterns = vec![
+        format!("**/{}.ts", "a".repeat(16_378)),
+        format!("**/{}.ts", "b".repeat(16_378)),
+    ];
+
+    let outcome = call(
+        &runtime,
+        "glob",
+        json!({ "patterns": patterns, "paths": ["never-created"] }),
+        &fixture.directory,
+    )
+    .await;
+
+    let budget = typecrate_harness::contract::MODEL_TOOL_RESULT_BUDGET_BYTES;
+    let echoed = typecrate_harness::payload::utf8_byte_length(&json!(&patterns).to_string());
+
+    assert!(
+        echoed > budget,
+        "the fixture's premise: the echoed patterns alone are {echoed} bytes against a \
+         {budget}-byte budget"
+    );
+
+    let refusal = format!(
+        "glob cannot answer this call: its own result scaffolding - {} compiled pattern(s), \
+         {echoed} bytes of pattern text the result echoes - fills the whole {budget}-byte delivery \
+         budget, leaving no room for a path. Pass fewer or shorter \"patterns\".",
+        patterns.len()
+    );
+
+    assert!(
+        !outcome.ok,
+        "a call the patterns already doomed is refused, not answered with an empty listing"
+    );
+    // Prefixed by the registry the same way every other tool failure is.
+    let expected = format!("Tool \"glob\" failed: {refusal}");
+
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some(expected.as_str()),
+        "and the sentence says which argument to shrink, with the measured numbers"
+    );
+    assert_eq!(outcome.content, expected);
+    assert!(
+        !outcome.content.contains("never-created"),
+        "the walk never ran, so the doomed call never paid for it: {refusal}"
     );
 }

@@ -38,11 +38,25 @@
 //!   * it does not parse (a log, a build output, a truncated write) -> the head/tail envelope
 //!     exactly as before, because for prose both previews are real content.
 //!
-//! ONE deliberate divergence remains: this crate gates on raw UTF-8 bytes (`utf8_byte_length`)
-//! where TS gates on serialized payload bytes (`modelPayloadBytes`), so the shared number bites
-//! slightly earlier here on escape-heavy text. The MAGNITUDE divergence (256 KiB vs 32 KiB) was
-//! closed on 2026-11-27 under contract-parity C1/R4 - see the parity note on
-//! [`crate::contract::MODEL_TOOL_RESULT_BUDGET_BYTES`].
+//! THE CURRENCY (CLOSED 2026-11-28): every size GATE in this module is measured in
+//! JSON-ESCAPED payload bytes - [`crate::payload::model_payload_bytes`], the bytes the text
+//! occupies once it is serialized into the model request, which is the number the provider
+//! bills (`core/payload-bytes.ts` `modelPayloadBytes`, `core/result-budget.ts` `boundWithReason`'s
+//! "THE CURRENCY (T3)" note). The numbers an envelope QUOTES stay raw UTF-8 bytes
+//! ([`utf8_byte_length`]), exactly as they do in TS: a reader asking "cut 64071 of 300000
+//! bytes" is asking about the tool's text, not about a JSON encoding it never sees. Both
+//! measures therefore appear here on purpose and only one of them gates anything.
+//!
+//! What changed on 2026-11-27 was the MAGNITUDE (256 KiB -> 32 KiB, contract-parity C1/R4, see
+//! the parity note on [`crate::contract::MODEL_TOOL_RESULT_BUDGET_BYTES`]); what changed on
+//! 2026-11-28 is the CURRENCY that magnitude is counted in, so the two halves of the reference
+//! rule are now the same rule here. Two residuals are stated rather than papered over, and both
+//! live in `crate::payload`'s header:
+//!   * a lone surrogate prices 6 bytes in TS and cannot exist in a Rust `String` at all (a
+//!     TS-written one arrives as U+FFFD and prices 3), so a document imported from a TS-written
+//!     data root is measured marginally LOW here;
+//!   * the crate measures its OWN serializer's escaping (`serde_json`), which agrees with
+//!     `JSON.stringify` on every class the oracle test covers.
 
 use std::time::Instant;
 
@@ -53,6 +67,12 @@ use crate::contract::{
     HarnessAttachment, MODEL_TOOL_RESULT_BUDGET_BYTES, MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES,
     ToolMediaDescriptor, ToolUiBlock, ToolUiPanel,
 };
+/// The gate's unit: the width a JSON serializer writes this text at
+/// ([`crate::payload::model_payload_bytes`], the port of the reference's `modelPayloadBytes`).
+/// Re-exported from here, next to [`utf8_byte_length`] below, so a module that sizes its own
+/// pages cannot read one unit without seeing the other: the reported number is UTF-8 bytes, the
+/// spent number is payload bytes, and swapping them is what used to make a capped page refuse.
+pub use crate::payload::model_payload_bytes;
 use crate::ports::ToolExecOutcome;
 
 /// The brand key of a `toolUi(content, panels)` result (`core/tool-ui.ts:78`).
@@ -88,12 +108,12 @@ impl ToolFailure {
     }
 }
 
-/// UTF-8 byte length, the unit the result budget is expressed in
-/// (`result-budget.ts:67` `utf8ByteLength`).
-#[must_use]
-pub fn utf8_byte_length(value: &str) -> usize {
-    value.len()
-}
+/// UTF-8 byte length, the unit the numbers an envelope QUOTES are written in
+/// (`result-budget.ts` `utf8ByteLength`). Canonical home is [`crate::payload`]; it is
+/// re-exported here because every consumer of the result boundary reads both measures from
+/// one place, and the pairing is the point: `utf8_byte_length` reports,
+/// [`model_payload_bytes`] gates.
+pub use crate::payload::utf8_byte_length;
 
 /// The outcome of applying the budget (`result-budget.ts:126` `BoundedToolResult`).
 ///
@@ -306,6 +326,58 @@ fn retained_handle(content: &str) -> Option<(&'static str, String)> {
     None
 }
 
+/// The parenthetical one refusal recommends: the producing tool's OWN levers
+/// (`result-budget.ts:547` `NARROWING_ADVICE`, F14 2026-11-28), or the historical phrase for a
+/// source the map does not list.
+///
+/// WHY A MAP AT ALL. The generic clause names `limit`, `ids` and `fields` - three arguments
+/// that exist in some tools and in NONE of the five that hit this cap in practice. A model
+/// reading "smaller limit" from a refused `grep` sends `limit`, gets `files grep does not
+/// accept "limit"`, and has spent a turn recovering a refusal. Each entry therefore states the
+/// arguments THIS build's tool actually declares, in the form that shrinks its payload most.
+///
+/// WHY THE FALLBACK STAYS. An unlisted name, and a refusal with no source at all, keep the
+/// sentence this function has always produced BYTE FOR BYTE: `read`, a record page, `knowledge`
+/// and every pinned refusal in this module and in `tests/tools.rs` assert that string. The rule
+/// is conservative on purpose - a wrong argument name here would be a new defect of exactly the
+/// kind F14 closed.
+///
+/// ONE honest deviation: TS's `files` row is the batch operations tool, so it advises "fewer
+/// operations in one call". THIS crate's `files` row is the paged directory listing
+/// (`crate::tools::files::file_list`, declared arguments `paths`/`offset`/`limit`), so the
+/// advice names what that tool really accepts. `fetch`, `search`, `grep` and `glob` are kept
+/// byte-identical to TS, because every argument those four strings name IS declared by this
+/// build's version of that tool.
+fn narrowing_phrase(source: Option<&ToolResultSource>) -> &'static str {
+    let name = source
+        .and_then(|value| value.name.as_deref())
+        .unwrap_or_default();
+
+    match name {
+        // fetch: `query` is the only filter, `format: "text"` drops the markdown scaffolding,
+        // and `offset` pages the SAME document instead of re-fetching it.
+        "fetch" => {
+            "(a narrower `query`, `format: \"text\"`, or an `offset` into the part you have not read)"
+        }
+        // search: fewer rows, or a tighter question; `includeDomains` narrows the row set
+        // without changing what is asked.
+        "search" => "(a smaller `maxResults`, a narrower `query`, or `includeDomains`)",
+        // grep: `output: "count"` answers most survey questions in a few hundred bytes,
+        // `context: 0` removes the neighbour lines, and narrowing `paths` cuts both the
+        // matches and the walk.
+        "grep" => {
+            "(a smaller `maxResults`, `context: 0`, `output: \"count\"`, or narrower `paths`)"
+        }
+        // glob: the page is names only, so fewer names or shorter paths are the whole remedy.
+        "glob" => "(a smaller `maxResults`, narrower `paths`, or fewer `patterns`)",
+        // files: this build's listing shares one budget across the whole call, so a smaller
+        // page or a narrower directory is the remedy (see the deviation note above).
+        "files" => "(a smaller `limit`, or a narrower `paths` entry)",
+        // Every other source, and a refusal that cannot name one: the historical text.
+        _ => "(smaller limit, fewer ids, narrower fields)",
+    }
+}
+
 /// The refusal sentence (`result-budget.ts:436` `refusalMessage`), worded byte for byte as
 /// the TS twin words it and sharing `spill_note`'s discipline: exact numbers, no
 /// locale-dependent prose, and the address the model can act on. It has to carry four things,
@@ -324,7 +396,9 @@ fn retained_handle(content: &str) -> Option<(&'static str, String)> {
 /// where the text still lives instead of being sent through a second fork or child run. Every
 /// other document keeps the sentence this function has always produced, byte for byte - the
 /// `None` arm below concatenates the same three pieces in the same order, which is what the
-/// pinned Rust refusals in this module's tests assert.
+/// pinned Rust refusals in this module's tests assert. F14 (2026-11-28) varied ONLY the
+/// parenthetical in that arm, via [`narrowing_phrase`], and its default IS the historical text,
+/// so an unlisted source still emits the exact byte stream its pins assert.
 ///
 /// Units follow [`spill_note`]: `original_bytes` is UTF-8 bytes of the tool's text, and
 /// `budget_bytes` is the budget that was applied - the aggregate case says out loud that it
@@ -354,9 +428,9 @@ fn refusal_message(
             source_phrase(source)
         ),
         None => format!(
-            "Re-run {} with narrower arguments (smaller limit, fewer ids, narrower fields) to \
-             fetch it. ",
-            source_phrase(source)
+            "Re-run {} with narrower arguments {} to fetch it. ",
+            source_phrase(source),
+            narrowing_phrase(source)
         ),
     };
 
@@ -534,6 +608,12 @@ fn envelope(
 /// THIS IS THE SINGLE DECISION POINT for the JSON refusal (F-CUTTER): the per-result cap and
 /// the aggregate spill both come through here, so there is no path in this crate that can
 /// hand a middle-cut JSON document to the model.
+///
+/// THE CURRENCY (`result-budget.ts`'s "THE CURRENCY (T3)" note, ported 2026-11-28):
+/// `budget_bytes` is a PAYLOAD budget, so every comparison below - the early return, both
+/// shrink loops, and the ledger's tally - is against [`model_payload_bytes`], the number this
+/// text occupies once it is serialized into the model request. `utf8_byte_length` stays what
+/// the note QUOTES, which is why both measures appear here and only one of them gates.
 fn bound_with_reason(
     content: &str,
     budget_bytes: usize,
@@ -543,10 +623,12 @@ fn bound_with_reason(
 ) -> BoundedResult {
     let original_bytes = utf8_byte_length(content);
 
-    // Small outputs are EXACT: no re-encoding, no normalization, no marker. The boundary is
-    // INCLUSIVE, and it stays inclusive for a document: JSON at exactly the budget is a
-    // result, not a refusal.
-    if original_bytes <= budget_bytes {
+    // Small outputs are EXACT: no re-encoding, no normalization, no marker. The test is the
+    // PAYLOAD measure (`result-budget.ts:678`), so a 640-byte quote-heavy window that escapes
+    // to 962 bytes is compared as 962 - the direction that used to be unbudgeted drift. The
+    // boundary stays INCLUSIVE for a document: JSON at exactly the budget is a result, not a
+    // refusal.
+    if model_payload_bytes(content) <= budget_bytes {
         return BoundedResult {
             content: content.to_owned(),
             truncated: false,
@@ -591,9 +673,11 @@ fn bound_with_reason(
 
     let units = UnitMap::new(content);
 
-    // One code unit can never encode to less than one byte, so a code-unit slice of
-    // `budget_bytes` is an upper bound on a preview pair that fits. JSON escaping of the
-    // previews only makes the envelope longer, hence the shrink loops below.
+    // One code unit can never encode to less than one byte - AFTER escaping either: the
+    // widest escape JSON produces (`\u00XX`, `\udXXX`) is 6 bytes and the narrowest real
+    // character is 1 - so a code-unit slice of `budget_bytes` is still an upper bound on a
+    // preview pair that fits. Escaping of the previews only makes the envelope longer, hence
+    // the shrink loops below.
     let mut keep = units.total_units().min(budget_bytes);
     let mut bounded = envelope(
         &units,
@@ -607,8 +691,14 @@ fn bound_with_reason(
 
     // Geometric shrink, then exact shrink: at most O(log n) + a few iterations, and it
     // terminates because every step strictly reduces `keep`. `Math.floor(keep * 0.9)` is
-    // done with integers so a 300 KB result cannot drift on float rounding.
-    while utf8_byte_length(&bounded) > budget_bytes && keep > 0 {
+    // done with integers so a 300 KB result cannot drift on float rounding. Both loops measure
+    // the ENVELOPE as it will be serialized (the TS rule this mirrors): the envelope is itself
+    // JSON text, so its own quotes are escaped AGAIN on the wire, and a quote inside a PREVIEW
+    // has already been escaped once by the envelope builder - `"x"` becomes `\"x\"` here and
+    // `\\\"x\\\"` in the request body, four bytes for one byte of the tool's text. Measuring
+    // the final string is the only way to know which of the two the caller is paying, and it is
+    // never an under-count.
+    while model_payload_bytes(&bounded) > budget_bytes && keep > 0 {
         keep = keep * 9 / 10;
 
         bounded = envelope(
@@ -622,7 +712,7 @@ fn bound_with_reason(
         );
     }
 
-    while utf8_byte_length(&bounded) > budget_bytes && keep > 0 {
+    while model_payload_bytes(&bounded) > budget_bytes && keep > 0 {
         keep -= 1;
 
         bounded = envelope(
@@ -684,7 +774,9 @@ pub fn bound_tool_result_with_source(
 /// one instead of two halves of a broken document.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolResultTurnBudget {
-    /// Bytes committed into this turn so far (envelope included, UTF-8).
+    /// Bytes committed into this turn so far (envelope included), counted in PAYLOAD bytes -
+    /// the same currency `aggregate` is declared in, which is the whole point of counting them
+    /// that way.
     committed: usize,
     /// The aggregate this ledger enforces (`0` = no aggregate guard).
     aggregate: usize,
@@ -720,7 +812,8 @@ impl ToolResultTurnBudget {
         }
     }
 
-    /// Bytes committed into this turn so far.
+    /// Payload bytes committed into this turn so far (the currency the aggregate is declared
+    /// in, so a caller can compare this against `aggregate_bytes` without re-measuring).
     #[must_use]
     pub fn committed_bytes(&self) -> usize {
         self.committed
@@ -753,7 +846,11 @@ impl ToolResultTurnBudget {
             .filter(|budget| *budget > 0)
             .unwrap_or(self.per_result);
         let capped = bound_with_reason(content, requested, SpillReason::Cap, None, source);
-        let size = utf8_byte_length(&capped.content);
+        // The tally is kept in the SAME currency the cap is declared in (T3): counting the turn
+        // in text bytes while capping each result in payload bytes would let the ledger
+        // under-report what the request actually carries by the escape factor of every result
+        // in it.
+        let size = model_payload_bytes(&capped.content);
 
         // A REFUSAL is never spilled (F-CUTTER). The document is already gone and the sentence
         // that replaced it IS the delivery; re-cutting that sentence to whatever headroom the
@@ -798,7 +895,7 @@ impl ToolResultTurnBudget {
         // here rather than spilled (the rule lives in `bound_with_reason`, which is why one
         // decision covers both caps), and what gets booked is the short refusal sentence -
         // never the bytes of the document that did not fit.
-        self.committed += utf8_byte_length(&spilled.content);
+        self.committed += model_payload_bytes(&spilled.content);
 
         spilled
     }
@@ -1361,9 +1458,11 @@ mod tests {
         assert!(bound_tool_result(&"x".repeat(101), 100).truncated);
     }
 
-    /// `result-budget.test.ts:75-101`: the whole envelope, byte for byte, naming the call.
-    /// The shrink loop settles on a 74-byte head and a 25-byte tail out of a 400-byte
-    /// budget; the numbers are the rule's output, not a range.
+    /// `result-budget.test.ts:121-152`: the whole envelope, byte for byte, naming the call.
+    /// The shrink loop settles on a 66-byte head and a 23-byte tail out of a 400-byte PAYLOAD
+    /// budget: the envelope's own 18 quotes are billed too, so the pair the raw-byte measure
+    /// produced (74 + 25) no longer fits. The numbers are the rule's output, not a range, and
+    /// they are the TS pin exactly.
     #[test]
     fn an_over_budget_result_becomes_an_exact_envelope_naming_the_call() {
         let bounded =
@@ -1374,11 +1473,11 @@ mod tests {
             BoundedResult {
                 content: format!(
                     "{{\"truncated\":true,\"originalBytes\":1000,\"budgetBytes\":400,\"note\":\
-                     \"Cut 901 of 1000 bytes from the middle by a 400-byte cap; kept a 74-byte head \
-                     and a 25-byte tail. The full text is not in this transcript: re-run tool \
+                     \"Cut 911 of 1000 bytes from the middle by a 400-byte cap; kept a 66-byte head \
+                     and a 23-byte tail. The full text is not in this transcript: re-run tool \
                      'read' (call c1) with narrower arguments to fetch it.\",\"content\":\"{}\",\"tail\":\"{}\"}}",
-                    "y".repeat(74),
-                    "y".repeat(25)
+                    "y".repeat(66),
+                    "y".repeat(23)
                 ),
                 truncated: true,
                 original_bytes: 1_000,
@@ -1406,28 +1505,33 @@ mod tests {
         );
         assert_eq!(
             parsed["note"],
-            "Cut 901 of 1000 bytes from the middle by a 400-byte cap; kept a 74-byte head and a 25-byte tail. The full text is not in this transcript: re-run tool 'read' (call c1) with narrower arguments to fetch it."
+            "Cut 911 of 1000 bytes from the middle by a 400-byte cap; kept a 66-byte head and a 23-byte tail. The full text is not in this transcript: re-run tool 'read' (call c1) with narrower arguments to fetch it."
         );
-        assert_eq!(parsed["content"], "y".repeat(74));
-        assert_eq!(parsed["tail"], "y".repeat(25));
-        assert_eq!(utf8_byte_length(&bounded.content), 392);
+        assert_eq!(parsed["content"], "y".repeat(66));
+        assert_eq!(parsed["tail"], "y".repeat(23));
+        // THE POINT OF THE CURRENCY: the budget bounds the DELIVERED bytes (400), not the
+        // text's own bytes (382). The 18-byte difference is the envelope's own quotes, which
+        // the provider bills and the raw measure never charged to anything.
+        assert_eq!(model_payload_bytes(&bounded.content), 400);
+        assert_eq!(utf8_byte_length(&bounded.content), 382);
     }
 
-    /// `result-budget.test.ts:104-124`: the manual tool route has no transcript and no call
-    /// id, so the note says only "the tool call" - and the shorter note leaves a BIGGER
-    /// preview (82 + 28 instead of 74 + 25). Both halves are exact.
+    /// `result-budget.test.ts:154-176`: the manual tool route has no transcript and no call
+    /// id, so the note says only "the tool call" - and a LONGER identity string buys a BIGGER
+    /// preview, which is the ordering this pin exists for. Both halves are exact.
     #[test]
     fn the_refetch_line_degrades_when_the_call_cannot_be_named() {
         let unnamed = envelope_of(&bound_tool_result(&"y".repeat(1_000), 400).content);
 
         assert_eq!(
             unnamed["note"],
-            "Cut 890 of 1000 bytes from the middle by a 400-byte cap; kept a 82-byte head and a 28-byte tail. The full text is not in this transcript: re-run the tool call with narrower arguments to fetch it."
+            "Cut 911 of 1000 bytes from the middle by a 400-byte cap; kept a 66-byte head and a 23-byte tail. The full text is not in this transcript: re-run the tool call with narrower arguments to fetch it."
         );
-        assert_eq!(unnamed["content"], "y".repeat(82));
-        assert_eq!(unnamed["tail"], "y".repeat(28));
+        assert_eq!(unnamed["content"], "y".repeat(66));
+        assert_eq!(unnamed["tail"], "y".repeat(23));
 
-        // A partial identity is still an identity: each form names what it knows.
+        // A partial identity is still an identity: each form names what it knows, and the
+        // shorter identity string buys 8 more head bytes and 2 more tail bytes.
         let only_id = ToolResultSource {
             name: None,
             call_id: Some("c9".to_owned()),
@@ -1437,7 +1541,7 @@ mod tests {
             envelope_of(
                 &bound_tool_result_with_source(&"y".repeat(1_000), 400, Some(&only_id)).content
             )["note"],
-            "Cut 890 of 1000 bytes from the middle by a 400-byte cap; kept a 82-byte head and a 28-byte tail. The full text is not in this transcript: re-run the call c9 with narrower arguments to fetch it."
+            "Cut 901 of 1000 bytes from the middle by a 400-byte cap; kept a 74-byte head and a 25-byte tail. The full text is not in this transcript: re-run the call c9 with narrower arguments to fetch it."
         );
 
         let only_name = ToolResultSource {
@@ -1449,7 +1553,7 @@ mod tests {
             envelope_of(
                 &bound_tool_result_with_source(&"y".repeat(1_000), 400, Some(&only_name)).content
             )["note"],
-            "Cut 890 of 1000 bytes from the middle by a 400-byte cap; kept a 82-byte head and a 28-byte tail. The full text is not in this transcript: re-run tool 'grep' with narrower arguments to fetch it."
+            "Cut 901 of 1000 bytes from the middle by a 400-byte cap; kept a 74-byte head and a 25-byte tail. The full text is not in this transcript: re-run tool 'grep' with narrower arguments to fetch it."
         );
     }
 
@@ -1518,6 +1622,108 @@ mod tests {
                 .contains("Re-run tool 'threadFork' (call f2)")
         );
         assert!(!bounded.content.contains(&"b".repeat(121)));
+    }
+
+    /// `result-budget.test.ts:260-305` (F14, 2026-11-28): the refusal names the arguments the
+    /// refused tool ACTUALLY declares. The generic clause offers `limit`, `ids` and `fields` —
+    /// three arguments NONE of the tools that reach this cap in practice declares, so a model
+    /// that sends `limit` to `grep` gets `does not accept "limit"` and has burned a turn
+    /// recovering a refusal. Everything OUTSIDE the map keeps the historical bytes exactly,
+    /// which is what keeps this from being a breaking change to `read`, `knowledge`, a record
+    /// page or a custom host tool.
+    #[test]
+    fn the_refusal_names_the_arguments_the_refused_tool_actually_declares() {
+        // 106 text bytes, 114 payload bytes (four framing quotes plus the eight inside), over a
+        // 40-byte budget, with no `branchId`/`invocationId` to change the recovery clause.
+        let doc = json!({ "id": "thing-1", "body": "z".repeat(80) }).to_string();
+
+        assert_eq!(utf8_byte_length(&doc), 106);
+        assert_eq!(model_payload_bytes(&doc), 114);
+
+        let advised = [
+            (
+                "fetch",
+                "(a narrower `query`, `format: \"text\"`, or an `offset` into the part you have not read)",
+            ),
+            (
+                "search",
+                "(a smaller `maxResults`, a narrower `query`, or `includeDomains`)",
+            ),
+            (
+                "grep",
+                "(a smaller `maxResults`, `context: 0`, `output: \"count\"`, or narrower `paths`)",
+            ),
+            (
+                "glob",
+                "(a smaller `maxResults`, narrower `paths`, or fewer `patterns`)",
+            ),
+            (
+                // This crate's `files` row is the paged listing (TS's is the batch tool), so the
+                // levers named are the listing's own. See [`narrowing_phrase`].
+                "files",
+                "(a smaller `limit`, or a narrower `paths` entry)",
+            ),
+        ];
+
+        for (name, advice) in advised {
+            let bounded = bound_tool_result_with_source(&doc, 40, Some(&source(name, "c1")));
+
+            assert_eq!(
+                bounded.content,
+                format!(
+                    "Tool result too large to deliver: 106 bytes against a 40-byte budget. The \
+                     result was discarded, not truncated: no part of it reached this transcript. \
+                     Re-run tool '{name}' (call c1) with narrower arguments {advice} to fetch it. \
+                     If this call could have written anything, that write may already be applied \
+                     \u{2014} re-read before retrying."
+                ),
+                "the refusal for {name} must name that tool's own levers"
+            );
+            // The generic phrase is GONE for these tools - keeping both sentences would make the
+            // refusal longer without making it truer.
+            assert!(
+                !bounded
+                    .content
+                    .contains("(smaller limit, fewer ids, narrower fields)")
+            );
+        }
+
+        // A tool OUTSIDE the map keeps the historical bytes, exactly. This is the assertion that
+        // keeps F14 from being a breaking change to `read`, `knowledge`, `agent`, a custom host
+        // tool, or anything else that has never been measured against this cap.
+        for name in [
+            "read",
+            "write",
+            "edit",
+            "shell",
+            "agent",
+            "knowledge",
+            "store",
+            "threadFork",
+            "custom",
+        ] {
+            let bounded = bound_tool_result_with_source(&doc, 40, Some(&source(name, "c1")));
+
+            assert_eq!(
+                bounded.content,
+                format!(
+                    "Tool result too large to deliver: 106 bytes against a 40-byte budget. The \
+                     result was discarded, not truncated: no part of it reached this transcript. \
+                     Re-run tool '{name}' (call c1) with narrower arguments (smaller limit, fewer \
+                     ids, narrower fields) to fetch it. If this call could have written anything, \
+                     that write may already be applied \u{2014} re-read before retrying."
+                ),
+                "an unlisted tool must get the byte stream its pins assert"
+            );
+        }
+
+        // And a refusal with NO source at all - the manual tool route's shape - gets the same
+        // generic sentence, addressed to "the tool call".
+        assert!(
+            bound_tool_result(&doc, 40).content.contains(
+                "Re-run the tool call with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it."
+            )
+        );
     }
 
     #[test]
@@ -1601,17 +1807,24 @@ mod tests {
         );
     }
 
-    /// `result-budget.test.ts:252-270`: the boundary stays INCLUSIVE for a document - JSON at
-    /// exactly the budget is a result, not a refusal - and one byte under, the same document is
-    /// refused, so there is no gap between fitting and refusing. Pinned at a trivial size AND
-    /// at this crate's published 32 KiB cap, which is the number production applies.
+    /// The boundary stays INCLUSIVE for a document - JSON at exactly the budget is a result,
+    /// not a refusal - and one byte under, the same document is refused, so there is no gap
+    /// between fitting and refusing. What "exactly the budget" means moved on 2026-11-28: it is
+    /// the PAYLOAD width, the currency `bound_with_reason` gates in, not the text's own byte
+    /// count. Pinned at a trivial size AND at this crate's published 32 KiB cap, and the gap
+    /// between the two measures is pinned as its own fact at the end, because that gap is
+    /// exactly why the file tools budget their own output in the same currency
+    /// ([`crate::tools::files`]).
     #[test]
-    fn a_json_document_at_exactly_the_budget_is_delivered_whole() {
+    fn a_json_document_at_exactly_the_payload_budget_is_delivered_whole() {
         let small = "{\"ok\":true,\"items\":[1,2,3]}";
 
         assert_eq!(utf8_byte_length(small), 27);
+        assert_eq!(model_payload_bytes(small), 31); // four `"` -> `\"`
+
+        // Payload exactly at the budget: delivered, byte for byte.
         assert_eq!(
-            bound_tool_result(small, 27),
+            bound_tool_result(small, 31),
             BoundedResult {
                 content: small.to_owned(),
                 truncated: false,
@@ -1619,13 +1832,15 @@ mod tests {
                 rejected: None,
             }
         );
+        // One payload byte over: refused - and the sentence still quotes the TEXT bytes (27),
+        // which is the unit the reader is asking about.
         assert_eq!(
-            bound_tool_result_with_source(small, 26, Some(&source("store", "s1"))).rejected,
+            bound_tool_result_with_source(small, 30, Some(&source("store", "s1"))).rejected,
             Some(ToolResultRejection {
                 reason: ToolResultRejectionReason::OversizedJson,
                 original_bytes: 27,
-                budget_bytes: 26,
-                message: "Tool result too large to deliver: 27 bytes against a 26-byte budget. \
+                budget_bytes: 30,
+                message: "Tool result too large to deliver: 27 bytes against a 30-byte budget. \
                           The result was discarded, not truncated: no part of it reached this \
                           transcript. Re-run tool 'store' (call s1) with narrower arguments \
                           (smaller limit, fewer ids, narrower fields) to fetch it. If this call \
@@ -1635,16 +1850,19 @@ mod tests {
             })
         );
 
-        // The production cap: a document of EXACTLY 32 768 bytes is delivered whole.
-        let exact = format!("{{\"data\":\"{}\"}}", "q".repeat(32_768 - 11));
+        // The production cap, sized in the currency the cap is enforced in: four framing quotes
+        // make a 32 764-byte document occupy exactly 32 768 payload bytes, and that one is
+        // delivered whole; one byte less refuses it.
+        let exact = format!("{{\"data\":\"{}\"}}", "q".repeat(32_753));
 
-        assert_eq!(utf8_byte_length(&exact), MODEL_TOOL_RESULT_BUDGET_BYTES);
+        assert_eq!(utf8_byte_length(&exact), MODEL_TOOL_RESULT_BUDGET_BYTES - 4);
+        assert_eq!(model_payload_bytes(&exact), MODEL_TOOL_RESULT_BUDGET_BYTES);
         assert_eq!(
             bound_tool_result(&exact, MODEL_TOOL_RESULT_BUDGET_BYTES),
             BoundedResult {
                 content: exact.clone(),
                 truncated: false,
-                original_bytes: MODEL_TOOL_RESULT_BUDGET_BYTES,
+                original_bytes: MODEL_TOOL_RESULT_BUDGET_BYTES - 4,
                 rejected: None,
             }
         );
@@ -1652,16 +1870,37 @@ mod tests {
             bound_tool_result(&exact, MODEL_TOOL_RESULT_BUDGET_BYTES - 1).rejected,
             Some(ToolResultRejection {
                 reason: ToolResultRejectionReason::OversizedJson,
-                original_bytes: MODEL_TOOL_RESULT_BUDGET_BYTES,
+                original_bytes: MODEL_TOOL_RESULT_BUDGET_BYTES - 4,
                 budget_bytes: MODEL_TOOL_RESULT_BUDGET_BYTES - 1,
-                message: "Tool result too large to deliver: 32768 bytes against a 32767-byte \
-                          budget. The result was discarded, not truncated: no part of it reached \
-                          this transcript. Re-run the tool call with narrower arguments (smaller \
-                          limit, fewer ids, narrower fields) to fetch it. If this call could have \
-                          written anything, that write may already be applied \u{2014} re-read \
-                          before retrying."
-                    .to_owned(),
+                message: format!(
+                    "Tool result too large to deliver: {} bytes against a {}-byte budget. The \
+                     result was discarded, not truncated: no part of it reached this transcript. \
+                     Re-run the tool call with narrower arguments (smaller limit, fewer ids, \
+                     narrower fields) to fetch it. If this call could have written anything, that \
+                     write may already be applied \u{2014} re-read before retrying.",
+                    MODEL_TOOL_RESULT_BUDGET_BYTES - 4,
+                    MODEL_TOOL_RESULT_BUDGET_BYTES - 1,
+                )
+                .to_owned(),
             })
+        );
+
+        // THE INTERACTION the file tools are sized against. A tool that fills 32 768 RAW bytes
+        // of a JSON document is REFUSED, because the same text arrives at 32 772 payload bytes -
+        // which is the whole reason `READ_CONTENT_BUDGET` and friends are declared equal to this
+        // cap and charged in this currency rather than in raw bytes.
+        let raw_exact = format!("{{\"data\":\"{}\"}}", "q".repeat(32_768 - 11));
+
+        assert_eq!(utf8_byte_length(&raw_exact), MODEL_TOOL_RESULT_BUDGET_BYTES);
+        assert_eq!(
+            model_payload_bytes(&raw_exact),
+            MODEL_TOOL_RESULT_BUDGET_BYTES + 4
+        );
+        assert!(
+            bound_tool_result(&raw_exact, MODEL_TOOL_RESULT_BUDGET_BYTES)
+                .rejected
+                .is_some(),
+            "32 768 RAW bytes of JSON escape past the cap and are refused, not delivered"
         );
     }
 
@@ -1690,11 +1929,14 @@ mod tests {
                 "truncated": true,
                 "originalBytes": 2_053,
                 "budgetBytes": 1_000,
-                "note": "Cut 1397 of 2053 bytes from the middle by a 1000-byte cap; kept a 492-byte head and a 164-byte tail. The full text is not in this transcript: re-run tool 'read' (call r1) with narrower arguments to fetch it.",
-                "content": &broken[..492],
-                "tail": broken[broken.len() - 164..],
+                "note": "Cut 1463 of 2053 bytes from the middle by a 1000-byte cap; kept a 442-byte head and a 148-byte tail. The full text is not in this transcript: re-run tool 'read' (call r1) with narrower arguments to fetch it.",
+                "content": &broken[..442],
+                "tail": broken[broken.len() - 148..],
             })
         );
+        // The delivered envelope is inside the cap it was cut to, in the currency the cap is
+        // declared in - which is the property the preview sizes are derived from.
+        assert!(model_payload_bytes(&cut.content) <= 1_000);
 
         // A brace-led log page: the pre-filter cannot answer it, the parser can.
         let log = format!("{{lead}}\n{}\n{{tail}}", "l".repeat(1_000));
@@ -1711,11 +1953,15 @@ mod tests {
                 "truncated": true,
                 "originalBytes": 1_014,
                 "budgetBytes": 400,
-                "note": "Cut 915 of 1014 bytes from the middle by a 400-byte cap; kept a 74-byte head and a 25-byte tail. The full text is not in this transcript: re-run tool 'tail' (call t1) with narrower arguments to fetch it.",
-                "content": &log[..74],
-                "tail": log[log.len() - 25..],
+                "note": "Cut 934 of 1014 bytes from the middle by a 400-byte cap; kept a 60-byte head and a 20-byte tail. The full text is not in this transcript: re-run tool 'tail' (call t1) with narrower arguments to fetch it.",
+                "content": &log[..60],
+                "tail": log[log.len() - 20..],
             })
         );
+        // This fixture pays for its own two `\\n` escapes as well: 1,014 text bytes are 1,016
+        // payload bytes, and the two newlines inside the previews are billed on the way out.
+        assert_eq!(model_payload_bytes(&log), 1_016);
+        assert!(model_payload_bytes(&log_cut.content) <= 400);
     }
 
     /// `result-budget.test.ts:145-163`: the shrink loop's first candidate is
@@ -1772,7 +2018,14 @@ mod tests {
     /// code-unit walk, not a byte walk, is what lands on the 6-character head and the
     /// 3-character tail, and the envelope fills the budget exactly.
     #[test]
-    fn a_multi_byte_character_is_never_split_at_either_cut() {
+    fn a_multibyte_budget_is_spent_on_the_note_before_any_preview() {
+        // The TS pin this replaced (`result-budget.test.ts` "spends a multibyte budget on the
+        // note before any preview"). 200 é is 400 bytes of PAYLOAD - JSON leaves non-ASCII as
+        // it is, so `é` costs its 2 UTF-8 bytes and nothing more - and over a 300-byte payload
+        // budget the envelope's own 299 serialized bytes (18 escaped quotes plus the note) leave
+        // room for ZERO preview. Under the raw-byte measure this same budget bought a
+        // 6-character head; the 18 bytes that measure ignored are exactly the difference. The
+        // multi-byte CUT property is pinned by the surrogate-pair test below.
         let bounded = bound_tool_result(&"é".repeat(200), 300);
 
         assert_eq!(
@@ -1781,28 +2034,36 @@ mod tests {
                 "truncated": true,
                 "originalBytes": 400,
                 "budgetBytes": 300,
-                "note": "Cut 382 of 400 bytes from the middle by a 300-byte cap; kept a 12-byte head and a 6-byte tail. The full text is not in this transcript: re-run the tool call with narrower arguments to fetch it.",
-                "content": "é".repeat(6),
-                "tail": "é".repeat(3),
+                "note": "Cut 400 of 400 bytes from the middle by a 300-byte cap; kept a 0-byte head and a 0-byte tail. The full text is not in this transcript: re-run the tool call with narrower arguments to fetch it.",
+                "content": "",
+                "tail": "",
             })
         );
-        assert_eq!(utf8_byte_length(&bounded.content), 300);
+        assert_eq!(model_payload_bytes(&bounded.content), 299);
+        assert_eq!(utf8_byte_length(&bounded.content), 281);
     }
 
-    /// `result-budget.test.ts:201-214`: a cut between the two UTF-16 units of U+1F600 would
+    /// `result-budget.test.ts:536-556`: a cut between the two UTF-16 units of U+1F600 would
     /// leave a lone surrogate on either side; both halves are dropped, so the previews stay
-    /// exact substrings of the source.
+    /// exact substrings of the source. A surrogate PAIR costs 4 payload bytes here, not 12:
+    /// `JSON.stringify` only escapes a LONE surrogate, and a preview that keeps pairs intact (as
+    /// the trim guarantees) pays nothing extra for them.
     #[test]
     fn a_split_surrogate_pair_is_dropped_from_the_head_and_the_tail() {
         let content = format!("{}{}{}", "😀".repeat(50), "x".repeat(400), "😀".repeat(50));
         let bounded = bound_tool_result(&content, 400);
         let envelope = envelope_of(&bounded.content);
 
-        assert_eq!(envelope["content"], "😀".repeat(21));
-        assert_eq!(envelope["tail"], "😀".repeat(7));
+        assert_eq!(envelope["content"], "😀".repeat(16));
+        assert_eq!(envelope["tail"], "😀".repeat(6));
         assert!(content.starts_with(envelope["content"].as_str().unwrap()));
         assert!(content.ends_with(envelope["tail"].as_str().unwrap()));
-        assert_eq!(utf8_byte_length(&bounded.content), 395);
+        assert_eq!(
+            envelope["note"],
+            "Cut 712 of 800 bytes from the middle by a 400-byte cap; kept a 64-byte head and a 24-byte tail. The full text is not in this transcript: re-run the tool call with narrower arguments to fetch it."
+        );
+        assert_eq!(model_payload_bytes(&bounded.content), 389);
+        assert_eq!(utf8_byte_length(&bounded.content), 371);
     }
 
     /// `result-budget.test.ts:216-227`: the documented extreme edge - a budget below the
@@ -1860,7 +2121,9 @@ mod tests {
             turn.commit(&content, Some(1_024), Some(&named)),
             bound_tool_result_with_source(&content, 1_024, Some(&named))
         );
-        assert_eq!(turn.committed_bytes(), 968);
+        // 968 raw / 986 delivered: the ledger books the SECOND number, because that is the
+        // number the next request carries.
+        assert_eq!(turn.committed_bytes(), 986);
     }
 
     /// `result-budget.test.ts:256-288`: a 2048-byte window with a 1024-byte per-result cap,
@@ -1880,12 +2143,12 @@ mod tests {
             envelope_of(&a.content)["note"],
             "Cut 830 of 1500 bytes from the middle by a 1024-byte cap; kept a 502-byte head and a 168-byte tail. The full text is not in this transcript: re-run tool 'alpha' (call a1) with narrower arguments to fetch it."
         );
-        assert_eq!(turn.committed_bytes(), 968);
+        assert_eq!(turn.committed_bytes(), 986);
 
         let b = turn.commit(&"b".repeat(1_500), Some(1_024), Some(&source("beta", "b2")));
 
         assert_eq!(envelope_of(&b.content)["budgetBytes"], json!(1_024));
-        assert_eq!(turn.committed_bytes(), 1_935);
+        assert_eq!(turn.committed_bytes(), 1_971);
 
         let c = turn.commit(&"c".repeat(100), Some(1_024), Some(&source("gamma", "c3")));
 
@@ -1898,7 +2161,7 @@ mod tests {
                 rejected: None
             }
         );
-        assert_eq!(turn.committed_bytes(), 2_035);
+        assert_eq!(turn.committed_bytes(), 2_071);
 
         let d = turn.commit(
             &"d".repeat(1_500),
@@ -1910,13 +2173,14 @@ mod tests {
         assert_eq!(spilled["budgetBytes"], json!(512));
         assert_eq!(
             spilled["note"],
-            "Cut 1342 of 1500 bytes from the middle by a 512-byte budget set by this turn's 2048-byte per-turn cap; kept a 118-byte head and a 40-byte tail. The full text is not in this transcript: re-run tool 'delta' (call d4) with narrower arguments to fetch it."
+            "Cut 1358 of 1500 bytes from the middle by a 512-byte budget set by this turn's 2048-byte per-turn cap; kept a 106-byte head and a 36-byte tail. The full text is not in this transcript: re-run tool 'delta' (call d4) with narrower arguments to fetch it."
         );
         // The spill is what fits; the window overshoots by less than one envelope, which is
         // the soft-bound rule stated in the module header.
-        assert_eq!(utf8_byte_length(&d.content), 499);
-        assert_eq!(turn.committed_bytes(), 2_534);
-        assert!(turn.committed_bytes() - 2_048 < 600);
+        assert_eq!(model_payload_bytes(&d.content), 501);
+        assert_eq!(utf8_byte_length(&d.content), 483);
+        assert_eq!(turn.committed_bytes(), 2_572);
+        assert_eq!(turn.committed_bytes() - 2_048, 524);
     }
 
     /// `result-budget.test.ts:290-308`: a provider request must answer every `tool_calls[]`
@@ -1937,16 +2201,22 @@ mod tests {
             MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES
         );
 
-        let third = turn.commit(&"t".repeat(3_000), None, Some(&source("tail", "t3")));
+        let fourth = turn.commit(&"t".repeat(3_000), None, Some(&source("tail", "t3")));
 
-        assert!(third.truncated);
-        assert_eq!(third.original_bytes, 3_000);
-        assert_eq!(envelope_of(&third.content)["budgetBytes"], json!(512));
-        // The note quotes this turn's aggregate, so the envelope is 499 bytes now that the
-        // published cap is 98304 (five digits) rather than 524288 (six).
-        assert_eq!(utf8_byte_length(&third.content), 499);
+        assert!(fourth.truncated);
+        assert_eq!(fourth.original_bytes, 3_000);
+        assert_eq!(envelope_of(&fourth.content)["budgetBytes"], json!(512));
+        // The note quotes this turn's aggregate, so the envelope is 483 text bytes now that the
+        // published cap is 98304 (five digits) rather than 524288 (six) - and 501 bytes of it is
+        // what the next request actually carries.
+        assert_eq!(model_payload_bytes(&fourth.content), 501);
+        assert_eq!(utf8_byte_length(&fourth.content), 483);
+        assert_eq!(
+            envelope_of(&fourth.content)["note"],
+            "Cut 2858 of 3000 bytes from the middle by a 512-byte budget set by this turn's 98304-byte per-turn cap; kept a 106-byte head and a 36-byte tail. The full text is not in this transcript: re-run tool 'tail' (call t3) with narrower arguments to fetch it."
+        );
         // The window is over by one envelope and nothing more.
-        assert_eq!(turn.committed_bytes(), 98_803);
+        assert_eq!(turn.committed_bytes(), 98_805);
     }
 
     /// `result-budget.test.ts:310-320`: the ledger is a pure function of the committed total
@@ -2003,7 +2273,7 @@ mod tests {
         let bounded = turn.commit(&"e".repeat(1_500), None, None);
 
         assert_eq!(envelope_of(&bounded.content)["budgetBytes"], json!(1_024));
-        assert_eq!(turn.committed_bytes(), 959);
+        assert_eq!(turn.committed_bytes(), 977);
     }
 
     /// `result-budget.test.ts:350-358`: a tool that budgets its own output (`read`, `grep`)
@@ -2014,8 +2284,12 @@ mod tests {
         let capped = turn.commit(&"k".repeat(1_500), Some(700), None);
 
         assert_eq!(envelope_of(&capped.content)["budgetBytes"], json!(700));
-        assert!(utf8_byte_length(&capped.content) <= 700);
-        assert_eq!(turn.committed_bytes(), 658);
+        // 658 raw, 676 delivered. The caller asked for 700 PAYLOAD bytes and got 676; under the
+        // old measure it would have asked for 700 raw and received a result that arrived at up to
+        // ~742 - quote-heavy content is where the gap lived.
+        assert_eq!(utf8_byte_length(&capped.content), 658);
+        assert_eq!(model_payload_bytes(&capped.content), 676);
+        assert_eq!(turn.committed_bytes(), 676);
     }
 
     /// `result-budget.test.ts:597-627` (F-CUTTER, contract 3): a 1,433-byte JSON page over a
@@ -2028,6 +2302,7 @@ mod tests {
         let doc = json!({ "ok": true, "records": [{ "id": "x".repeat(1_400) }] }).to_string();
 
         assert_eq!(utf8_byte_length(&doc), 1_433);
+        assert_eq!(model_payload_bytes(&doc), 1_441);
 
         let refusal = "Tool result too large to deliver: 1433 bytes against a 1024-byte budget. \
                        The result was discarded, not truncated: no part of it reached this \
@@ -2093,7 +2368,9 @@ mod tests {
         let doc = json!({ "ok": true, "records": [{ "id": "x".repeat(560) }] }).to_string();
 
         assert_eq!(utf8_byte_length(&doc), 593);
+        assert_eq!(model_payload_bytes(&doc), 601);
         // It fits the PER-RESULT cap on its own - the aggregate is the only thing wrong.
+        // (In the payload currency: 601 of the 1,024 the cap allows.)
         assert_eq!(
             bound_tool_result(&doc, 1_024),
             BoundedResult {
@@ -2127,9 +2404,9 @@ mod tests {
                 }),
             }
         );
-        // 968 + 411: still INSIDE the 1,400-byte window, and every call still has exactly one
+        // 986 + 411: still INSIDE the 1,400-byte window, and every call still has exactly one
         // answer, so the pairing rule holds with nothing dropped.
-        assert_eq!(turn.committed_bytes(), 1_379);
+        assert_eq!(turn.committed_bytes(), 1_397);
     }
 
     #[test]

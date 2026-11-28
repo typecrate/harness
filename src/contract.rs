@@ -90,8 +90,10 @@ pub const MAX_CREATED_TOOLS: usize = 32;
 ///
 /// CLOSED 2026-11-27 (contract-parity stage C1, R4). This constant used to sit at 256 KiB
 /// against TS's 32 KiB, which let 8× more tool output reach the model than the replacement
-/// target does. The magnitude gap is now closed; ONE axis is still open and is stated below so
-/// nobody reads parity as byte-for-byte agreement of the *measurement*.
+/// target does. The magnitude gap was closed in C1; the CURRENCY it is spent in was closed after
+/// it (slice R2), so the two harnesses now agree on the number and on the unit. What still is not
+/// byte-for-byte agreement of the MEASUREMENT is listed in item 2, so nobody reads parity as more
+/// than it is.
 ///
 /// 1. THE TYPESCRIPT FIGURE THIS MIRRORS (re-verified 2026-11-27): **32,768** bytes per result.
 ///    `MODEL_TOOL_RESULT_BUDGET_BYTES` is token-derived at
@@ -104,21 +106,48 @@ pub const MAX_CREATED_TOOLS: usize = 32;
 ///    `packages/underload/harness/src/harness-server.swagger.yaml`
 ///    (`tool_result_bytes: 32768`). The TS invariant that the published figure equals the
 ///    enforced one is pinned there by `engine/shared/harness-api.test.ts:237`.
-/// 2. STILL OPEN — THE CURRENCY, NOT THE MAGNITUDE: TS gates on ESCAPED PAYLOAD bytes
-///    (`modelPayloadBytes`, the number the provider bills); this crate gates on raw UTF-8 bytes
-///    ([`crate::tools::result::utf8_byte_length`]). The same number therefore bites slightly
-///    EARLIER here than in TS on text heavy on quotes/newlines (JSON escaping adds 2-15%).
-///    Moving the magnitude without the currency was the requested change; moving the currency
-///    is a separate stage.
+/// 2. THE CURRENCY, NOW THE SAME ONE AT BOTH ENDS: the gate charges ESCAPED PAYLOAD bytes
+///    ([`crate::payload::model_payload_bytes`], the port of the reference's `modelPayloadBytes`,
+///    whose vectors are ported from `engine/core/payload-bytes.test.ts`), and the file tools that
+///    size their own pages charge that same function - which is the pairing that matters, because
+///    a tool that measures its page in raw bytes while the cutter charges escaped bytes delivers
+///    a page the cutter refuses. The numbers an envelope QUOTES stay UTF-8 bytes
+///    ([`crate::tools::result::utf8_byte_length`]), exactly TS's split (`result-budget.ts` gates
+///    with `modelPayloadBytes` and reports with `utf8ByteLength`). RESIDUALS:
+///      * a LONE surrogate cannot exist in a Rust `String`. TS prices one at the six-byte
+///        `\udXXX` literal ES2019 `JSON.stringify` writes; this crate's decoder turns it into
+///        U+FFFD, which costs 3 and is billed as 3 - always UNDER TS, never over, because the
+///        crate bills the bytes it actually writes. The reference's surrogate vectors are pinned
+///        on the code-unit twin [`crate::payload::model_payload_bytes_units`].
+///      * the crate prices what its OWN serializer writes (the identity, and the test that asserts
+///        the walk equals `serde_json`'s rendering on every escape class, are in
+///        [`crate::payload`]), where TS prices `JSON.stringify`. The two agree on every class the
+///        reference's corpus covers, U+2028/U+2029, DEL, the C1 controls and the BOM included.
+///      * the full residual list lives in `src/tools/result.rs`'s module header, which is the
+///        single place it is written out.
 /// 3. WHY THE HISTORICAL "must stay ≥ read's own content budget" argument no longer binds at
-///    this number: the old comment kept 256 KiB because `read` budgeted its own output at the
-///    same order and the two had to agree. This crate's `read` content budget is
-///    [`crate::tools::files::READ_CONTENT_BUDGET`] (64 KiB), which is now ABOVE this cap — so a
-///    `read` that exactly fills its own budget arrives JSON-refused (see
-///    [`crate::tools::result::bound_with_reason`]) rather than surviving whole. TS closed the
-///    same interaction by setting `FILE_READ_WIRE_BUDGET = MODEL_TOOL_RESULT_BUDGET_BYTES`
-///    (`engine/tools/files/read.tool.ts`); aligning `READ_CONTENT_BUDGET` is out of C1's file
-///    ownership and is reported rather than done here.
+///    this number: the old comment kept 256 KiB because `read` budgeted its own output at the same
+///    order and the two had to agree. That interaction is now closed in the direction that
+///    matters: [`crate::tools::files::READ_CONTENT_BUDGET`] IS this constant, as are
+///    [`crate::tools::files::LIST_CONTENT_BUDGET`] and
+///    [`crate::tools::files::SEARCH_CONTENT_BUDGET`], and each of those tools charges a page
+///    against a published allowance that has ALREADY paid for the result's own scaffolding
+///    ([`crate::tools::files::file_list_allowance`], [`crate::tools::files::glob_page_allowance`],
+///    [`crate::tools::files::grep_page_allowance`], `read_result_overhead`). So a file tool that
+///    fills its page is inside this cap and survives the cutter whole - `bound_with_reason` in
+///    `crate::tools::result` (private, which is the point: nothing bypasses it); the
+///    oversized-JSON refusal stays reachable only for a result no tool budgeted to this ceiling.
+/// 4. THE WEB TOOLS NOW BUDGET THEMSELVES IN THIS CURRENCY, so they are no longer on that list.
+///    `crate::tools::web::fetch` sizes a whole page against a content allowance measured with
+///    [`crate::payload::document_wire_bytes`] (the envelope measured with an EMPTY `content`, the
+///    5% step-down ladder, `webfetch/index.ts` `fitResult`), and `crate::tools::web::search` trims
+///    ROWS to [`crate::tools::web::SEARCH_MAX_RESULT_BYTES`] before the result is assembled; the two
+///    ceiling tests in `tests/web_surface.rs` assert the delivered outcome is inside this cap AND is
+///    not refused, which is the property the character-currency version of this note could not claim.
+///    `crate::tools::web::download` keeps its bytes off the model path altogether - the summary is
+///    the result and the payload rides the attachment - so a 20 MiB file spends none of this budget.
+///    The live unbudgeted producer is `command`'s 128 KiB stdout transcript, and anything else a
+///    caller hands the runtime without sizing it.
 pub const MODEL_TOOL_RESULT_BUDGET_BYTES: usize = 32 * 1024;
 
 /// The `tool_result_bytes` figure THIS crate's boot document publishes: **32768**, identical to
